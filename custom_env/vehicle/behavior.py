@@ -347,70 +347,107 @@ class IDMVehicle(ControlledVehicle):
         return acceleration
 
 
-class LinearVehicle(IDMVehicle):
-    """A Vehicle whose longitudinal and lateral controllers are linear with respect to parameters."""
+class StyledIDMVehicle(IDMVehicle):
+    """
+    在 IDM 基础上加：
+    - 不同风格的参数均值（期望速度/间距/时距/加减速/礼貌等）
+    - 围绕这些均值进行采样的 std
+    - imperfection: 加速度噪声强度
+    """
+    DESIRED_SPEED_FACTOR = 1.0          # 相对车道限速的比例
+    DESIRED_SPEED_SIGMA = 0.05
 
-    ACCELERATION_PARAMETERS = [0.3, 0.3, 2.0]
-    STEERING_PARAMETERS = [
-        ControlledVehicle.KP_HEADING,
-        ControlledVehicle.KP_HEADING * ControlledVehicle.KP_LATERAL,
-    ]
+    TIME_WANTED_MEAN = 1.5
+    TIME_WANTED_SIGMA = 0.2
 
-    ACCELERATION_RANGE = np.array(
-        [
-            0.5 * np.array(ACCELERATION_PARAMETERS),
-            1.5 * np.array(ACCELERATION_PARAMETERS),
-        ]
-    )
-    STEERING_RANGE = np.array(
-        [
-            np.array(STEERING_PARAMETERS) - np.array([0.07, 1.5]),
-            np.array(STEERING_PARAMETERS) + np.array([0.07, 1.5]),
-        ]
-    )
+    DISTANCE_WANTED_MEAN = 5.0 + ControlledVehicle.LENGTH
+    DISTANCE_WANTED_SIGMA = 1.0
 
-    TIME_WANTED = 2.5
+    DELTA_LOW = 3.5
+    DELTA_UPP = 4.5
 
-    def __init__(
-        self,
-        road: Road,
-        position: Vector,
-        heading: float = 0,
-        speed: float = 0,
-        target_lane_index: int = None,
-        target_speed: float = None,
-        route: Route = None,
-        enable_lane_change: bool = True,
-        timer: float = None,
-        data: dict = None,
-    ):
-        super().__init__(
-            road,
-            position,
-            heading,
-            speed,
-            target_lane_index,
-            target_speed,
-            route,
-            enable_lane_change,
-            timer,
-        )
-        self.data = data if data is not None else {}
-        self.collecting_data = True
+    COMFORT_ACC_MAX_MEAN = 3.0
+    COMFORT_ACC_MAX_SIGMA = 0.5
 
-    def act(self, action: dict | str = None):
-        if self.collecting_data:
-            self.collect_data()
-        super().act(action)
+    COMFORT_ACC_MIN_MEAN = -5.0
+    COMFORT_ACC_MIN_SIGMA = 0.5
+
+    POLITENESS_MEAN = 0.0
+    POLITENESS_SIGMA = 0.1
+
+    # speed_gain / other_vehicle_brake 对应 MOBIL 里的两个阈值
+    LANE_CHANGE_MIN_ACC_GAIN_MEAN = 0.2    # speed_gain 相关
+    LANE_CHANGE_MIN_ACC_GAIN_SIGMA = 0.05
+
+    LANE_CHANGE_MAX_BRAKING_IMPOSED_MEAN = 2.0  # other_vehicle_brake 相关
+    LANE_CHANGE_MAX_BRAKING_IMPOSED_SIGMA = 0.5
+
+    # 驾驶员不完美性：0 表示完全理想，越大随机扰动越强
+    IMPERFECTION_MEAN = 0.0
+    IMPERFECTION_SIGMA = 0.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.imperfection = getattr(self, "IMPERFECTION_MEAN", 0.0)
 
     def randomize_behavior(self):
-        ua = self.road.np_random.uniform(size=np.shape(self.ACCELERATION_PARAMETERS))
-        self.ACCELERATION_PARAMETERS = self.ACCELERATION_RANGE[0] + ua * (
-            self.ACCELERATION_RANGE[1] - self.ACCELERATION_RANGE[0]
+        """在每辆车的风格均值附近采样具体参数。"""
+        rng = self.road.np_random
+
+        # 车道限速，用来确定期望速度
+        # if getattr(self, "lane", None) is not None and self.lane.speed_limit is not None:
+        #     lane_speed = self.lane.speed_limit
+        # else:
+        #     lane_speed = self.road.speed_limit
+
+        # 期望速度（期望速度 = 限速 * 风格比例，再加一点随机）
+        # v0_base = lane_speed * self.DESIRED_SPEED_FACTOR
+        # v0 = rng.normal(v0_base, self.DESIRED_SPEED_SIGMA * v0_base)
+        # self.target_speed = max(0.1, v0)
+
+        # 期望车头时距 / 间距
+        self.TIME_WANTED = max(
+            0.2, rng.normal(self.TIME_WANTED_MEAN, self.TIME_WANTED_SIGMA)
         )
-        ub = self.road.np_random.uniform(size=np.shape(self.STEERING_PARAMETERS))
-        self.STEERING_PARAMETERS = self.STEERING_RANGE[0] + ub * (
-            self.STEERING_RANGE[1] - self.STEERING_RANGE[0]
+        self.DISTANCE_WANTED = max(
+            1.0, rng.normal(self.DISTANCE_WANTED_MEAN, self.DISTANCE_WANTED_SIGMA)
+        )
+
+        # IDM 纵向参数
+        self.DELTA = max(1.0, rng.normal(self.DELTA_LOW, self.DELTA_UPP))
+        self.COMFORT_ACC_MAX = max(
+            0.1, rng.normal(self.COMFORT_ACC_MAX_MEAN, self.COMFORT_ACC_MAX_SIGMA)
+        )
+        self.COMFORT_ACC_MIN = min(
+            -0.1, rng.normal(self.COMFORT_ACC_MIN_MEAN, self.COMFORT_ACC_MIN_SIGMA)
+        )
+
+        # MOBIL 换道参数
+        self.POLITENESS = float(
+            np.clip(
+                rng.normal(self.POLITENESS_MEAN, self.POLITENESS_SIGMA),
+                0.0,
+                1.0,
+            )
+        )
+        self.LANE_CHANGE_MIN_ACC_GAIN = max(
+            0.0,
+            rng.normal(
+                self.LANE_CHANGE_MIN_ACC_GAIN_MEAN,
+                self.LANE_CHANGE_MIN_ACC_GAIN_SIGMA,
+            ),
+        )
+        self.LANE_CHANGE_MAX_BRAKING_IMPOSED = max(
+            0.1,
+            rng.normal(
+                self.LANE_CHANGE_MAX_BRAKING_IMPOSED_MEAN,
+                self.LANE_CHANGE_MAX_BRAKING_IMPOSED_SIGMA,
+            ),
+        )
+
+        # 驾驶员不完美性
+        self.imperfection = max(
+            0.0, rng.normal(self.IMPERFECTION_MEAN, self.IMPERFECTION_SIGMA)
         )
 
     def acceleration(
@@ -420,163 +457,102 @@ class LinearVehicle(IDMVehicle):
         rear_vehicle: Vehicle = None,
     ) -> float:
         """
-        Compute an acceleration command with a Linear Model.
-
-        The acceleration is chosen so as to:
-        - reach a target speed;
-        - reach the speed of the leading (resp following) vehicle, if it is lower (resp higher) than ego's;
-        - maintain a minimum safety distance w.r.t the leading vehicle.
-
-        :param ego_vehicle: the vehicle whose desired acceleration is to be computed. It does not have to be an
-                            Linear vehicle, which is why this method is a class method. This allows a Linear vehicle to
-                            reason about other vehicles behaviors even though they may not Linear.
-        :param front_vehicle: the vehicle preceding the ego-vehicle
-        :param rear_vehicle: the vehicle following the ego-vehicle
-        :return: the acceleration command for the ego-vehicle [m/s2]
+        先用 IDM 算“理想加速度”，再叠加一个与 imperfection 成正比的噪声。
         """
-        return float(
-            np.dot(
-                self.ACCELERATION_PARAMETERS,
-                self.acceleration_features(ego_vehicle, front_vehicle, rear_vehicle),
-            )
-        )
+        base_acc = super().acceleration(ego_vehicle, front_vehicle, rear_vehicle)  # IDM 原公式:contentReference[oaicite:3]{index=3}
 
-    def acceleration_features(
-        self,
-        ego_vehicle: ControlledVehicle,
-        front_vehicle: Vehicle = None,
-        rear_vehicle: Vehicle = None,
-    ) -> np.ndarray:
-        vt, dv, dp = 0, 0, 0
-        if ego_vehicle:
-            vt = (
-                getattr(ego_vehicle, "target_speed", ego_vehicle.speed)
-                - ego_vehicle.speed
-            )
-            d_safe = (
-                self.DISTANCE_WANTED
-                + np.maximum(ego_vehicle.speed, 0) * self.TIME_WANTED
-            )
-            if front_vehicle:
-                d = ego_vehicle.lane_distance_to(front_vehicle)
-                dv = min(front_vehicle.speed - ego_vehicle.speed, 0)
-                dp = min(d - d_safe, 0)
-        return np.array([vt, dv, dp])
+        imp = getattr(self, "imperfection", 0.0)
+        if imp > 0 and self.road is not None:
+            noise = self.road.np_random.normal(0.0, imp * self.COMFORT_ACC_MAX)
+            base_acc += noise
 
-    def steering_control(self, target_lane_index: LaneIndex) -> float:
-        """
-        Linear controller with respect to parameters.
+        return base_acc
 
-        Overrides the non-linear controller ControlledVehicle.steering_control()
+class NormalIDMVehicle(StyledIDMVehicle):
+    """正常驾驶：接近期望速度，适中时距，适中礼貌。"""
+    DESIRED_SPEED_FACTOR = 0.8
+    DESIRED_SPEED_SIGMA = 0.05
 
-        :param target_lane_index: index of the lane to follow
-        :return: a steering wheel angle command [rad]
-        """
-        return float(
-            np.dot(
-                np.array(self.STEERING_PARAMETERS),
-                self.steering_features(target_lane_index),
-            )
-        )
+    TIME_WANTED_MEAN = 1.5
+    TIME_WANTED_SIGMA = 0.15
 
-    def steering_features(self, target_lane_index: LaneIndex) -> np.ndarray:
-        """
-        A collection of features used to follow a lane
+    DISTANCE_WANTED_MEAN = 5.0 + ControlledVehicle.LENGTH
+    DISTANCE_WANTED_SIGMA = 1.0
 
-        :param target_lane_index: index of the lane to follow
-        :return: a array of features
-        """
-        lane = self.road.network.get_lane(target_lane_index)
-        lane_coords = lane.local_coordinates(self.position)
-        lane_next_coords = lane_coords[0] + self.speed * self.TAU_PURSUIT
-        lane_future_heading = lane.heading_at(lane_next_coords)
-        features = np.array(
-            [
-                utils.wrap_to_pi(lane_future_heading - self.heading)
-                * self.LENGTH
-                / utils.not_zero(self.speed),
-                -lane_coords[1] * self.LENGTH / (utils.not_zero(self.speed) ** 2),
-            ]
-        )
-        return features
+    COMFORT_ACC_MAX_MEAN = 3.0
+    COMFORT_ACC_MAX_SIGMA = 0.2
 
-    def longitudinal_structure(self):
-        # Nominal dynamics: integrate speed
-        A = np.array([[0, 0, 1, 0], [0, 0, 0, 1], [0, 0, 0, 0], [0, 0, 0, 0]])
-        # Target speed dynamics
-        phi0 = np.array([[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, -1, 0], [0, 0, 0, -1]])
-        # Front speed control
-        phi1 = np.array([[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, -1, 1], [0, 0, 0, 0]])
-        # Front position control
-        phi2 = np.array(
-            [[0, 0, 0, 0], [0, 0, 0, 0], [-1, 1, -self.TIME_WANTED, 0], [0, 0, 0, 0]]
-        )
-        # Disable speed control
-        front_vehicle, _ = self.road.neighbour_vehicles(self)
-        if not front_vehicle or self.speed < front_vehicle.speed:
-            phi1 *= 0
+    COMFORT_ACC_MIN_MEAN = -5.0
+    COMFORT_ACC_MIN_SIGMA = 0.2
 
-        # Disable front position control
-        if front_vehicle:
-            d = self.lane_distance_to(front_vehicle)
-            if d != self.DISTANCE_WANTED + self.TIME_WANTED * self.speed:
-                phi2 *= 0
-        else:
-            phi2 *= 0
+    POLITENESS_MEAN = 0.2
+    POLITENESS_SIGMA = 0.1
 
-        phi = np.array([phi0, phi1, phi2])
-        return A, phi
+    LANE_CHANGE_MIN_ACC_GAIN_MEAN = 0.3    # 不会为了很小的收益就换道
+    LANE_CHANGE_MIN_ACC_GAIN_SIGMA = 0.0
 
-    def lateral_structure(self):
-        A = np.array([[0, 1], [0, 0]])
-        phi0 = np.array([[0, 0], [0, -1]])
-        phi1 = np.array([[0, 0], [-1, 0]])
-        phi = np.array([phi0, phi1])
-        return A, phi
+    LANE_CHANGE_MAX_BRAKING_IMPOSED_MEAN = 2.0
+    LANE_CHANGE_MAX_BRAKING_IMPOSED_SIGMA = 0.3
 
-    def collect_data(self):
-        """Store features and outputs for parameter regression."""
-        self.add_features(self.data, self.target_lane_index)
-
-    def add_features(self, data, lane_index, output_lane=None):
-        front_vehicle, rear_vehicle = self.road.neighbour_vehicles(self)
-        features = self.acceleration_features(self, front_vehicle, rear_vehicle)
-        output = np.dot(self.ACCELERATION_PARAMETERS, features)
-        if "longitudinal" not in data:
-            data["longitudinal"] = {"features": [], "outputs": []}
-        data["longitudinal"]["features"].append(features)
-        data["longitudinal"]["outputs"].append(output)
-
-        if output_lane is None:
-            output_lane = lane_index
-        features = self.steering_features(lane_index)
-        out_features = self.steering_features(output_lane)
-        output = np.dot(self.STEERING_PARAMETERS, out_features)
-        if "lateral" not in data:
-            data["lateral"] = {"features": [], "outputs": []}
-        data["lateral"]["features"].append(features)
-        data["lateral"]["outputs"].append(output)
+    IMPERFECTION_MEAN = 0.05
+    IMPERFECTION_SIGMA = 0.0
 
 
-class AggressiveVehicle(LinearVehicle):
-    LANE_CHANGE_MIN_ACC_GAIN = 1.0  # [m/s2]
-    MERGE_ACC_GAIN = 0.8
-    MERGE_VEL_RATIO = 0.75
-    MERGE_TARGET_VEL = 30
-    ACCELERATION_PARAMETERS = [
-        MERGE_ACC_GAIN / ((1 - MERGE_VEL_RATIO) * MERGE_TARGET_VEL),
-        MERGE_ACC_GAIN / (MERGE_VEL_RATIO * MERGE_TARGET_VEL),
-        0.5,
-    ]
+class AggressiveIDMVehicle(StyledIDMVehicle):
+    """激进驾驶：高期望速度，短时距，大加速度，小礼貌。"""
+    DESIRED_SPEED_FACTOR = 0.9
+    DESIRED_SPEED_SIGMA = 0.05
+
+    TIME_WANTED_MEAN = 1.0
+    TIME_WANTED_SIGMA = 0.15
+
+    DISTANCE_WANTED_MEAN = 3.0 + ControlledVehicle.LENGTH
+    DISTANCE_WANTED_SIGMA = 0.5
+
+    COMFORT_ACC_MAX_MEAN = 4.0
+    COMFORT_ACC_MAX_SIGMA = 0.3
+
+    COMFORT_ACC_MIN_MEAN = -6.0
+    COMFORT_ACC_MIN_SIGMA = 0.3
+
+    POLITENESS_MEAN = 0.0           # 不管别人
+    POLITENESS_SIGMA = 0.05
+
+    LANE_CHANGE_MIN_ACC_GAIN_MEAN = 0.2   # 为了很小的加速收益也愿意变道（speed_gain 大）
+    LANE_CHANGE_MIN_ACC_GAIN_SIGMA = 0.0
+
+    LANE_CHANGE_MAX_BRAKING_IMPOSED_MEAN = 3.0  # 允许后车为自己猛踩一点刹车
+    LANE_CHANGE_MAX_BRAKING_IMPOSED_SIGMA = 0.3
+
+    IMPERFECTION_MEAN = 0.05          # 更不稳定
+    IMPERFECTION_SIGMA = 0.0
 
 
-class DefensiveVehicle(LinearVehicle):
-    LANE_CHANGE_MIN_ACC_GAIN = 1.0  # [m/s2]
-    MERGE_ACC_GAIN = 1.2
-    MERGE_VEL_RATIO = 0.75
-    MERGE_TARGET_VEL = 30
-    ACCELERATION_PARAMETERS = [
-        MERGE_ACC_GAIN / ((1 - MERGE_VEL_RATIO) * MERGE_TARGET_VEL),
-        MERGE_ACC_GAIN / (MERGE_VEL_RATIO * MERGE_TARGET_VEL),
-        2.0,
-    ]
+class DefensiveIDMVehicle(StyledIDMVehicle):
+    """保守驾驶：低期望速度，长时距，小加速度，高礼貌。"""
+    DESIRED_SPEED_FACTOR = 0.7
+    DESIRED_SPEED_SIGMA = 0.05
+
+    TIME_WANTED_MEAN = 2.0
+    TIME_WANTED_SIGMA = 0.15
+
+    DISTANCE_WANTED_MEAN = 7.0 + ControlledVehicle.LENGTH
+    DISTANCE_WANTED_SIGMA = 1.0
+
+    COMFORT_ACC_MAX_MEAN = 2.0
+    COMFORT_ACC_MAX_SIGMA = 0.3
+
+    COMFORT_ACC_MIN_MEAN = -3.0
+    COMFORT_ACC_MIN_SIGMA = 0.3
+
+    POLITENESS_MEAN = 0.5         # 很讲礼貌
+    POLITENESS_SIGMA = 0.1
+
+    LANE_CHANGE_MIN_ACC_GAIN_MEAN = 0.5    # 必须收益明显才愿意变道
+    LANE_CHANGE_MIN_ACC_GAIN_SIGMA = 0.0
+
+    LANE_CHANGE_MAX_BRAKING_IMPOSED_MEAN = 1.0  # 不愿让别人为自己猛刹
+    LANE_CHANGE_MAX_BRAKING_IMPOSED_SIGMA = 0.3
+
+    IMPERFECTION_MEAN = 0.05       # 也有一点反应误差，但比激进小
+    IMPERFECTION_SIGMA = 0.0

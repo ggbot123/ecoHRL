@@ -27,7 +27,7 @@ class MultiLaneEnv(AbstractEnv):
                 "duration": 50,               # [s]
 
                 # 道路设置
-                "lanes_count": 4,
+                "lanes_count": 3,
                 "road_length": 500.0,
                 "speed_limit": 15.0,          # 限速 [m/s]
 
@@ -36,21 +36,22 @@ class MultiLaneEnv(AbstractEnv):
                 "flow_speed_range": [10.0, 15.0],   # 环境车 初始 + 目标 速度
                 "spawn_min_gap": 10.0,           # 入口附近的最小空间间距 [m]
                 "spawn_min_t_headway": 1.5,      # 最小时间车头时距 [s]
-                "other_vehicles_type": "custom_env.vehicle.behavior.IDMVehicle",
+                # "other_vehicles_type": "custom_env.vehicle.behavior.IDMVehicle",
+                "behavior_vehicle_types": [     # 三种风格 IDM 类型及其概率
+                    "custom_env.vehicle.behavior.NormalIDMVehicle",
+                    "custom_env.vehicle.behavior.AggressiveIDMVehicle",
+                    "custom_env.vehicle.behavior.DefensiveIDMVehicle",
+                ],
+                "behavior_probs": [0.5, 0.2, 0.3],
                 "vid": 0,
 
                 # ego设置
                 "controlled_vehicles": 1,
                 "ego_speed": 10.0,        # [m/s]
-                "initial_lane_id": 2,
-                "warmup_time": 30.0,             # 只跑环境车的时间 [s]
+                "initial_lane_id": 1,
+                "warmup_time": 40.0,             # 只跑环境车的时间 [s]
                 "ego_clear_radius": 10.0,        # 在插入ego前，清除入口附近多远范围内的车辆 [m]
                 
-                # 渲染设置
-                "show_trajectories": False,      # True 时记录并显示车辆轨迹
-                "warmup_render": False,          # True 时在 reset 期间也渲染 warmup 画面
-                "real_time_rendering": False,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
-
                 # 观测-动作-奖励空间配置
                 "observation": {
                     "type": "Kinematics",
@@ -178,33 +179,47 @@ class MultiLaneEnv(AbstractEnv):
             return
         lanes = int(cfg["lanes_count"])
         speed_min, speed_max = cfg["flow_speed_range"]
+        
+        behavior_types = cfg.get(
+            "behavior_vehicle_types",
+            [cfg["other_vehicles_type"]],  # IDM三种风格类型 + 概率
+        )
+        probs = np.array(cfg.get("behavior_probs", [1.0] * len(behavior_types)),
+                        dtype=float)
+        probs = probs / probs.sum()
 
-        # 尝试若干次（不同车道+速度），找一个符合安全间距的插入点
+        # 尝试若干次（不同车道+速度），找一个符合安全间距的插入点，成功生成一辆就退出循环
         for _ in range(2 * lanes):
             lane_id = int(self.np_random.integers(lanes))
             lane_index = ("0", "1", lane_id)
             lane = self.road.network.get_lane(lane_index)
             speed = float(self.np_random.uniform(speed_min, speed_max))
 
-            # 检查初始速度下该车道是否有安全车头时距
+            # 检查是否有安全车头时距
             if not self._can_spawn_on_lane(lane, lane_index, speed):
                 continue
 
-            vehicle_type = utils.class_from_path(cfg["other_vehicles_type"])
+            # 按概率抽一类风格，创建车辆
+            style_idx = int(self.np_random.choice(len(behavior_types), p=probs))
+            vehicle_cls = utils.class_from_path(behavior_types[style_idx])
             position = lane.position(0.0, 0.0)
             heading = lane.heading_at(0.0)
-            v = vehicle_type(self.road, position, heading, speed, target_speed=speed)   # TODO: target_speed按不同风格车辆设定，设为自由流车速/道路限速的一定比率，附加风格内部的随机性
-            cfg["vid"] += 1
-
-            # TODO: 更丰富的随机参数（delta + desire distance & time headway + accel range + politeness...），按不同风格设置，附加风格内部的随机性
-            if hasattr(v, "randomize_behavior"):
-                v.randomize_behavior()
+            v = vehicle_cls(
+                self.road,
+                position,
+                heading,
+                speed,
+                target_speed=speed,
+            )
             v.lane = lane
             v.lane_index = lane_index
+            cfg["vid"] += 1
             v.vid = cfg["vid"]
-
+            if hasattr(v, "randomize_behavior"):    # 随机化车辆参数
+                v.randomize_behavior()
+                
             self.road.vehicles.append(v)
-            break  # 成功生成一辆，就退出循环
+            break
 
     def _can_spawn_on_lane(self, lane, lane_index, new_speed: float) -> bool:
         """

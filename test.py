@@ -11,12 +11,13 @@ env = gym.make(
     # render_mode=None,
     config={
         # 这里可以覆盖 default_config 里定义的任何键
-        "behavior_probs": [0.4, 0.3, 0.3],
-        "spacing_range": [0.3, 1.5],
         "screen_width": 1200,
         "screen_height": 300,
         "scaling": 2.0,              # 越小越“缩放出去”，视野越大
         "centering_position": [0.5, 0.5],  # 观察点放在屏幕中心
+        "show_trajectories": False,      # True 时记录并显示车辆轨迹
+        "warmup_render": False,          # True 时在 reset 期间也渲染 warmup 画面
+        "real_time_rendering": True,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
     },
 )
 
