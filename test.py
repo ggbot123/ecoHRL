@@ -3,6 +3,7 @@ import scenarios.multi_lane  # 触发你在 __init__.py 里的 register
 import numpy as np
 import time
 from util.test_fps import test_env_fps
+from util.plot_result import plot_ego_speed_history
 
 np.random.seed(42)  # 全局随机数生成器，为了可复现的随机场景
 env = gym.make(
@@ -15,9 +16,9 @@ env = gym.make(
         "screen_height": 300,
         "scaling": 2.0,              # 越小越“缩放出去”，视野越大
         "centering_position": [0.5, 0.5],  # 观察点放在屏幕中心
-        "show_trajectories": False,      # True 时记录并显示车辆轨迹
+        "show_trajectories": True,      # True 时记录并显示车辆轨迹
         "warmup_render": False,          # True 时在 reset 期间也渲染 warmup 画面
-        "real_time_rendering": True,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
+        "real_time_rendering": False,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
     },
 )
 
@@ -38,4 +39,6 @@ for _ in range(1000):
     obs, reward, terminated, truncated, info = env.step(action)
     img = env.render()
     if terminated or truncated:
-        obs, info = env.reset(seed=np.random.randint(0, 1e7))
+        if env.unwrapped.config["show_trajectories"]:
+            plot_ego_speed_history(env)
+        obs, info = env.reset(seed=np.random.randint(0, 1e7)) 

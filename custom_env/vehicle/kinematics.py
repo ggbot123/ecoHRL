@@ -28,7 +28,7 @@ class Vehicle(RoadObject):
     """ Maximum reachable speed [m/s] """
     MIN_SPEED = -40.0
     """ Minimum reachable speed [m/s] """
-    HISTORY_SIZE = 30
+    HISTORY_SIZE = 500
     """ Length of the vehicle state history, for trajectory display"""
 
     def __init__(
