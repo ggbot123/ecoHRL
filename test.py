@@ -1,5 +1,5 @@
 import gymnasium as gym
-import scenarios.multi_lane  # 触发你在 __init__.py 里的 register
+import scenarios.multi_lane  # 触发 __init__.py 里的 register
 import numpy as np
 import time
 from util.test_fps import test_env_fps
@@ -35,7 +35,8 @@ env.unwrapped.viewer.observer_vehicle = Dummy([250.0, 5.0])
 
 for _ in range(1000):
     # action = env.action_space.sample()
-    action = 1
+    # action = 1
+    action = [0, 1]
     obs, reward, terminated, truncated, info = env.step(action)
     img = env.render()
     if terminated or truncated:
