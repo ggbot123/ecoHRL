@@ -8,34 +8,6 @@ from util.plot_result import plot_ego_speed_history
 from rl.algos.ppo.ppo import PPO
 from rl.algos.sac.sac import SAC
 
-def instrument_env_rewards(env):
-    """
-    替换 env.unwrapped._reward，使其在每次 step 时记录 reward 各项分量到
-    env.unwrapped._last_rewards_dict，同时保持总 reward 计算方式与 scenario.py 一致。
-    """
-    base_env = env.unwrapped
-    def _reward_with_logging(self, action):
-        # 复用 MultiLaneEnv._rewards 的定义
-        raw = self._rewards(action)
-        on_road = float(raw.get("on_road_reward", 1.0))
-
-        # 记录最近一次 step 的 reward 各项分量 (加权值)
-        weighted = {}
-        for name, val in raw.items():
-            w = float(self.config.get(name, 0.0))
-            weighted[name] = w * float(val) * on_road
-        total = sum(weighted.values())
-
-        # 特别记录 on_road_reward 分量，不计入总奖励，但方便分析
-        weighted["on_road_reward"] = float(raw.get("on_road_reward", 0.0))
-        self._last_rewards_dict = weighted
-        self._last_scalar_reward = total
-
-        return total
-    
-    base_env._reward = types.MethodType(_reward_with_logging, base_env)
-
-
 def load_model(algo: str, model_path: str, env):
     algo = algo.lower()
     if algo == "ppo":
@@ -56,8 +28,8 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
 
     env = gym.make(
         "multi-lane-custom-v0",
-        render_mode="human",
-        # render_mode=None,
+        # render_mode="human",
+        render_mode=None,
         config={
             # 这里可以覆盖 default_config 里定义的任何键
             "screen_width": 1200,
@@ -66,12 +38,11 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
             "centering_position": [0.5, 0.5],
             "show_trajectories": False,      # True 时记录并显示车辆轨迹
             "warmup_render": False,          # True 时在 reset 期间也渲染 warmup 画面
-            "real_time_rendering": True,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
+            "real_time_rendering": False,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
         },
     )
 
     # 记录每一步的 reward 各项分量
-    instrument_env_rewards(env)
     obs, _ = env.reset(seed=42)
 
     if env.unwrapped.render_mode is not None:
@@ -122,7 +93,7 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
             obs, reward, terminated, truncated, info = env.step(action)
 
             # 从 env 中取出刚刚这个 step 的 reward 分量
-            r_dict = getattr(env.unwrapped, "_last_rewards_dict", None)
+            r_dict = getattr(env.unwrapped, "_last_weighted_rewards", None)
             if r_dict is not None:
                 for k in reward_keys:
                     ep_components[k] += float(r_dict.get(k, 0.0))

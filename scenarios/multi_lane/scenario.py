@@ -65,6 +65,8 @@ class MultiLaneEnv(AbstractEnv):
                 "observation": {
                     "type": "Kinematics",
                     "normalize": False,
+                    "see_behind": False,
+                    "include_obstacles": False,
                 },
                 # "action": {
                 #     "type": "DiscreteMetaAction",
@@ -159,6 +161,12 @@ class MultiLaneEnv(AbstractEnv):
     def step(self, action):
         # 让 AbstractEnv 完成 ego 控制 + 仿真
         obs, reward, terminated, truncated, info = super().step(action)
+
+        # 把“加权后的分项奖励”塞进 info，方便 callback 从 infos 里读
+        weighted = getattr(self, "_last_weighted_rewards", None)
+        if isinstance(info, dict) and weighted is not None:
+            info["reward_components"] = dict(weighted)
+
         sim_freq = float(self.config["simulation_frequency"])
         pol_freq = float(self.config["policy_frequency"])
 
@@ -170,12 +178,22 @@ class MultiLaneEnv(AbstractEnv):
     
     # ----------------- RL task 定义 ----------------- #
     def _reward(self, action: Action) -> float:
-        rewards = self._rewards(action)
-        reward = sum(
-            self.config.get(name, 0) * reward for name, reward in rewards.items()
-        )
-        reward *= rewards["on_road_reward"]
-        return reward
+        raw = self._rewards(action)
+        on_road = float(raw["on_road_reward"])
+
+        weighted: dict[str, float] = {}
+        for name, val in raw.items():
+            w = float(self.config.get(name, 0.0))
+            # 各项真实贡献 = 权重 * 原始分项 * on_road gating
+            weighted[name] = w * float(val) * on_road
+        total = sum(weighted.values())
+
+        # 特殊记录 on_road_reward
+        weighted["on_road_reward"] = on_road
+        self._last_raw_rewards = raw
+        self._last_weighted_rewards = weighted
+        
+        return total
 
     def _rewards(self, action: Action) -> dict[str, float]:
         # 当前车道和纵向位置

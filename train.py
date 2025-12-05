@@ -9,6 +9,7 @@ from rl.algos.ppo.ppo import PPO
 from rl.algos.sac.sac import SAC
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from rl.utils.callbacks import RewardComponentsTensorboardCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 import scenarios.multi_lane  # 触发 __init__.py 里的 register
 
@@ -79,6 +80,7 @@ def train(
         save_replay_buffer=False,
         save_vecnormalize=False,
     )
+    rc_tb_callback = RewardComponentsTensorboardCallback(log_freq=1, verbose=0)
 
     # 根据 algo 选择算法和超参数
     if algo == "ppo":
@@ -99,7 +101,7 @@ def train(
     print(f"[INFO] {algo.upper()} 训练开始")
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[eval_callback, checkpoint_callback],
+        callback=[eval_callback, checkpoint_callback, rc_tb_callback],
         progress_bar=True,
     )
     # 保存模型
