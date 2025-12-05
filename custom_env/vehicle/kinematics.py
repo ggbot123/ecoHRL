@@ -26,7 +26,7 @@ class Vehicle(RoadObject):
     """ Range for random initial speeds [m/s] """
     MAX_SPEED = 40.0
     """ Maximum reachable speed [m/s] """
-    MIN_SPEED = -40.0
+    MIN_SPEED = 0
     """ Minimum reachable speed [m/s] """
     HISTORY_SIZE = 500
     """ Length of the vehicle state history, for trajectory display"""

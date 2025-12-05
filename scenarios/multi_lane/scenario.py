@@ -28,7 +28,7 @@ class MultiLaneEnv(AbstractEnv):
 
                 # 道路设置
                 "lanes_count": 3,
-                "road_length": 500.0,
+                "road_length": 320.0,
                 "speed_limit": 15.0,          # 限速 [m/s]
 
                 # 交通流设置
@@ -100,15 +100,31 @@ class MultiLaneEnv(AbstractEnv):
 
     # ----------------- reset：预热 + 插入 ego ----------------- #
     def _reset(self):
-        # 1) 建路 & 清空车辆
-        self._create_road()
-        self.road.vehicles = []
-        self.controlled_vehicles = []
+        """
+        - 第一次 reset：建路 + 全局 warmup 交通流 + 插入 ego；
+        - 后续 reset：保留现有路网和交通流，只移除旧 ego、清理一下车流，再插入新的 ego。
+        """
+        first_reset = not getattr(self, "_did_global_warmup", False)
+        if first_reset:
+            # ------- 第一次：建立路网 + 清空所有车辆 + 预热交通流 -------
+            self._create_road()
+            self.road.vehicles = []
+            self.controlled_vehicles = []
 
-        # 2) 预热 warmup_time 秒
-        self._warmup(render=self.config.get("warmup_render", False))
+            # 只跑环境车 warmup_time 秒
+            self._warmup(render=self.config.get("warmup_render", False))
 
-        # 3) warmup 结束后，从入口插入 ego
+            # 打标记：后续 reset 不再重建 & warmup
+            self._did_global_warmup = True
+        else:
+            # 把上一回合的 ego 从 road.vehicles 里移除
+            if getattr(self, "vehicle", None) is not None:
+                try:
+                    self.road.vehicles.remove(self.vehicle)
+                except ValueError:
+                    pass
+            self.controlled_vehicles = []
+            self._clear_background()
         self._create_ego()
 
     def _warmup(self, render: bool = False):
