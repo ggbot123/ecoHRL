@@ -1,45 +1,213 @@
 import gymnasium as gym
 import scenarios.multi_lane  # 触发 __init__.py 里的 register
 import numpy as np
-import time
+import types, os
 from util.test_fps import test_env_fps
 from util.plot_result import plot_ego_speed_history
 
-np.random.seed(42)  # 全局随机数生成器，为了可复现的随机场景
-env = gym.make(
-    "multi-lane-custom-v0",
-    render_mode="human",
-    # render_mode=None,
-    config={
-        # 这里可以覆盖 default_config 里定义的任何键
-        "screen_width": 1200,
-        "screen_height": 300,
-        "scaling": 2.0,              # 越小越“缩放出去”，视野越大
-        "centering_position": [0.5, 0.5],  # 观察点放在屏幕中心
-        "show_trajectories": True,      # True 时记录并显示车辆轨迹
-        "warmup_render": False,          # True 时在 reset 期间也渲染 warmup 画面
-        "real_time_rendering": False,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
-    },
-)
+from rl.algos.ppo.ppo import PPO
+from rl.algos.sac.sac import SAC
 
-# 初始化
-seed = np.random.randint(0, 1e7)
-obs, info = env.reset(seed=seed)
+def instrument_env_rewards(env):
+    """
+    替换 env.unwrapped._reward，使其在每次 step 时记录 reward 各项分量到
+    env.unwrapped._last_rewards_dict，同时保持总 reward 计算方式与 scenario.py 一致。
+    """
+    base_env = env.unwrapped
+    def _reward_with_logging(self, action):
+        # 复用 MultiLaneEnv._rewards 的定义
+        raw = self._rewards(action)
+        on_road = float(raw.get("on_road_reward", 1.0))
 
-# 定义一个“假车”，把摄像头锁在中心点
-class Dummy:
-    def __init__(self, pos):
-        self.position = np.array(pos, dtype=float)
-env.render()    # 先 render 一帧，env 内部会创建 env.viewer
-env.unwrapped.viewer.observer_vehicle = Dummy([250.0, 5.0])
+        # 记录最近一次 step 的 reward 各项分量 (加权值)
+        weighted = {}
+        for name, val in raw.items():
+            w = float(self.config.get(name, 0.0))
+            weighted[name] = w * float(val) * on_road
+        total = sum(weighted.values())
 
-for _ in range(1000):
-    # action = env.action_space.sample()
-    # action = 1
-    action = [0, 1]
-    obs, reward, terminated, truncated, info = env.step(action)
-    img = env.render()
-    if terminated or truncated:
-        if env.unwrapped.config["show_trajectories"]:
+        # 特别记录 on_road_reward 分量，不计入总奖励，但方便分析
+        weighted["on_road_reward"] = float(raw.get("on_road_reward", 0.0))
+        self._last_rewards_dict = weighted
+        self._last_scalar_reward = total
+
+        return total
+    
+    base_env._reward = types.MethodType(_reward_with_logging, base_env)
+
+
+def load_model(algo: str, model_path: str, env):
+    algo = algo.lower()
+    if algo == "ppo":
+        model = PPO.load(model_path, env=env)
+    elif algo == "sac":
+        model = SAC.load(model_path, env=env)
+    else:
+        raise ValueError(f"未知算法类型: {algo}")
+    return model
+
+def main(model_path: str, model_name: str, algo: str, episodes: int):
+    # 日志文件：模型所在目录下的 txt
+    log_path = os.path.join(model_path, f"eval_{algo.lower()}.txt")
+    log_file = open(log_path, "w", encoding="utf-8")
+    def log(msg: str = ""):
+        print(msg)
+        log_file.write(msg + "\n")
+
+    env = gym.make(
+        "multi-lane-custom-v0",
+        render_mode="human",
+        # render_mode=None,
+        config={
+            # 这里可以覆盖 default_config 里定义的任何键
+            "screen_width": 1200,
+            "screen_height": 300,
+            "scaling": 3,
+            "centering_position": [0.5, 0.5],
+            "show_trajectories": False,      # True 时记录并显示车辆轨迹
+            "warmup_render": False,          # True 时在 reset 期间也渲染 warmup 画面
+            "real_time_rendering": True,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
+        },
+    )
+
+    # 记录每一步的 reward 各项分量
+    instrument_env_rewards(env)
+    obs, _ = env.reset(seed=42)
+
+    if env.unwrapped.render_mode is not None:
+        # 定义一个“假车”，把摄像头锁在中心点
+        class Dummy:
+            def __init__(self, pos):
+                self.position = np.array(pos, dtype=float)
+        env.render()    # 先 render 一帧，env 内部会创建 env.viewer
+        env.unwrapped.viewer.observer_vehicle = Dummy([160.0, 5.0])
+
+    # 加载模型
+    model = load_model(algo, os.path.join(model_path, model_name), env)
+
+    # reward key 列表，保持与 MultiLaneEnv._rewards 一致
+    reward_keys = [
+        "collision_reward",
+        "progress_reward",
+        "comfort_reward",
+        "lane_change_reward",
+        "punctual_reward",
+        "on_road_reward",
+    ]
+    log("=" * 80)
+    log(f"Eval model: {model_path}")
+    log(f"Algo      : {algo}")
+    log(f"Episodes  : {episodes}")
+    log("=" * 80)
+
+    # 用于统计均值
+    episode_lengths = []
+    episode_total_rewards = []
+    agg_components = {k: 0.0 for k in reward_keys}
+    arrived_count = 0
+    arrival_times = []
+
+    for ep in range(1, episodes+1):
+        # 每个 episode 重置环境和统计量
+        obs, _ = env.reset()
+        terminated = False
+        truncated = False
+        step_count = 0
+        ep_total_reward = 0.0
+        ep_components = {k: 0.0 for k in reward_keys}
+
+        while not (terminated or truncated):
+            # 用训练好的模型选择动作
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+
+            # 从 env 中取出刚刚这个 step 的 reward 分量
+            r_dict = getattr(env.unwrapped, "_last_rewards_dict", None)
+            if r_dict is not None:
+                for k in reward_keys:
+                    ep_components[k] += float(r_dict.get(k, 0.0))
+            ep_total_reward += float(reward)
+            step_count += 1
+            if env.unwrapped.render_mode is not None:
+                env.render() 
+        # Episode 结束，判断是否成功到达
+        base_env = env.unwrapped
+        crashed = getattr(base_env.vehicle, "crashed", False)
+        arrived = bool(getattr(base_env, "_has_arrived", False))
+        arrival_time = getattr(base_env, "_arrival_time", None)
+
+        # 打印本 episode 结果
+        reason = "unknown"
+        if truncated:
+            reason = "truncated(time limit)"
+        else:
+            # terminated
+            if crashed:
+                reason = "terminated(crash)"
+            elif arrived:
+                reason = "terminated(goal)"
+            else:
+                reason = "terminated(other)"
+        # 统计到全局
+        episode_lengths.append(step_count)
+        episode_total_rewards.append(ep_total_reward)
+        for k in reward_keys:
+            agg_components[k] += ep_components[k]
+        if arrived and (arrival_time is not None):
+            arrived_count += 1
+            arrival_times.append(float(arrival_time))
+
+        # ---- 打印 / 写日志：单个 episode 结果 ----
+        log("=" * 60)
+        log(f"Episode {ep}:")
+        log(f"  length (steps) : {step_count}")
+        log(f"  total reward   : {ep_total_reward:.4f}")
+        log(f"  terminated info: {reason}")
+        log("  reward components (sum over episode):")
+        for k in reward_keys:
+            log(f"    {k:18s}: {ep_components[k]: .6f}")
+        # 成功到达目标时，打印到达时间
+        if arrived and arrival_time is not None:
+            log(f"  ARRIVED at t = {arrival_time:.3f} s")
+        # 如需画速度轨迹
+        if base_env.config["show_trajectories"]:
             plot_ego_speed_history(env)
-        obs, info = env.reset(seed=np.random.randint(0, 1e7)) 
+    
+    # ====== 统计所有 episode 的均值并打印 ======
+    n = episodes
+    mean_len = float(np.mean(episode_lengths)) if n > 0 else 0.0
+    mean_total_rew = float(np.mean(episode_total_rewards)) if n > 0 else 0.0
+    log("=" * 80)
+    log("Summary over all episodes:")
+    log(f"  episodes          : {n}")
+    log(f"  mean length       : {mean_len:.3f} steps")
+    log(f"  mean total reward : {mean_total_rew:.6f}")
+    log("  mean reward components (per episode):")
+    for k in reward_keys:
+        mean_k = agg_components[k] / n
+        log(f"    {k:18s}: {mean_k: .6f}")
+    arrive_rate = arrived_count / n
+    log(f"  arrival rate      : {arrive_rate * 100:.2f}%")
+    if arrived_count > 0:
+        mean_arrival_time = float(np.mean(arrival_times))
+        log(f"  mean arrival time : {mean_arrival_time:.3f} s (over {arrived_count} success episodes)")
+    else:
+        log("  mean arrival time : N/A (no successful episodes)")
+    log("=" * 80)
+
+    log_file.close()
+    env.close()
+
+
+if __name__ == "__main__":
+    # main(
+    #     model_path="./models/ppo_20251205-134029/best_model.zip",
+    #     algo="ppo",
+    #     episodes=30,
+    # )
+    main(
+        model_path="./models/sac_20251205-133820",
+        model_name="best_model.zip",
+        algo="sac",
+        episodes=30,
+    )

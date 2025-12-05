@@ -31,7 +31,11 @@ def make_env():
         env = gym.make(
             "multi-lane-custom-v0",
             render_mode=None,
-            config={},
+            # render_mode="human",
+            config={
+                "policy_frequency": 10, 
+                "duration": 30,               # [s]
+            },
         )
         env = Monitor(env)
         env.reset(seed=env_seed)
@@ -106,17 +110,17 @@ def train(
     eval_env.close()
 
 if __name__ == "__main__":
-    # train(
-    #     algo="ppo", 
-    #     total_timesteps=1_000_000, 
-    #     eval_freq=10_000, 
-    #     save_freq=50_000,
-    #     n_envs=1,
-    # )
     train(
-        algo="sac", 
+        algo="ppo", 
         total_timesteps=1_000_000, 
         eval_freq=10_000, 
         save_freq=50_000,
-        n_envs=1,
+        n_envs=4,
     )
+    # train(
+    #     algo="sac", 
+    #     total_timesteps=1_000_000, 
+    #     eval_freq=10_000, 
+    #     save_freq=50_000,
+    #     n_envs=4,
+    # )

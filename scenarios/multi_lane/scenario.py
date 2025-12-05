@@ -2,7 +2,6 @@ import numpy as np
 
 from custom_env.envs.common.abstract import AbstractEnv
 from custom_env.road.road import Road, RoadNetwork
-from custom_env.vehicle.controller import ControlledVehicle
 from custom_env.envs.common.action import Action
 from custom_env import utils
 
@@ -171,7 +170,6 @@ class MultiLaneEnv(AbstractEnv):
         # 当前车道和纵向位置
         lane = self.road.network.get_lane(self.vehicle.lane_index)
         longi, _ = lane.local_coordinates(self.vehicle.position)
-        neighbours = self.road.network.all_side_lanes(self.vehicle.lane_index)
 
         # ---------- 1) 进度奖励 ----------
         last_longi = getattr(self, "_last_longitudinal", longi)
@@ -204,13 +202,13 @@ class MultiLaneEnv(AbstractEnv):
         self._last_lane_id = curr_lane_id
         self._last_longitudinal = longi
         return {
-        "collision_reward": float(self.vehicle.crashed),
-        "progress_reward": progress,
-        "comfort_reward": comfort,
-        "lane_change_reward": lane_changed,
-        "punctual_reward": punctual,
-        "on_road_reward": float(self.vehicle.on_road),
-    }
+            "collision_reward": float(self.vehicle.crashed),
+            "progress_reward": progress,
+            "comfort_reward": comfort,
+            "lane_change_reward": lane_changed,
+            "punctual_reward": punctual,
+            "on_road_reward": float(self.vehicle.on_road),
+        }
     
 
     def _is_terminated(self) -> bool:
