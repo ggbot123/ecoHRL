@@ -57,16 +57,26 @@ class MultiLaneEnv(AbstractEnv):
                     "type": "Kinematics",
                     "normalize": False,
                 },
+                # "action": {
+                #     "type": "DiscreteMetaAction",
+                #     "target_speeds": np.linspace(10, 20, 3),  # [m/s]，设置MDPVehicle可选目标速度
+                # },
                 "action": {
-                    "type": "DiscreteMetaAction",
-                    "target_speeds": np.linspace(10, 20, 3),  # [m/s]，设置MDPVehicle可选目标速度
+                    "type": "ParamLaneAccelAction",
+                    "acceleration_range": [-5.0, 5.0],
+                    "lane_actions": ["KEEP", "LANE_LEFT", "LANE_RIGHT"],
                 },
-                "collision_reward": -10,  # The reward received when colliding with a vehicle.
-                "progress_reward": 1,  # The reward received when moving forward.
-                "comfort_reward": 0.2,  # The reward received when accelerating / decelerating.
-                "lane_change_reward": -0.5,  # The reward received at each lane change action.
-                "punctual_reward": 10,  # The reward received when reaching the goal on time.
-                "reward_speed_range": [10, 15], # TODO: calculated by goal position
+                "goal_longitudinal": 300.0,        # 任务 / 目标设置
+                "goal_lane_id": 2,
+                "punctual_time_window": [20.0, 30.0],   # punctual arrival reward
+                "punctual_time_target": 25.0,
+                "punctual_reward": 10.0,
+                "collision_reward": -10.0,  # collision penalty
+                "progress_reward": 1,  # progress reward
+                "comfort_reward": 0.2,  # comfort reward
+                "comfort_max_accel": 3.0, 
+                "lane_change_reward": -0.5,  # lane change penalty
+                # "reward_speed_range": [10, 15], # TODO: calculated by goal position
                 "offroad_terminal": False,
             }
         )
@@ -142,26 +152,56 @@ class MultiLaneEnv(AbstractEnv):
         return reward
 
     def _rewards(self, action: Action) -> dict[str, float]:
+        # 当前车道和纵向位置
+        lane = self.road.network.get_lane(self.vehicle.lane_index)
+        longi, _ = lane.local_coordinates(self.vehicle.position)
         neighbours = self.road.network.all_side_lanes(self.vehicle.lane_index)
-        lane = (
-            self.vehicle.target_lane_index[2]
-            if isinstance(self.vehicle, ControlledVehicle)
-            else self.vehicle.lane_index[2]
-        )
-        # Use forward speed rather than speed, see https://github.com/eleurent/highway-env/issues/268
-        forward_speed = self.vehicle.speed * np.cos(self.vehicle.heading)
-        scaled_speed = utils.lmap(
-            forward_speed, self.config["reward_speed_range"], [0, 1]
-        )
+
+        # ---------- 1) 进度奖励 ----------
+        last_longi = getattr(self, "_last_longitudinal", longi)
+        delta_s = max(longi - last_longi, 0.0)
+        goal_long = float(self.config.get("goal_longitudinal", self.config["road_length"]))
+        progress = np.clip(delta_s / goal_long, 0.0, 1.0)
+
+        # ---------- 2) 舒适性奖励（加速度） ----------
+        dt = 1.0 / float(self.config["policy_frequency"])
+        cur_speed = self.vehicle.speed
+        last_speed = getattr(self, "_last_speed", cur_speed)
+        acc = (cur_speed - last_speed) / dt
+
+        a_max = float(self.config["comfort_max_accel"])
+        comfort = - (min(abs(acc) / a_max, 1.0) ** 2) * dt
+
+        # ---------- 3) 换道惩罚 ----------
+        curr_lane_id = self.vehicle.lane_index[2]
+        last_lane_id = getattr(self, "_last_lane_id", curr_lane_id)
+        lane_changed = 1.0 if curr_lane_id != last_lane_id else 0.0
+
+        # ---------- 4) 准时性奖励（只在首次到达目标时给） ----------
+        punctual = 0.0
+        if not getattr(self, "_has_arrived", False) and self._goal_reached():
+            self._has_arrived = True
+            self._arrival_time = self.time
+            punctual = self._punctual_factor(self._arrival_time)
+
+        self._last_speed = cur_speed
+        self._last_lane_id = curr_lane_id
+        self._last_longitudinal = longi
         return {
-            "collision_reward": float(self.vehicle.crashed),
-            "on_road_reward": float(self.vehicle.on_road),
-        }
+        "collision_reward": float(self.vehicle.crashed),
+        "progress_reward": progress,
+        "comfort_reward": comfort,
+        "lane_change_reward": lane_changed,
+        "punctual_reward": punctual,
+        "on_road_reward": float(self.vehicle.on_road),
+    }
+    
 
     def _is_terminated(self) -> bool:
-        """The episode is over if the ego vehicle crashed or reached the goal."""
+        """The episode is over if the ego vehicle crashed, reached the goal, or went off-road."""
         return (
             self.vehicle.crashed
+            or self._goal_reached()
             or self.config["offroad_terminal"]
             and not self.vehicle.on_road
         )
@@ -280,7 +320,7 @@ class MultiLaneEnv(AbstractEnv):
     # ----------------- 预热后，在入口插入 ego ----------------- #
     def _create_ego(self):
         cfg = self.config
-        lane_id = cfg.get("initial_lane_id")
+        lane_id = cfg["initial_lane_id"] if cfg["initial_lane_id"] != "random" else int(self.np_random.integers(int(cfg["lanes_count"])))
         lane_index = ("0", "1", int(lane_id))
         lane = self.road.network.get_lane(lane_index)
 
@@ -306,3 +346,40 @@ class MultiLaneEnv(AbstractEnv):
         self.vehicle = ego
         self.controlled_vehicles = [ego]
         self.road.vehicles.append(ego)
+
+        # ====== 初始化奖励相关的历史量 ======
+        self._last_speed = ego_speed
+        self._last_lane_id = lane_id
+        self._last_longitudinal = longi0
+        self._has_arrived = False
+        self._arrival_time = None
+
+    def _goal_reached(self) -> bool:
+        """判断是否到达右侧车道的目标位置 x >= goal_longitudinal。"""
+        goal_lane_id = self.config["goal_lane_id"]
+
+        lane_index = self.vehicle.lane_index
+        if lane_index[2] != goal_lane_id:
+            return False
+
+        lane = self.road.network.get_lane(lane_index)
+        longi, _ = lane.local_coordinates(self.vehicle.position)
+
+        goal_long = float(self.config.get("goal_longitudinal", 300.0))
+        return longi >= goal_long
+    
+    def _punctual_factor(self, t: float) -> float:
+        """根据到达时间 t 计算 [0,1] 上的准时性系数"""
+        t_min, t_max = self.config.get("punctual_time_window", [20.0, 30.0])
+        t_target = float(self.config.get("punctual_time_target", 25.0))
+
+        if t < t_min or t > t_max:
+            return 0.0
+
+        half_width = min(t_target - t_min, t_max - t_target)
+        if half_width <= 0:
+            return 0.0
+
+        d = abs(t - t_target) / half_width   # in [0,1]
+        d = min(d, 1.0)
+        return 1.0 - 0.5 * d

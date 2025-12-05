@@ -298,6 +298,134 @@ class DiscreteMetaAction(ActionType):
         return actions
 
 
+class ParamLaneAccelAction(ActionType):
+    """
+    Parameterized action for RL:
+    （默认）动作空间：Box([-1, -1], [1, 1])
+        - action[0] ∈ [-1, 1] : 车道决策，三等分区间
+            [-1,   -1/3)  -> LANE_LEFT
+            [-1/3,  1/3]  -> KEEP
+            ( 1/3,  1]    -> LANE_RIGHT
+        - action[1] ∈ [-1, 1] : 纵向加速度的归一化值，经线性映射到物理加速度
+    同时兼容 Dict 形式：
+        {
+            "lane_change": 0/1/2,          # 0: KEEP, 1: LANE_LEFT, 2: LANE_RIGHT
+            "acceleration": acc_phys,      # 物理加速度 [m/s^2]
+        }
+    steering 始终由车模内部（如 RLControlledVehicle）调用自己的 steering/换道控制器计算。
+    """
+
+    ACCELERATION_RANGE = (-5, 5.0)
+    """Acceleration range: [-x, x], in m/s²."""
+    LANE_ACTIONS = ["KEEP", "LANE_LEFT", "LANE_RIGHT"]
+    """Default lane actions: KEEP, LANE_LEFT, LANE_RIGHT."""
+
+    def __init__(
+        self,
+        env: AbstractEnv,
+        acceleration_range: tuple[float, float] | None = None,
+        lane_actions: list[str] | None = None,
+        clip: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(env)
+
+        # 加速度物理范围
+        self.acc_min, self.acc_max = acceleration_range if acceleration_range is not None else self.ACCELERATION_RANGE
+        # 车道动作语义（默认：0: KEEP, 1: LANE_LEFT, 2: LANE_RIGHT）
+        self.lane_actions = lane_actions if lane_actions is not None else self.LANE_ACTIONS
+        assert (len(self.lane_actions) == 3), "lane_actions 期望 3 个元素：KEEP / LANE_LEFT / LANE_RIGHT"
+        assert "KEEP" in self.lane_actions
+        assert "LANE_LEFT" in self.lane_actions
+        assert "LANE_RIGHT" in self.lane_actions
+        # 动作空间定义为 2 维 Box： [lane_scalar, acceleration_scalar]
+        self._space = spaces.Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self._lane_index_by_name = {
+            name: idx for idx, name in enumerate(self.lane_actions)
+        }
+        self.clip = clip
+    
+    def space(self) -> spaces.Space:
+        """
+        默认暴露给 RL 的动作空间：Box([-1, -1], [1, 1])。
+        对 action[0] 做三等分映射到车道选择，对 action[1] 线性映射到物理加速度。
+        """
+        return self._space
+    
+    @property
+    def vehicle_class(self) -> Callable:
+        from custom_env.vehicle.controller import RLControlledVehicle  # 延迟导入，避免循环引用
+        return RLControlledVehicle
+    
+    # ---------- 内部工具函数 ----------
+    def _scalar_to_lane_index(self, x: float) -> int:
+        """将 [-1, 1] 上的连续标量映射为 lane_actions 中的一个离散 index。"""
+        x = float(np.clip(x, -1.0, 1.0))
+        if x < -1/3:
+            return self._lane_index_by_name["LANE_LEFT"]
+        elif x > 1/3:
+            return self._lane_index_by_name["LANE_RIGHT"]
+        else:
+            return self._lane_index_by_name["KEEP"]
+
+    def _map_acceleration(self, a: float, normalized: bool) -> float:
+        """
+        将加速度标量映射到物理加速度范围 [acc_min, acc_max]。
+        - 如果 normalized=True，则认为 a ∈ [-1, 1]，先截断再线性映射；
+        - 如果 normalized=False，则认为 a 已经是物理加速度，只做范围截断。
+        """
+        if normalized:
+            if self.clip:
+                a = float(np.clip(a, -1.0, 1.0))
+            return float(utils.lmap(a, [-1.0, 1.0], [self.acc_min, self.acc_max]))
+        else:
+            return float(np.clip(a, self.acc_min, self.acc_max))
+    
+    # ---------- 动作执行 ----------
+    def act(self, action: Action) -> None:
+        """
+        将 RL 的动作翻译给受控车辆（一般是 RLControlledVehicle）。
+        支持以下形式：
+        1) Dict：
+           {
+               "lane_change": 0/1/2,        # 对应 lane_actions 中元素
+               "acceleration": acc_phys,    # 物理加速度 [m/s^2]
+           }
+        2) np.ndarray / list / tuple，形状 (2,)：
+           action[0] ∈ [-1, 1] : 映射车道选择
+           action[1] ∈ [-1, 1] : 映射到物理加速度
+        """
+        ego = self.controlled_vehicle
+        lane_cmd_idx = self._lane_index_by_name["KEEP"]
+        acc_phys = 0.0
+
+        # ---- 1) Dict 形式：直接读取离散 + 物理加速度 ----
+        if isinstance(action, dict):
+            if "lane_change" in action:
+                lane_cmd_idx = int(action["lane_change"])
+            if "acceleration" in action:
+                # 认为已经是物理加速度
+                acc_phys = self._map_acceleration(float(action["acceleration"]), normalized=False)
+
+        # ---- 2) Box / 序列形式：[-1,1]^2 ----
+        elif isinstance(action, (np.ndarray, list, tuple)):
+            if len(action) >= 1:
+                a0 = float(action[0])
+                lane_cmd_idx = self._scalar_to_lane_index(a0)
+            if len(action) >= 2:
+                a1 = float(action[1])
+                acc_phys = self._map_acceleration(a1, normalized=True)
+
+        # 防御性截断 lane index
+        lane_cmd_idx = int(np.clip(lane_cmd_idx, 0, len(self.lane_actions) - 1))
+
+        # 把解析出的 “离散车道选择 + 物理加速度” 交给车模
+        ego.act({"lane_change": lane_cmd_idx, "acceleration": acc_phys})
+
 class MultiAgentAction(ActionType):
     def __init__(self, env: AbstractEnv, action_config: dict, **kwargs) -> None:
         super().__init__(env)
@@ -340,5 +468,7 @@ def action_factory(env: AbstractEnv, config: dict) -> ActionType:
         return DiscreteMetaAction(env, **config)
     elif config["type"] == "MultiAgentAction":
         return MultiAgentAction(env, **config)
+    elif config["type"] == "ParamLaneAccelAction":
+        return ParamLaneAccelAction(env, **config)
     else:
         raise ValueError("Unknown action type")

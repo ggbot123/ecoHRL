@@ -253,6 +253,87 @@ class ControlledVehicle(Vehicle):
         return tuple(zip(*pos_heads))
 
 
+class RLControlledVehicle(ControlledVehicle):
+    """
+    给 RL 用的车辆：
+    - 车道选择由 RL 提供离散动作（KEEP / LEFT / RIGHT），内部更新 target_lane_index；
+    - steering 一律用父类的 steering_control 计算；
+    - 纵向加速度直接用 RL 给的 acceleration，不再用 speed_control。
+    """
+
+    def __init__(
+        self,
+        road: Road,
+        position: Vector,
+        heading: float = 0,
+        speed: float = 0,
+        target_lane_index: LaneIndex = None,
+        target_speed: float = None,
+        route: Route = None,
+    ):
+        super().__init__(road, position, heading, speed,
+                         target_lane_index=target_lane_index,
+                         target_speed=target_speed,
+                         route=route)
+        # 最近一次 RL 下发的加速度（在 policy_step 间隔内复用）
+        self.rl_acceleration: float = 0.0
+    
+    def _apply_lane_change_command(self, lane_change_cmd: int) -> None:
+        """
+        lane_change_cmd: 0=KEEP, 1=LANE_LEFT, 2=LANE_RIGHT
+        """
+        if lane_change_cmd == 0:
+            return
+
+        _from, _to, _id = self.target_lane_index
+        lanes_on_edge = self.road.network.graph[_from][_to]
+        max_lane_id = len(lanes_on_edge) - 1
+
+        if lane_change_cmd == 1:  # LANE_LEFT
+            self.target_lane_index = (_from, _to, int(np.clip(_id - 1, 0, max_lane_id)))
+        elif lane_change_cmd == 2:  # LANE_RIGHT
+            self.target_lane_index = (_from, _to, int(np.clip(_id + 1, 0, max_lane_id)))
+        else:
+            return
+    
+    def act(self, action: Union[dict, str, None] = None) -> None:
+        """
+        两种模式：
+        1) 如果传入 dict 且含有 'acceleration'，认为是 RL 的 parameterized 动作：
+           - action["lane_change"]: 0/1/2
+           - action["acceleration"]: 连续加速度（已在 ActionType 中截断过）
+        2) 如果 action is None：说明这是 Road.act() 在仿真频率下调用，
+           不再用 speed_control，只复用上一次 RL 的加速度，重新算一次 steering。
+        """
+        self.follow_road()
+
+        # ------- policy step -------
+        # 在 env.step() 中调用。
+        if isinstance(action, dict) and "acceleration" in action:
+            # 记录 RL 给的加速度，在 policy_frequency 内会被复用
+            self.rl_acceleration = float(action["acceleration"])
+
+            # 横向控制：用 target_lane_index 跟踪车道中心
+            self._apply_lane_change_command(action["lane_change"])
+            steering = self.steering_control(self.target_lane_index)
+            steering = np.clip(
+                steering, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE
+            )
+
+            # 调用 Vehicle.act（跳过 ControlledVehicle.act 的 speed_control）
+            Vehicle.act(self, {"steering": steering,
+                               "acceleration": self.rl_acceleration})
+            return
+
+        # ------- simulation step -------
+        # 这一分支在 Road.act() 中，两个policy step之间调用。
+        steering = self.steering_control(self.target_lane_index)
+        steering = np.clip(
+            steering, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE
+        )
+        Vehicle.act(self, {"steering": steering,
+                           "acceleration": getattr(self, "rl_acceleration", 0.0)})
+
 class MDPVehicle(ControlledVehicle):
     """A controlled vehicle with a specified discrete range of allowed target speeds."""
 
