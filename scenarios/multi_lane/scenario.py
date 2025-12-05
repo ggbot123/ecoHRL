@@ -4,8 +4,18 @@ from custom_env.envs.common.abstract import AbstractEnv
 from custom_env.road.road import Road, RoadNetwork
 from custom_env.envs.common.action import Action
 from custom_env import utils
+from custom_env.vehicle.objects import Obstacle
 
 Observation = np.ndarray
+
+class BusStop(Obstacle):
+    """
+    静态矩形公交站台，沿道路方向放置。
+    length: 沿道路方向长度
+    width:  垂直道路方向宽度（从路缘向右侧延伸）
+    """
+    LENGTH = 20.0  # m，沿 x 方向
+    WIDTH = 3.0    # m，可以自己调宽一点，比如 3~4m
 
 class MultiLaneEnv(AbstractEnv):
     """
@@ -96,6 +106,7 @@ class MultiLaneEnv(AbstractEnv):
             np_random=self.np_random,
             record_history=self.config["show_trajectories"],
         )
+        self._create_bus_stop()
 
     # ----------------- reset：预热 + 插入 ego ----------------- #
     def _reset(self):
@@ -397,3 +408,23 @@ class MultiLaneEnv(AbstractEnv):
         d = abs(t - t_target) / half_width   # in [0,1]
         d = min(d, 1.0)
         return 1.0 - 0.5 * d
+    
+    def _create_bus_stop(self):
+        lane_index = ("0", "1", int(self.config["lanes_count"]) - 1)
+        lane = self.road.network.get_lane(lane_index)
+
+        center_long = float(self.config.get("goal_longitudinal", 300.0))  # 以 x=300 为中心
+        bus_length = BusStop.LENGTH
+        bus_width = BusStop.WIDTH
+        lane_half_width = getattr(lane, "width", 4.0) / 2.0
+        margin = 0.5  # 车道右缘和站台中线之间留一点间隙
+        lateral_center = lane_half_width + margin + bus_width / 2.0
+
+        position = lane.position(center_long, lateral_center)
+        heading = lane.heading_at(center_long)
+
+        # 创建 BusStop 对象并加入 road.objects，交给 viewer 渲染
+        bus_stop = BusStop(self.road, position, heading)
+        if not hasattr(self.road, "objects"):
+            self.road.objects = []
+        self.road.objects.append(bus_stop)
