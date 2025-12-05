@@ -36,6 +36,12 @@ def make_env():
             config={
                 "policy_frequency": 10, 
                 "duration": 30,               # [s]
+                "observation": {
+                    "type": "Kinematics",
+                    "normalize": False,
+                    "include_time": True,           # 在观测中加入当前时间
+                    "time_range": [0.0, 30.0],
+                }
             },
         )
         env = Monitor(env)
@@ -112,17 +118,17 @@ def train(
     eval_env.close()
 
 if __name__ == "__main__":
-    train(
-        algo="ppo", 
-        total_timesteps=1_000_000, 
-        eval_freq=10_000, 
-        save_freq=50_000,
-        n_envs=4,
-    )
     # train(
-    #     algo="sac", 
-    #     total_timesteps=1_000_000, 
+    #     algo="ppo", 
+    #     total_timesteps=5_000_000, 
     #     eval_freq=10_000, 
     #     save_freq=50_000,
-    #     n_envs=4,
+    #     n_envs=8,
     # )
+    train(
+        algo="sac", 
+        total_timesteps=5_000_000, 
+        eval_freq=10_000, 
+        save_freq=50_000,
+        n_envs=8,
+    )

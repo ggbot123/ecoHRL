@@ -32,6 +32,7 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
         render_mode=None,
         config={
             # 这里可以覆盖 default_config 里定义的任何键
+            "policy_frequency": 10,         # [Hz]
             "screen_width": 1200,
             "screen_height": 300,
             "scaling": 3,
@@ -39,6 +40,12 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
             "show_trajectories": False,      # True 时记录并显示车辆轨迹
             "warmup_render": False,          # True 时在 reset 期间也渲染 warmup 画面
             "real_time_rendering": False,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
+            "observation": {
+                "type": "Kinematics",
+                "normalize": False,
+                "include_time": True,           # 在观测中加入当前时间
+                "time_range": [0.0, 30.0],
+            }
         },
     )
 

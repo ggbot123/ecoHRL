@@ -169,6 +169,8 @@ class KinematicObservation(ObservationType):
         see_behind: bool = False,
         observe_intentions: bool = False,
         include_obstacles: bool = True,
+        include_time: bool = False,
+        time_range: list[float] | None = None,
         **kwargs: dict,
     ) -> None:
         """
@@ -194,14 +196,25 @@ class KinematicObservation(ObservationType):
         self.see_behind = see_behind
         self.observe_intentions = observe_intentions
         self.include_obstacles = include_obstacles
+        self.include_time = include_time
+        self.time_range = time_range
 
     def space(self) -> spaces.Space:
-        return spaces.Box(
-            shape=(self.vehicles_count, len(self.features)),
-            low=-np.inf,
-            high=np.inf,
-            dtype=np.float32,
-        )
+        if self.include_time:
+            dim = self.vehicles_count * len(self.features) + 1  # flatten 后 + t
+            return spaces.Box(
+                shape=(dim,),
+                low=-np.inf,
+                high=np.inf,
+                dtype=np.float32,
+            )
+        else:
+            return spaces.Box(
+                shape=(self.vehicles_count, len(self.features)),
+                low=-np.inf,
+                high=np.inf,
+                dtype=np.float32,
+            )
 
     def normalize_obs(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -271,6 +284,25 @@ class KinematicObservation(ObservationType):
         obs = df.values.copy()
         if self.order == "shuffled":
             self.env.np_random.shuffle(obs[1:])
+
+        # ===== 关键：是否拼接时间 =====
+        if self.include_time:
+            obs_flat = obs.astype(np.float32).ravel()  # (vehicles_count * len(features),)
+
+            t = float(getattr(self.env, "time", 0.0))
+            if self.time_range is not None:
+                t_min, t_max = float(self.time_range[0]), float(self.time_range[1])
+            else:
+                t_min = 0.0
+                t_max = float(self.env.config.get("duration", 50.0))
+            if self.normalize and t_max > t_min:
+                t = utils.lmap(t, [t_min, t_max], [-1.0, 1.0])
+
+            obs_with_time = np.concatenate(
+                [np.array([t], dtype=np.float32), obs_flat], axis=0
+            )
+            return obs_with_time.astype(self.space().dtype)
+
         # Flatten
         return obs.astype(self.space().dtype)
 
