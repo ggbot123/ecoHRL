@@ -1,9 +1,10 @@
 import gymnasium as gym
+from gymnasium.wrappers import RecordVideo
 import scenarios.multi_lane  # 触发 __init__.py 里的 register
 import numpy as np
 import types, os
 from util.test_fps import test_env_fps
-from util.plot_result import plot_ego_speed_history
+from util.plot_result import plot_ego_speed_history, plot_all_speed_history, plot_warmup_avg_speed
 
 from rl.algos.ppo.ppo import PPO
 from rl.algos.sac.sac import SAC
@@ -18,7 +19,44 @@ def load_model(algo: str, model_path: str, env):
         raise ValueError(f"未知算法类型: {algo}")
     return model
 
-def main(model_path: str, model_name: str, algo: str, episodes: int):
+
+def record_episode_video(
+    model,
+    model_path: str,
+    algo: str,
+    env_config: dict,
+    episode_seed: int,
+    episode_idx: int,
+):
+    video_folder = model_path
+    name_prefix = f"{algo}_ep{episode_idx}"
+
+    # 专门用于录制的环境：render_mode="rgb_array" + RecordVideo
+    base_env = gym.make(
+        "multi-lane-custom-v0",
+        render_mode="rgb_array",
+        config=env_config,
+    )
+    env = RecordVideo(
+        base_env,
+        video_folder=video_folder,
+        episode_trigger=lambda ep_id: True,  # 只跑一个 episode，第一条就录
+        name_prefix=name_prefix,
+    )
+
+    obs, _ = env.reset(seed=episode_seed)
+    terminated = False
+    truncated = False
+
+    while not (terminated or truncated):
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env.step(action)
+
+    env.close()
+    print(f"[VIDEO] 已录制 episode {episode_idx} 的视频到: {video_folder}")
+
+
+def main(model_path: str, model_name: str, algo: str, episodes: int, record_episode: int | None = None):
     # 日志文件：模型所在目录下的 txt
     log_path = os.path.join(model_path, f"eval_{algo.lower()}.txt")
     log_file = open(log_path, "w", encoding="utf-8")
@@ -26,31 +64,33 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
         print(msg)
         log_file.write(msg + "\n")
 
+    env_config = {
+        # 这里可以覆盖 default_config 里定义的任何键
+        "policy_frequency": 10,  # [Hz]
+        "screen_width": 1200,
+        "screen_height": 300,
+        "scaling": 3,
+        "centering_position": [0.5, 0.5],
+        "show_trajectories": 'all',  # True 时记录并显示ego轨迹, all 时记录所有车辆轨迹
+        "warmup_render": False,      # True 时在 reset 期间也渲染 warmup 画面
+        "real_time_rendering": False,  # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
+        "observation": {
+            "type": "Kinematics",
+            "normalize": False,
+            "include_time": True,  # 在观测中加入当前时间
+            "time_range": [0.0, 30.0],
+        },
+    }
     env = gym.make(
         "multi-lane-custom-v0",
-        # render_mode="human",
-        render_mode=None,
-        config={
-            # 这里可以覆盖 default_config 里定义的任何键
-            "policy_frequency": 10,         # [Hz]
-            "screen_width": 1200,
-            "screen_height": 300,
-            "scaling": 3,
-            "centering_position": [0.5, 0.5],
-            "show_trajectories": False,      # True 时记录并显示车辆轨迹
-            "warmup_render": False,          # True 时在 reset 期间也渲染 warmup 画面
-            "real_time_rendering": False,     # True 时在 step 期间渲染时加 sleep，变成肉眼可看速度
-            "observation": {
-                "type": "Kinematics",
-                "normalize": False,
-                "include_time": True,           # 在观测中加入当前时间
-                "time_range": [0.0, 30.0],
-            }
-        },
+        render_mode="human",
+        config=env_config,
     )
 
     # 记录每一步的 reward 各项分量
-    obs, _ = env.reset(seed=42)
+    seed_base = 42
+    obs, _ = env.reset(seed=seed_base)
+    plot_warmup_avg_speed(env)
 
     if env.unwrapped.render_mode is not None:
         # 定义一个“假车”，把摄像头锁在中心点
@@ -58,7 +98,7 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
             def __init__(self, pos):
                 self.position = np.array(pos, dtype=float)
         env.render()    # 先 render 一帧，env 内部会创建 env.viewer
-        env.unwrapped.viewer.observer_vehicle = Dummy([160.0, 5.0])
+        env.unwrapped.viewer.observer_vehicle = Dummy([env.unwrapped.config["road_length"]/2, 5.0])
 
     # 加载模型
     model = load_model(algo, os.path.join(model_path, model_name), env)
@@ -87,6 +127,7 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
 
     for ep in range(1, episodes+1):
         # 每个 episode 重置环境和统计量
+        episode_seed = seed_base + ep
         obs, _ = env.reset()
         terminated = False
         truncated = False
@@ -149,7 +190,20 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
             log(f"  ARRIVED at t = {arrival_time:.3f} s")
         # 如需画速度轨迹
         if base_env.config["show_trajectories"]:
-            plot_ego_speed_history(env)
+            if base_env.config["show_trajectories"] == 'all':
+                plot_all_speed_history(env)
+            else:
+                plot_ego_speed_history(env)
+        # 如果需要录制这一条 episode 的视频
+        if record_episode is not None and ep == record_episode:
+            record_episode_video(
+                model=model,
+                model_path=model_path,
+                algo=algo,
+                env_config=env_config,
+                episode_seed=episode_seed,
+                episode_idx=ep,
+            )
     
     # ====== 统计所有 episode 的均值并打印 ======
     n = episodes
@@ -179,13 +233,16 @@ def main(model_path: str, model_name: str, algo: str, episodes: int):
 
 if __name__ == "__main__":
     # main(
-    #     model_path="./models/ppo_20251205-134029/best_model.zip",
+    #     model_path="./models/ppo_1e6",
+    #     model_name="best_model.zip",
     #     algo="ppo",
     #     episodes=30,
+    #     record_episode=3,
     # )
     main(
-        model_path="./models/sac_20251205-133820",
+        model_path="./models/sac_5e6",
         model_name="best_model.zip",
         algo="sac",
         episodes=30,
+        record_episode=None,
     )
