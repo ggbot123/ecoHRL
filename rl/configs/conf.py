@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Dict, Any
-
+from rl.algos.HRL.hiro import HIROConfig
 
 def get_ppo_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
     """
@@ -40,4 +40,22 @@ def get_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
         learning_rate=3e-4,
         train_freq=(1, "step"),
         gradient_steps=1,
+    )
+
+def get_hiro_config() -> HIROConfig:
+    """
+    返回 HIRO 的超参数配置（高层间隔 / intrinsic 系数等）。
+    """
+    return HIROConfig(
+        high_interval=25,      # 0.1s * 25 = 2.5s，一次高层决策（0.4Hz）
+        gamma_high=0.99,
+        gamma_low=0.99,
+        buffer_size=1_000_000,
+        batch_size=256,
+        learning_starts=10_000,
+        gradient_steps_high=1,
+        gradient_steps_low=1,
+        train_freq=1,
+        intrinsic_coef=3.0,   # 你之前设置的 intrinsic reward 系数
+        device="auto",
     )

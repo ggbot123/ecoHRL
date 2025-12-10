@@ -1,47 +1,58 @@
-import os, random
+# train.py
+from __future__ import annotations
+import os
+import random
 from datetime import datetime
 import gymnasium as gym
 import numpy as np
 import torch as th
 
-from rl.configs.conf import *
-from rl.algos.ppo.ppo import PPO
-from rl.algos.sac.sac import SAC
+import scenarios.multi_lane  # 注册 multi-lane-custom-v0
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
-from rl.utils.callbacks import RewardComponentsTensorboardCallback
-from stable_baselines3.common.vec_env import DummyVecEnv
-import scenarios.multi_lane  # 触发 __init__.py 里的 register
+
+from rl.configs.conf import (
+    get_ppo_kwargs,
+    get_sac_kwargs,
+    get_hiro_config,
+)
+from rl.algos.ppo.trainer import train_ppo
+from rl.algos.sac.trainer import train_sac
+from rl.algos.HRL.trainer import train_hiro  # 你之前的 HIRO trainer
+from rl.algos.HRL.hiro import HIROConfig
 
 MASTER_SEED = 42
+master_rng: np.random.Generator
 
-# ---- 固定所有库的随机种子 ----
-random.seed(MASTER_SEED)
-np.random.seed(MASTER_SEED)
-th.manual_seed(MASTER_SEED)
-th.cuda.manual_seed_all(MASTER_SEED)
-th.backends.cudnn.deterministic = True
-th.backends.cudnn.benchmark = False
-master_rng = np.random.default_rng(MASTER_SEED)
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    th.manual_seed(seed)
+    th.cuda.manual_seed_all(seed)
+    th.backends.cudnn.deterministic = True
+    th.backends.cudnn.benchmark = False
 
-# ------------------------- 环境构造函数 ------------------------- #
+
 def make_env():
-    # 确保每次运行都是同一串 seeds
+    """
+    返回一个“环境构造函数”（与 DummyVecEnv 兼容）：
+    - 在外层用 master_rng 生成一个固定 env_seed
+    - _init() 内部创建 MultiLaneEnv，并用该 seed reset 一次
+    """
     env_seed = int(master_rng.integers(0, 2**31 - 1))
     def _init():
         env = gym.make(
             "multi-lane-custom-v0",
             render_mode=None,
-            # render_mode="human",
             config={
-                "policy_frequency": 10, 
-                "duration": 30,               # [s]
+                "policy_frequency": 10,
+                "duration": 50.0,
                 "observation": {
                     "type": "Kinematics",
                     "normalize": False,
-                    "include_time": True,           # 在观测中加入当前时间
-                    "time_range": [0.0, 30.0],
-                }
+                    "include_time": True,
+                    "time_range": [0.0, 50.0],
+                    "include_obstacles": False,
+                },
             },
         )
         env = Monitor(env)
@@ -49,86 +60,113 @@ def make_env():
         return env
     return _init
 
-# ------------------------- 训练主流程 ------------------------- #
-def train(
+
+def main(
     algo: str = "ppo",
-    total_timesteps: int = 500_000,
+    total_timesteps: int = 1_000_000,
     eval_freq: int = 10_000,
     save_freq: int = 50_000,
-    n_envs: int = 1,
-    log_dir: str = "./logs",
+    n_envs: int = 8,
+    log_root: str = "./logs",
     save_root: str = "./models",
-):
-    algo = algo.lower()
-    vec_env = DummyVecEnv([make_env() for _ in range(n_envs)])
-    eval_env = DummyVecEnv([make_env()])  # 评估环境
+) -> None:
+    global master_rng
 
-    # 为每次训练创建独立的 log / model 目录
+    set_global_seed(MASTER_SEED)
+    master_rng = np.random.default_rng(MASTER_SEED)
+
+    algo = algo.lower()
+
+    # 每次运行一个新的时间戳目录
     time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-    save_dir = os.path.join(save_root, f"{algo}_{time_str}")
+    run_name = f"{algo}_{time_str}"
+    log_dir = os.path.join(log_root, run_name)
+    save_dir = os.path.join(save_root, run_name)
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
 
-    # 定义回调：定期评估 + 存 checkpoint
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=save_dir,
-        log_path=log_dir,
-        eval_freq=eval_freq,
-        n_eval_episodes=5,
-        deterministic=True,
-        render=False,
-    )
-    checkpoint_callback = CheckpointCallback(
-        save_freq=save_freq,
-        save_path=save_dir,
-        name_prefix="rl_model",
-        save_replay_buffer=False,
-        save_vecnormalize=False,
-    )
-    rc_tb_callback = RewardComponentsTensorboardCallback(log_freq=1, verbose=0)
+    print(f"[MAIN] algo={algo}")
+    print(f"[MAIN] log_dir={log_dir}")
+    print(f"[MAIN] save_dir={save_dir}")
 
-    # 根据 algo 选择算法和超参数
     if algo == "ppo":
         ppo_kwargs = get_ppo_kwargs(log_dir=log_dir, seed=MASTER_SEED)
-        model = PPO(
-            env=vec_env,
-            **ppo_kwargs,
-        )
-    else:  # SAC 只支持连续 Box 动作，请确保 ParamLaneAccelAction 把 action_space 暴露为 Box([-1,1]^2)
-        assert isinstance(vec_env.action_space, gym.spaces.Box), "使用 SAC 时 env.action_space 必须是 gym.spaces.Box"
-        sac_kwargs = get_sac_kwargs(log_dir=log_dir, seed=MASTER_SEED)
-        model = SAC(
-            env=vec_env,
-            **sac_kwargs,
+        env_fns = [make_env() for _ in range(n_envs)]
+        eval_env_fn = make_env()
+        train_ppo(
+            env_fns=env_fns,
+            eval_env_fn=eval_env_fn,
+            total_timesteps=total_timesteps,
+            log_dir=log_dir,
+            save_dir=save_dir,
+            ppo_kwargs=ppo_kwargs,
+            eval_freq=eval_freq,
+            save_freq=save_freq,
+            save_name_prefix="ppo",
         )
 
-    # 开始训练
-    print(f"[INFO] {algo.upper()} 训练开始")
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=[eval_callback, checkpoint_callback, rc_tb_callback],
-        progress_bar=True,
-    )
-    # 保存模型
-    final_model_path = os.path.join(save_dir, f"{algo}_final")
-    model.save(final_model_path)
-    print(f"[INFO] {algo.upper()} 训练完成，模型已保存到：{final_model_path}")
-    vec_env.close()
-    eval_env.close()
+    elif algo == "sac":
+        sac_kwargs = get_sac_kwargs(log_dir=log_dir, seed=MASTER_SEED)
+        env_fns = [make_env() for _ in range(n_envs)]
+        eval_env_fn = make_env()
+        train_sac(
+            env_fns=env_fns,
+            eval_env_fn=eval_env_fn,
+            total_timesteps=total_timesteps,
+            log_dir=log_dir,
+            save_dir=save_dir,
+            sac_kwargs=sac_kwargs,
+            eval_freq=eval_freq,
+            save_freq=save_freq,
+            save_name_prefix="sac",
+        )
+
+    elif algo == "hiro":
+        # HIRO 当前只支持单环境
+        sac_kwargs_high = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_high"), seed=MASTER_SEED)
+        sac_kwargs_low = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED)
+        hiro_cfg: HIROConfig = get_hiro_config()
+
+        # 单环境实例：make_env() 返回 _init 函数，这里调用一次得到 env
+        env = make_env()()
+
+        train_hiro(
+            env=env,
+            total_env_steps=total_timesteps,
+            log_dir=log_dir,
+            save_dir=save_dir,
+            high_sac_kwargs=sac_kwargs_high,
+            low_sac_kwargs=sac_kwargs_low,
+            cfg=hiro_cfg,
+            save_name_prefix="hiro",
+        )
+        env.close()
+
+    else:
+        raise ValueError(f"未知算法类型: {algo}, 只支持 ppo / sac / hiro")
+
+    print("[MAIN] 训练完成")
+
 
 if __name__ == "__main__":
-    # train(
-    #     algo="ppo", 
-    #     total_timesteps=5_000_000, 
-    #     eval_freq=10_000, 
+    # main(
+    #     algo="ppo",
+    #     total_timesteps=1_000_000,
+    #     eval_freq=10_000,
     #     save_freq=50_000,
     #     n_envs=8,
     # )
-    train(
-        algo="sac", 
-        total_timesteps=5_000_000, 
-        eval_freq=10_000, 
+    # main(
+    #     algo="sac",
+    #     total_timesteps=1_000_000,
+    #     eval_freq=10_000,
+    #     save_freq=50_000,
+    #     n_envs=8,
+    # )
+    main(
+        algo="hiro",
+        total_timesteps=1_000_000,
+        eval_freq=10_000,
         save_freq=50_000,
-        n_envs=8,
+        n_envs=1,
     )
