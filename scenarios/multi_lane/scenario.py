@@ -24,6 +24,10 @@ class MultiLaneEnv(AbstractEnv):
     - 环境车：从左端（x=0）按概率生成，跑到右端后删除
     - warmup：先只跑环境车 warmup_time 秒，再在入口插入 ego
     """
+    metadata = {
+        "render_modes": ["human", "rgb_array"],
+        "render_fps": 10,  # 例如 10fps，对应你的 policy_frequency=10Hz
+    }
     # ----------------- 配置 ----------------- #
     @classmethod
     def default_config(cls):
@@ -64,9 +68,10 @@ class MultiLaneEnv(AbstractEnv):
                 # ego设置
                 "controlled_vehicles": 1,
                 "ego_speed": 10.0,        # [m/s]
-                "initial_lane_id": 1,
-                # "initial_lane_id": "random",
+                # "initial_lane_id": 1,
+                "initial_lane_id": "random",
                 "warmup_time": 100.0,             # 只跑环境车的时间 [s]
+                "warmup_each_episode": False,
                 "ego_clear_radius": 10.0,        # 在插入ego前，清除入口附近多远范围内的车辆 [m]
                 
                 # 观测-动作-奖励空间配置
@@ -119,27 +124,34 @@ class MultiLaneEnv(AbstractEnv):
         - 第一次 reset：建路 + 全局 warmup 交通流 + 插入 ego；
         - 后续 reset：保留现有路网和交通流，只移除旧 ego、清理一下车流，再插入新的 ego。
         """
-        first_reset = not getattr(self, "_did_global_warmup", False)
-        if first_reset:
-            # ------- 第一次：建立路网 + 清空所有车辆 + 预热交通流 -------
+        # 每次都重置交通流，用于测试，以保证各个episode之间独立
+        if self.config["warmup_each_episode"] is True:
             self._create_road()
             self.road.vehicles = []
             self.controlled_vehicles = []
-
-            # 只跑环境车 warmup_time 秒
             self._warmup(render=self.config.get("warmup_render", False))
-
-            # 打标记：后续 reset 不再重建 & warmup
-            self._did_global_warmup = True
         else:
-            # 把上一回合的 ego 从 road.vehicles 里移除
-            if getattr(self, "vehicle", None) is not None:
-                try:
-                    self.road.vehicles.remove(self.vehicle)
-                except ValueError:
-                    pass
-            self.controlled_vehicles = []
-            self._clear_background()
+            first_reset = not getattr(self, "_did_global_warmup", False)
+            if first_reset:
+                # ------- 第一次：建立路网 + 清空所有车辆 + 预热交通流 -------
+                self._create_road()
+                self.road.vehicles = []
+                self.controlled_vehicles = []
+
+                # 只跑环境车 warmup_time 秒
+                self._warmup(render=self.config.get("warmup_render", False))
+
+                # 打标记：后续 reset 不再重建 & warmup
+                self._did_global_warmup = True
+            else:
+                # 把上一回合的 ego 从 road.vehicles 里移除
+                if getattr(self, "vehicle", None) is not None:
+                    try:
+                        self.road.vehicles.remove(self.vehicle)
+                    except ValueError:
+                        pass
+                self.controlled_vehicles = []
+                self._clear_background()
         self._create_ego()
 
     def _warmup(self, render: bool = False):
