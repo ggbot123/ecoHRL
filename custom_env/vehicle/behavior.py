@@ -354,37 +354,9 @@ class StyledIDMVehicle(IDMVehicle):
     - 围绕这些均值进行采样的 std
     - imperfection: 加速度噪声强度
     """
-    DESIRED_SPEED_FACTOR = 1.0          # 相对车道限速的比例
-    DESIRED_SPEED_SIGMA = 0.05
-
-    TIME_WANTED_MEAN = 1.5
-    TIME_WANTED_SIGMA = 0.2
-
-    DISTANCE_WANTED_MEAN = 5.0 + ControlledVehicle.LENGTH
-    DISTANCE_WANTED_SIGMA = 1.0
 
     DELTA_LOW = 3.5
     DELTA_UPP = 4.5
-
-    COMFORT_ACC_MAX_MEAN = 3.0
-    COMFORT_ACC_MAX_SIGMA = 0.5
-
-    COMFORT_ACC_MIN_MEAN = -5.0
-    COMFORT_ACC_MIN_SIGMA = 0.5
-
-    POLITENESS_MEAN = 0.0
-    POLITENESS_SIGMA = 0.1
-
-    # speed_gain / other_vehicle_brake 对应 MOBIL 里的两个阈值
-    LANE_CHANGE_MIN_ACC_GAIN_MEAN = 0.2    # speed_gain 相关
-    LANE_CHANGE_MIN_ACC_GAIN_SIGMA = 0.05
-
-    LANE_CHANGE_MAX_BRAKING_IMPOSED_MEAN = 2.0  # other_vehicle_brake 相关
-    LANE_CHANGE_MAX_BRAKING_IMPOSED_SIGMA = 0.5
-
-    # 驾驶员不完美性：0 表示完全理想，越大随机扰动越强
-    IMPERFECTION_MEAN = 0.0
-    IMPERFECTION_SIGMA = 0.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -394,16 +366,9 @@ class StyledIDMVehicle(IDMVehicle):
         """在每辆车的风格均值附近采样具体参数。"""
         rng = self.road.np_random
 
-        # 车道限速，用来确定期望速度
-        # if getattr(self, "lane", None) is not None and self.lane.speed_limit is not None:
-        #     lane_speed = self.lane.speed_limit
-        # else:
-        #     lane_speed = self.road.speed_limit
-
-        # 期望速度（期望速度 = 限速 * 风格比例，再加一点随机）
-        # v0_base = lane_speed * self.DESIRED_SPEED_FACTOR
-        # v0 = rng.normal(v0_base, self.DESIRED_SPEED_SIGMA * v0_base)
-        # self.target_speed = max(0.1, v0)
+        # 期望速度
+        v0 = rng.uniform(self.DESIRED_SPEED_MIN, self.DESIRED_SPEED_MAX)
+        self.target_speed = max(0.1, v0)
 
         # 期望车头时距 / 间距
         self.TIME_WANTED = max(
@@ -414,7 +379,7 @@ class StyledIDMVehicle(IDMVehicle):
         )
 
         # IDM 纵向参数
-        self.DELTA = max(1.0, rng.normal(self.DELTA_LOW, self.DELTA_UPP))
+        self.DELTA = max(1.0, rng.uniform(self.DELTA_LOW, self.DELTA_UPP))
         self.COMFORT_ACC_MAX = max(
             0.1, rng.normal(self.COMFORT_ACC_MAX_MEAN, self.COMFORT_ACC_MAX_SIGMA)
         )
@@ -470,8 +435,8 @@ class StyledIDMVehicle(IDMVehicle):
 
 class NormalIDMVehicle(StyledIDMVehicle):
     """正常驾驶：接近期望速度，适中时距，适中礼貌。"""
-    DESIRED_SPEED_FACTOR = 0.8
-    DESIRED_SPEED_SIGMA = 0.05
+    DESIRED_SPEED_MIN = 12
+    DESIRED_SPEED_MAX = 15
 
     TIME_WANTED_MEAN = 1.5
     TIME_WANTED_SIGMA = 0.15
@@ -494,14 +459,16 @@ class NormalIDMVehicle(StyledIDMVehicle):
     LANE_CHANGE_MAX_BRAKING_IMPOSED_MEAN = 2.0
     LANE_CHANGE_MAX_BRAKING_IMPOSED_SIGMA = 0.3
 
-    IMPERFECTION_MEAN = 0.05
-    IMPERFECTION_SIGMA = 0.0
+    LANE_CHANGE_DELAY = 1.0
+
+    IMPERFECTION_MEAN = 0.0
+    IMPERFECTION_SIGMA = 0.1
 
 
 class AggressiveIDMVehicle(StyledIDMVehicle):
     """激进驾驶：高期望速度，短时距，大加速度，小礼貌。"""
-    DESIRED_SPEED_FACTOR = 0.9
-    DESIRED_SPEED_SIGMA = 0.05
+    DESIRED_SPEED_MIN = 12
+    DESIRED_SPEED_MAX = 15
 
     TIME_WANTED_MEAN = 1.0
     TIME_WANTED_SIGMA = 0.15
@@ -524,14 +491,16 @@ class AggressiveIDMVehicle(StyledIDMVehicle):
     LANE_CHANGE_MAX_BRAKING_IMPOSED_MEAN = 3.0  # 允许后车为自己猛踩一点刹车
     LANE_CHANGE_MAX_BRAKING_IMPOSED_SIGMA = 0.3
 
-    IMPERFECTION_MEAN = 0.05          # 更不稳定
-    IMPERFECTION_SIGMA = 0.0
+    LANE_CHANGE_DELAY = 1.0
+
+    IMPERFECTION_MEAN = 0.0          # 更不稳定
+    IMPERFECTION_SIGMA = 0.1
 
 
 class DefensiveIDMVehicle(StyledIDMVehicle):
     """保守驾驶：低期望速度，长时距，小加速度，高礼貌。"""
-    DESIRED_SPEED_FACTOR = 0.7
-    DESIRED_SPEED_SIGMA = 0.05
+    DESIRED_SPEED_MIN = 8
+    DESIRED_SPEED_MAX = 10
 
     TIME_WANTED_MEAN = 2.0
     TIME_WANTED_SIGMA = 0.15
@@ -548,11 +517,13 @@ class DefensiveIDMVehicle(StyledIDMVehicle):
     POLITENESS_MEAN = 0.5         # 很讲礼貌
     POLITENESS_SIGMA = 0.1
 
-    LANE_CHANGE_MIN_ACC_GAIN_MEAN = 0.5    # 必须收益明显才愿意变道
+    LANE_CHANGE_MIN_ACC_GAIN_MEAN = 3.0    # 必须收益明显才愿意变道
     LANE_CHANGE_MIN_ACC_GAIN_SIGMA = 0.0
 
     LANE_CHANGE_MAX_BRAKING_IMPOSED_MEAN = 1.0  # 不愿让别人为自己猛刹
     LANE_CHANGE_MAX_BRAKING_IMPOSED_SIGMA = 0.3
 
-    IMPERFECTION_MEAN = 0.05       # 也有一点反应误差，但比激进小
-    IMPERFECTION_SIGMA = 0.0
+    LANE_CHANGE_DELAY = 1.0
+
+    IMPERFECTION_MEAN = 0.0       # 也有一点反应误差，但比激进小
+    IMPERFECTION_SIGMA = 0.1

@@ -37,28 +37,36 @@ class MultiLaneEnv(AbstractEnv):
 
                 # 道路设置
                 "lanes_count": 3,
-                "road_length": 320.0,
+                "road_length": 500.0,
                 "speed_limit": 15.0,          # 限速 [m/s]
 
                 # 交通流设置
                 "spawn_probability": 0.07,       # 每个仿真步生成一辆新车的概率
-                "flow_speed_range": [10.0, 15.0],   # 环境车 初始 + 目标 速度
+                "flow_speed_range": [10.0, 10.0],   # 环境车 初始速度
+                "speed_distribution": "Uniform",
+                # "flow_speed_range": [12.0, 2, 4],   # 环境车 初始速度
+                # "speed_distribution": "Gaussian",
                 "spawn_min_gap": 10.0,           # 入口附近的最小空间间距 [m]
                 "spawn_min_t_headway": 1.5,      # 最小时间车头时距 [s]
-                # "other_vehicles_type": "custom_env.vehicle.behavior.IDMVehicle",
                 "behavior_vehicle_types": [     # 三种风格 IDM 类型及其概率
                     "custom_env.vehicle.behavior.NormalIDMVehicle",
                     "custom_env.vehicle.behavior.AggressiveIDMVehicle",
                     "custom_env.vehicle.behavior.DefensiveIDMVehicle",
                 ],
-                "behavior_probs": [0.5, 0.2, 0.3],
+                "behavior_probs": [0.4, 0.3, 0.3],
+                "behavior_lane_probs": [
+                    [0.6, 0.3, 0.1],   # 0 号车道
+                    [0.6, 0.3, 0.1],   # 1 号车道
+                    [0.4, 0.3, 0.3],   # 2 号车道
+                ],
                 "vid": 0,
 
                 # ego设置
                 "controlled_vehicles": 1,
                 "ego_speed": 10.0,        # [m/s]
                 "initial_lane_id": 1,
-                "warmup_time": 40.0,             # 只跑环境车的时间 [s]
+                # "initial_lane_id": "random",
+                "warmup_time": 100.0,             # 只跑环境车的时间 [s]
                 "ego_clear_radius": 10.0,        # 在插入ego前，清除入口附近多远范围内的车辆 [m]
                 
                 # 观测-动作-奖励空间配置
@@ -68,26 +76,21 @@ class MultiLaneEnv(AbstractEnv):
                     "see_behind": False,
                     "include_obstacles": False,
                 },
-                # "action": {
-                #     "type": "DiscreteMetaAction",
-                #     "target_speeds": np.linspace(10, 20, 3),  # [m/s]，设置MDPVehicle可选目标速度
-                # },
                 "action": {
                     "type": "ParamLaneAccelAction",
                     "acceleration_range": [-5.0, 5.0],
                     "lane_actions": ["KEEP", "LANE_LEFT", "LANE_RIGHT"],
                 },
-                "goal_longitudinal": 300.0,        # 任务 / 目标设置
+                "goal_longitudinal": 400.0,        # 任务 / 目标设置
                 "goal_lane_id": 2,
-                "punctual_time_window": [20.0, 30.0],   # punctual arrival reward
-                "punctual_time_target": 25.0,
+                "punctual_time_window": [30.0, 40.0],   # punctual arrival reward
+                "punctual_time_target": 35.0,
                 "punctual_reward": 10.0,
                 "collision_reward": -10.0,  # collision penalty
                 "progress_reward": 1,  # progress reward
-                "comfort_reward": 0.2,  # comfort reward
+                "comfort_reward": 0.7,  # comfort reward
                 "comfort_max_accel": 3.0, 
                 "lane_change_reward": -0.5,  # lane change penalty
-                # "reward_speed_range": [10, 15], # TODO: calculated by goal position
                 "offroad_terminal": False,
             }
         )
@@ -145,9 +148,25 @@ class MultiLaneEnv(AbstractEnv):
         sim_freq = float(self.config["simulation_frequency"])
         steps = int(warmup_time * sim_freq)
 
-        for _ in range(steps):
+        avg_speeds = []
+        times = []
+        for k in range(steps):
             self._clear_background()
             self._spawn_background()
+
+            speeds = [
+                float(v.speed)
+                for v in self.road.vehicles
+                if not getattr(v, "crashed", False)
+            ]
+            if speeds:
+                avg_speed = float(np.mean(speeds))
+            else:
+                avg_speed = 0.0
+            t = k / sim_freq  # 当前 warmup 时间 [s]
+            times.append(t)
+            avg_speeds.append(avg_speed)
+            
             self.road.act()
             self.road.step(1.0 / sim_freq)
             # 调试模式：在 reset 期间也渲染 warmup 的画面
@@ -156,6 +175,9 @@ class MultiLaneEnv(AbstractEnv):
 
         # 再做一次清理，避免 warmup 结束时残留 crash 车辆
         self._clear_background()
+
+        self._warmup_times = np.asarray(times, dtype=float)
+        self._warmup_avg_speeds = np.asarray(avg_speeds, dtype=float)
 
     # ----------------- RL step：在 AbstractEnv 的基础上维护车流 ----------------- #
     def step(self, action):
@@ -261,29 +283,53 @@ class MultiLaneEnv(AbstractEnv):
         if self.np_random.uniform() > spawn_probability:
             return
         lanes = int(cfg["lanes_count"])
-        speed_min, speed_max = cfg["flow_speed_range"]
         
         behavior_types = cfg.get(
             "behavior_vehicle_types",
-            [cfg["other_vehicles_type"]],  # IDM三种风格类型 + 概率
+            [cfg["other_vehicles_type"]],
         )
-        probs = np.array(cfg.get("behavior_probs", [1.0] * len(behavior_types)),
-                        dtype=float)
-        probs = probs / probs.sum()
+        n_types = len(behavior_types)
+        lane_probs_all = cfg.get("behavior_lane_probs", None)   # 各车道独立的行为分布（可选）
+        global_probs = np.array(
+            cfg.get("behavior_probs", [1.0] * n_types),
+            dtype=float,
+        )
+        global_probs = global_probs / global_probs.sum()
+
+        def _get_lane_behavior_probs(lane_id: int) -> np.ndarray:
+            """返回当前 lane_id 的 behavior 概率向量"""
+            if lane_probs_all is not None:
+                try:
+                    lane_row = np.asarray(lane_probs_all[lane_id], dtype=float)
+                    if lane_row.shape[0] == n_types:
+                        lane_row = lane_row / lane_row.sum()
+                        return lane_row
+                except (IndexError, TypeError, ValueError):
+                    pass
+            # 回退：使用全局分布
+            return global_probs
 
         # 尝试若干次（不同车道+速度），找一个符合安全间距的插入点，成功生成一辆就退出循环
         for _ in range(2 * lanes):
             lane_id = int(self.np_random.integers(lanes))
             lane_index = ("0", "1", lane_id)
             lane = self.road.network.get_lane(lane_index)
-            speed = float(self.np_random.uniform(speed_min, speed_max))
+            if cfg["speed_distribution"] == 'Uniform':
+                speed_min, speed_max = cfg["flow_speed_range"]
+                speed = float(self.np_random.uniform(speed_min, speed_max))
+            elif cfg["speed_distribution"] == 'Gaussian':
+                speed_mean, speed_dev, speed_bound = cfg["flow_speed_range"]
+                speed = float(np.clip(self.np_random.normal(speed_mean, speed_dev), speed_mean-speed_bound, speed_mean+speed_bound))
+            else:
+                raise RuntimeError
 
             # 检查是否有安全车头时距
             if not self._can_spawn_on_lane(lane, lane_index, speed):
                 continue
 
             # 按概率抽一类风格，创建车辆
-            style_idx = int(self.np_random.choice(len(behavior_types), p=probs))
+            probs_lane = _get_lane_behavior_probs(lane_id)
+            style_idx = int(self.np_random.choice(len(behavior_types), p=probs_lane))
             vehicle_cls = utils.class_from_path(behavior_types[style_idx])
             position = lane.position(0.0, 0.0)
             heading = lane.heading_at(0.0)
@@ -292,7 +338,6 @@ class MultiLaneEnv(AbstractEnv):
                 position,
                 heading,
                 speed,
-                target_speed=speed,
             )
             v.lane = lane
             v.lane_index = lane_index
@@ -363,7 +408,8 @@ class MultiLaneEnv(AbstractEnv):
     # ----------------- 预热后，在入口插入 ego ----------------- #
     def _create_ego(self):
         cfg = self.config
-        lane_id = cfg["initial_lane_id"] if cfg["initial_lane_id"] != "random" else int(self.np_random.integers(int(cfg["lanes_count"])))
+        lanes = int(cfg["lanes_count"])
+        lane_id = int(self.np_random.integers(lanes)) if cfg["initial_lane_id"] == "random" else int(cfg["initial_lane_id"])
         lane_index = ("0", "1", int(lane_id))
         lane = self.road.network.get_lane(lane_index)
 
@@ -390,7 +436,7 @@ class MultiLaneEnv(AbstractEnv):
         self.controlled_vehicles = [ego]
         self.road.vehicles.append(ego)
 
-        # ====== 初始化奖励相关的历史量 ======
+        # 初始化奖励相关的历史量
         self._last_speed = ego_speed
         self._last_lane_id = lane_id
         self._last_longitudinal = longi0

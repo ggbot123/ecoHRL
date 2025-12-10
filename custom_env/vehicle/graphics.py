@@ -7,7 +7,7 @@ import numpy as np
 import pygame
 
 from custom_env.utils import Vector
-from custom_env.vehicle.behavior import IDMVehicle
+from custom_env.vehicle.behavior import IDMVehicle, DefensiveIDMVehicle
 from custom_env.vehicle.controller import MDPVehicle
 from custom_env.vehicle.dynamics import BicycleVehicle
 from custom_env.vehicle.kinematics import Vehicle
@@ -239,6 +239,8 @@ class VehicleGraphics:
         #     color = cls.YELLOW
         elif isinstance(vehicle, IDMVehicle):
             color = cls.BLUE
+            if isinstance(vehicle, DefensiveIDMVehicle):
+                color = cls.GREEN
         elif isinstance(vehicle, MDPVehicle):
             color = cls.EGO_COLOR
         if transparent:
