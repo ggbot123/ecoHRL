@@ -4,8 +4,7 @@ import scenarios.multi_lane  # 触发 __init__.py 里的 register
 import numpy as np
 import os
 from typing import Optional, Sequence
-from util.test_fps import test_env_fps
-from util.plot_result import plot_ego_speed_history, plot_all_speed_history, plot_warmup_avg_speed
+from util.plot_result import *
 
 from rl.algos.ppo.ppo import PPO
 from rl.algos.sac.sac import SAC
@@ -32,13 +31,14 @@ def main(model_path: str, model_name: str, algo: str, episodes: int, record_epis
     env_config = {
         "policy_frequency": 10,  # [Hz]
         "duration": 70,
-        # "initial_lane_id": 1,
-        "initial_lane_id": "random",
+        "initial_lane_id": 1,
+        # "initial_lane_id": "random",
         "observation": {
             "type": "Kinematics",
             "normalize": False,
             "include_time": True,  # 在观测中加入当前时间
             "time_range": [0.0, 40.0],
+            "include_obstacles": False,
         },
         "warmup_each_episode": False,    # 每个 episode 重置交通流，使各个ep之间独立
         # 可视化设置
@@ -46,7 +46,7 @@ def main(model_path: str, model_name: str, algo: str, episodes: int, record_epis
         "screen_height": 300,
         "scaling": 3,
         "centering_position": [0.5, 0.5],
-        "show_trajectories": False,  # 记录并显示ego轨迹, all 时记录所有车辆轨迹
+        "show_trajectories": True,  # 记录并显示ego轨迹, all 时记录所有车辆轨迹
         "warmup_render": False,      # 在 reset 期间也渲染 warmup 画面
     }
     # 视频录制触发器
@@ -169,10 +169,7 @@ def main(model_path: str, model_name: str, algo: str, episodes: int, record_epis
             log(f"  ARRIVED at t = {arrival_time:.3f} s")
         # 如需画速度轨迹
         if base_env.config["show_trajectories"]:
-            if base_env.config["show_trajectories"] == 'all':
-                plot_all_speed_history(env)
-            else:
-                plot_ego_speed_history(env)
+            save_speed_acc_curves(env, ep_idx=ep, model_path=model_path)
     
     # ====== 统计所有 episode 的均值并打印 ======
     n = episodes
@@ -209,9 +206,10 @@ if __name__ == "__main__":
     #     record_episode=3,
     # )
     main(
-        model_path="./models/sac_5e6",
+        model_path="./models/sac_1e6_lane1",
         model_name="best_model.zip",
         algo="sac",
         episodes=30,
-        record_episodes=[1, 3, 5],
+        # record_episodes=[1, 3, 5],
+        record_episodes=[i for i in range(1, 31)],
     )

@@ -92,7 +92,7 @@ class MultiLaneEnv(AbstractEnv):
                 "punctual_time_target": 35.0,
                 "punctual_reward": 10.0,
                 "collision_reward": -10.0,  # collision penalty
-                "progress_reward": 1,  # progress reward
+                "progress_reward": 10.0,  # progress reward
                 "comfort_reward": 0.7,  # comfort reward
                 "comfort_max_accel": 3.0, 
                 "lane_change_reward": -0.5,  # lane change penalty

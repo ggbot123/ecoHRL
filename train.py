@@ -50,9 +50,10 @@ def make_env():
                     "type": "Kinematics",
                     "normalize": False,
                     "include_time": True,
-                    "time_range": [0.0, 50.0],
+                    "time_range": [0.0, 40.0],
                     "include_obstacles": False,
                 },
+                "initial_lane_id": 2,
             },
         )
         env = Monitor(env)
@@ -156,17 +157,17 @@ if __name__ == "__main__":
     #     save_freq=50_000,
     #     n_envs=8,
     # )
-    # main(
-    #     algo="sac",
-    #     total_timesteps=1_000_000,
-    #     eval_freq=10_000,
-    #     save_freq=50_000,
-    #     n_envs=8,
-    # )
     main(
-        algo="hiro",
+        algo="sac",
         total_timesteps=1_000_000,
         eval_freq=10_000,
         save_freq=50_000,
-        n_envs=1,
+        n_envs=8,
     )
+    # main(
+    #     algo="hiro",
+    #     total_timesteps=1_000_000,
+    #     eval_freq=10_000,
+    #     save_freq=50_000,
+    #     n_envs=1,
+    # )

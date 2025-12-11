@@ -1,4 +1,6 @@
+import os
 import matplotlib.pyplot as plt
+import numpy as np
 
 def plot_ego_speed_history(env):
     ego = env.unwrapped.vehicle          # ego 车对象
@@ -14,7 +16,7 @@ def plot_ego_speed_history(env):
 
 def plot_all_speed_history(env):
     dt = 1.0 / env.unwrapped.config["simulation_frequency"]
-    vehs = env.unwrapped.road.vehicles  # 所有车辆字典
+    vehs = env.unwrapped.road.vehicles  # 所有车辆
     for v in vehs:
         hist = list(reversed(v.history))
         speeds = [t.speed for t in hist]
@@ -47,4 +49,95 @@ def plot_warmup_avg_speed(env, show=True, save_path=None):
         plt.savefig(save_path)
     if show:
         plt.show()
+    plt.close()
+
+
+def save_speed_acc_curves(env, ep_idx: int, model_path: str):
+    """
+    在 show_trajectories 打开的情况下，将当前 episode 的
+    车速曲线和加速度曲线保存到 model_path/speed_curve 和 model_path/acc_curve。
+
+    - show_trajectories == 'all'：一张图上画所有车辆（ego 为红色，其它车辆为蓝色）
+    - show_trajectories == True：只画 ego 车辆
+    - show_trajectories == False：不做任何事
+    """
+    base_env = env.unwrapped
+    road = base_env.road
+
+    show_mode = base_env.config.get("show_trajectories", False)
+    if not show_mode:
+        # 未开启轨迹记录，直接返回
+        return
+
+    # 创建保存目录
+    speed_dir = os.path.join(model_path, "speed_curve")
+    acc_dir = os.path.join(model_path, "acc_curve")
+    os.makedirs(speed_dir, exist_ok=True)
+    os.makedirs(acc_dir, exist_ok=True)
+
+    speed_path = os.path.join(speed_dir, f"ep{ep_idx:03d}_speed.png")
+    acc_path = os.path.join(acc_dir, f"ep{ep_idx:03d}_acc.png")
+
+    # 时间步长按 simulation_frequency 计算（与历史记录采样频率一致）
+    dt = 1.0 / float(base_env.config["simulation_frequency"])
+
+    # 根据 show_trajectories 的取值决定绘制哪些车辆
+    if show_mode == "all":
+        vehicles = list(road.vehicles)
+        title_prefix = "All vehicles"
+    else:
+        vehicles = [base_env.vehicle]
+        title_prefix = "Ego"
+
+    # --------- 速度曲线 --------- #
+    plt.figure()
+    for v in vehicles:
+        hist = list(reversed(getattr(v, "history", [])))
+        if not hist:
+            continue
+        speeds = np.asarray([snap.speed for snap in hist], dtype=float)
+        if speeds.size == 0:
+            continue
+        t = np.arange(speeds.size, dtype=float) * dt
+        if v is base_env.vehicle:
+            plt.plot(t, speeds, color="r", label="ego")
+        else:
+            plt.plot(t, speeds, color="b", alpha=0.6)
+
+    plt.xlabel("Time [s]")
+    plt.ylabel("Speed [m/s]")
+    plt.title(f"{title_prefix} Speed vs Time (ep {ep_idx})")
+    plt.grid(True)
+    if show_mode == "all":
+        plt.legend()
+    plt.tight_layout()
+    plt.savefig(speed_path)
+    plt.close()
+
+    # --------- 加速度曲线（由速度数值微分算出） --------- #
+    plt.figure()
+    for v in vehicles:
+        hist = list(reversed(getattr(v, "history", [])))
+        if not hist:
+            continue
+        speeds = np.asarray([snap.speed for snap in hist], dtype=float)
+        if speeds.size < 2:
+            continue
+        # 数值微分：a_t ≈ (v_t - v_{t-1}) / dt
+        accs = np.diff(speeds) / dt          # 长度 N-1
+        t_acc = np.arange(accs.size, dtype=float) * dt  # 对齐到从第1步开始的时间
+
+        if v is base_env.vehicle:
+            plt.plot(t_acc, accs, color="r", label="ego")
+        else:
+            plt.plot(t_acc, accs, color="b", alpha=0.6)
+
+    plt.xlabel("Time [s]")
+    plt.ylabel("Acceleration [m/s²]")
+    plt.title(f"{title_prefix} Acceleration vs Time (ep {ep_idx})")
+    plt.grid(True)
+    if show_mode == "all":
+        plt.legend()
+    plt.tight_layout()
+    plt.savefig(acc_path)
     plt.close()
