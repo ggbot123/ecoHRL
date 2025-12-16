@@ -1,3 +1,4 @@
 *.pyc
 /logs
 /models
+*.csv
