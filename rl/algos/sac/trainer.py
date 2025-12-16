@@ -5,7 +5,7 @@ import os
 from typing import Dict, Any, List, Callable
 
 import gymnasium as gym
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 
@@ -29,7 +29,10 @@ def train_sac(
 
     参数定义同 PPO 版本。
     """
-    vec_env = DummyVecEnv(env_fns)
+    if len(env_fns) > 1:
+        vec_env = SubprocVecEnv(env_fns)
+    else:
+        vec_env = DummyVecEnv(env_fns)
     eval_env = DummyVecEnv([eval_env_fn])
 
     eval_callback = EvalCallback(

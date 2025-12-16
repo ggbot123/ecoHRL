@@ -206,7 +206,7 @@ if __name__ == "__main__":
     #     record_episode=3,
     # )
     main(
-        model_path="./models/sac_1e6_lane1",
+        model_path="./models/sac_5e6_lane1",
         model_name="best_model.zip",
         algo="sac",
         episodes=30,

@@ -53,7 +53,8 @@ def make_env():
                     "time_range": [0.0, 40.0],
                     "include_obstacles": False,
                 },
-                "initial_lane_id": 2,
+                "initial_lane_id": 1,
+                # "initial_lane_id": "random",
             },
         )
         env = Monitor(env)
@@ -63,11 +64,11 @@ def make_env():
 
 
 def main(
-    algo: str = "ppo",
-    total_timesteps: int = 1_000_000,
-    eval_freq: int = 10_000,
-    save_freq: int = 50_000,
-    n_envs: int = 8,
+    algo: str,
+    total_timesteps: int,
+    eval_freq: int,
+    save_freq: int,
+    n_envs: int,
     log_root: str = "./logs",
     save_root: str = "./models",
 ) -> None:
@@ -124,8 +125,8 @@ def main(
 
     elif algo == "hiro":
         # HIRO 当前只支持单环境
-        sac_kwargs_high = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_high"), seed=MASTER_SEED)
-        sac_kwargs_low = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED)
+        sac_kwargs_high = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_high"), seed=MASTER_SEED, level="high")
+        sac_kwargs_low = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED, level="low")
         hiro_cfg: HIROConfig = get_hiro_config()
 
         # 单环境实例：make_env() 返回 _init 函数，这里调用一次得到 env
@@ -133,7 +134,7 @@ def main(
 
         train_hiro(
             env=env,
-            total_env_steps=total_timesteps,
+            total_timesteps=total_timesteps,
             log_dir=log_dir,
             save_dir=save_dir,
             high_sac_kwargs=sac_kwargs_high,
@@ -157,17 +158,17 @@ if __name__ == "__main__":
     #     save_freq=50_000,
     #     n_envs=8,
     # )
+    # main(
+    #     algo="sac",
+    #     total_timesteps=5_000_000,
+    #     eval_freq=10_000,
+    #     save_freq=50_000,
+    #     n_envs=4,
+    # )
     main(
-        algo="sac",
+        algo="hiro",
         total_timesteps=1_000_000,
         eval_freq=10_000,
         save_freq=50_000,
-        n_envs=8,
+        n_envs=1,
     )
-    # main(
-    #     algo="hiro",
-    #     total_timesteps=1_000_000,
-    #     eval_freq=10_000,
-    #     save_freq=50_000,
-    #     n_envs=1,
-    # )

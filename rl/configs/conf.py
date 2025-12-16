@@ -23,11 +23,11 @@ def get_ppo_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
     )
 
 
-def get_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
+def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, Any]:
     """
     返回 SAC 初始化所需的 keyword arguments（不包括 env）。
     """
-    return dict(
+    sac_kwargs = dict(
         policy="MlpPolicy",
         verbose=1,
         tensorboard_log=log_dir,
@@ -41,6 +41,9 @@ def get_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
         train_freq=(1, "step"),
         gradient_steps=1,
     )
+    if level == 'low':
+        sac_kwargs['verbose'] = 0
+    return sac_kwargs
 
 def get_hiro_config() -> HIROConfig:
     """
@@ -56,6 +59,6 @@ def get_hiro_config() -> HIROConfig:
         gradient_steps_high=1,
         gradient_steps_low=1,
         train_freq=1,
-        intrinsic_coef=3.0,   # 你之前设置的 intrinsic reward 系数
+        intrinsic_coef=1.0,   # 你之前设置的 intrinsic reward 系数
         device="auto",
     )

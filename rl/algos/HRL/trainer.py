@@ -1,0 +1,35 @@
+# rl/algos/hiro/trainer.py
+from __future__ import annotations
+import os
+from typing import Dict, Any, Optional
+from rl.algos.HRL.hiro import HIROSAC, HIROConfig
+from rl.algos.HRL.callbacks import HIROLoggingCallback, HIROCheckpointCallback
+from stable_baselines3.common.callbacks import CallbackList
+
+
+def train_hiro(env, total_timesteps, log_dir, save_dir, high_sac_kwargs, low_sac_kwargs, cfg, save_name_prefix: str):
+    os.makedirs(save_dir, exist_ok=True)
+
+    model = HIROSAC(env, high_sac_kwargs, low_sac_kwargs, cfg)
+
+    logging_cb = HIROLoggingCallback(log_interval=1)
+
+    # 可选：周期性保存的 callback
+    checkpoint_cb = HIROCheckpointCallback(
+        save_freq=50_000,                 # 或从参数传进来
+        save_dir=save_dir,
+        prefix=save_name_prefix,
+        verbose=1,
+    )
+
+    callback = CallbackList([logging_cb, checkpoint_cb])
+
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=callback,
+        progress_bar=True,
+    )
+
+    # 训练结束时再保存一份最终模型
+    model.high_agent.save(os.path.join(save_dir, f"{save_name_prefix}_high_final.zip"))
+    model.low_agent.save(os.path.join(save_dir, f"{save_name_prefix}_low_final.zip"))
