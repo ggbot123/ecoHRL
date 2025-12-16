@@ -51,14 +51,10 @@ def get_hiro_config() -> HIROConfig:
     """
     return HIROConfig(
         high_interval=25,      # 0.1s * 25 = 2.5s，一次高层决策（0.4Hz）
-        gamma_high=0.99,
-        gamma_low=0.99,
-        buffer_size=1_000_000,
         batch_size=256,
-        learning_starts=10_000,
         gradient_steps_high=1,
         gradient_steps_low=1,
         train_freq=1,
-        intrinsic_coef=1.0,   # 你之前设置的 intrinsic reward 系数
+        intrinsic_coef=20.0,   # 你之前设置的 intrinsic reward 系数
         device="auto",
     )

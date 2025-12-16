@@ -124,7 +124,6 @@ def main(
         )
 
     elif algo == "hiro":
-        # HIRO 当前只支持单环境
         sac_kwargs_high = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_high"), seed=MASTER_SEED, level="high")
         sac_kwargs_low = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED, level="low")
         hiro_cfg: HIROConfig = get_hiro_config()

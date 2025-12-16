@@ -3,43 +3,40 @@ from __future__ import annotations
 
 import os
 from typing import Dict, Any
+from collections import deque
+import numpy as np
 
 from stable_baselines3.common.callbacks import BaseCallback
 
 
 class HIROLoggingCallback(BaseCallback):
-    """
-    用于 HIROSAC 的默认日志记录回调，仿照 SB3 的风格：
-
-    - 在 `_on_rollout_end` 中记录低层 pseudo-episode（一个 high_interval）的统计，
-      使用 `model.low_logger` 写入：
-        * rollout/ep_rew
-        * rollout/ep_len
-        * reward_components/*
-    - 在 `_on_step` 中，当 locals["episode_end"] 为 True 时，记录一次完整环境 episode 的统计，
-      使用 `model.high_logger` 写入：
-        * rollout/ep_rew
-        * rollout/ep_len
-        * reward_components/*
-
-    依赖于 HIROSAC.learn/_collect_hierarchical_rollout 中按如下约定填充 locals：
-
-      - 每个 high_interval 结束前：
-          low_ret: float
-          low_len: int
-          low_comp_sums: Dict[str, float]
-
-      - 每个 env.step：
-          episode_end: bool
-          episode_return: float
-          episode_len: int
-          episode_comp_sums: Dict[str, float]
-    """
-
-    def __init__(self, log_interval: int = 1, verbose: int = 0):
+    def __init__(self, log_interval: int = 1, verbose: int = 0, smooth_window: int = 100):
         super().__init__(verbose=verbose)
         self.log_interval = log_interval
+        self.smooth_window = int(smooth_window)
         self._episode_counter: int = 0
+        self.low_buffers: Dict[str, deque] = {}
+        self.high_buffers: Dict[str, deque] = {}
+
+    def _record_smooth(self, logger, buffers: Dict[str, deque], tag: str, value: float):
+        """
+        辅助函数：更新缓冲区，计算均值，并写入对应的 smooth 选项卡
+        """
+        if tag not in buffers:
+            buffers[tag] = deque(maxlen=self.smooth_window)
+        
+        buffers[tag].append(value)
+        mean_val = np.mean(buffers[tag])
+
+        # 映射到新的 Tag 前缀
+        if tag.startswith("rollout/"):
+            new_tag = tag.replace("rollout/", "1_rollout_smooth/")
+        elif tag.startswith("reward_components/"):
+            new_tag = tag.replace("reward_components/", "2_reward_smooth/")
+        else:
+            new_tag = f"smooth/{tag}"
+
+        logger.record(new_tag, mean_val)
 
     def _on_training_start(self) -> None:
         # 简单健壮性检查
@@ -51,6 +48,8 @@ class HIROLoggingCallback(BaseCallback):
         self.ep_len = 0
         self.ep_comp_sums = {}
         self._episode_counter = 0
+        self.low_buffers.clear()
+        self.high_buffers.clear()
 
     def _on_rollout_end(self) -> None:
         # 低层“episode”日志（每个 high_interval 一次）
@@ -61,14 +60,26 @@ class HIROLoggingCallback(BaseCallback):
             or "low_comp_sums" not in loc
         ):
             return
-
         low_logger = self.model.low_logger
-        low_logger.record("rollout/ep_rew", float(loc["low_ret"]))
-        low_logger.record("rollout/ep_len", int(loc["low_len"]))
+
+        # 1. 记录原始值
+        ep_rew = float(loc["low_ret"])
+        ep_len = int(loc["low_len"])
+        low_logger.record("rollout/ep_rew", ep_rew)
+        low_logger.record("rollout/ep_len", ep_len)
+
+        # 2. 记录滑动平均值
+        self._record_smooth(low_logger, self.low_buffers, "rollout/ep_rew", ep_rew)
+        self._record_smooth(low_logger, self.low_buffers, "rollout/ep_len", float(ep_len))
 
         comp_sums: Dict[str, float] = loc["low_comp_sums"]
         for name, value in comp_sums.items():
-            low_logger.record(f"reward_components/{name}", float(value))
+            val = float(value)
+            # 记录原始分量
+            tag = f"reward_components/{name}"
+            low_logger.record(tag, val)
+            # 记录平滑分量
+            self._record_smooth(low_logger, self.low_buffers, tag, val)
 
         # 这里直接按 model.num_timesteps 写 step，与 SB3 保持一致
         low_logger.dump(step=self.model.num_timesteps)
@@ -92,10 +103,19 @@ class HIROLoggingCallback(BaseCallback):
         self._episode_counter += 1
         high_logger = self.model.high_logger
 
+        # 1. 记录原始值
         high_logger.record("rollout/ep_rew", self.ep_return)
         high_logger.record("rollout/ep_len", self.ep_len)
+        
+        # 2. 记录滑动平均值
+        self._record_smooth(high_logger, self.high_buffers, "rollout/ep_rew", self.ep_return)
+        self._record_smooth(high_logger, self.high_buffers, "rollout/ep_len", float(self.ep_len))
+
         for name, value in self.ep_comp_sums.items():
-            high_logger.record(f"reward_components/{name}", float(value))
+            val = float(value)
+            tag = f"reward_components/{name}"
+            high_logger.record(tag, val)
+            self._record_smooth(high_logger, self.high_buffers, tag, val)
 
         # 控制 dump 频率（默认每个 episode 都 dump）
         if self._episode_counter % self.log_interval == 0:

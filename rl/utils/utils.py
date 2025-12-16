@@ -100,33 +100,6 @@ def extract_ego_substate(kin: np.ndarray, ego_feature_idx: Sequence[int]) -> np.
     return ego_full[idx]
 
 
-def denormalize_goal(
-    norm_goal: np.ndarray, goal_feature_ranges: np.ndarray
-) -> np.ndarray:
-    """
-    将高层策略输出的归一化动作 norm_goal ∈ [-1,1]^d
-    映射到物理 goal_phys，使用与 Kinematics 相同的 feature_range。
-
-    这是 KinematicObservation.normalize_obs 映射的逆过程：
-        物理 x ∈ [v_min, v_max]  ->  x_norm ∈ [-1,1]
-    这里是：
-        x_norm ∈ [-1,1] -> 物理 x ∈ [v_min, v_max]
-    """
-    norm_goal = np.asarray(norm_goal, dtype=np.float32).reshape(-1)
-    assert norm_goal.shape[0] == goal_feature_ranges.shape[0]
-    phys = []
-    for g, (v_min, v_max) in zip(norm_goal, goal_feature_ranges):
-        v_min = float(v_min)
-        v_max = float(v_max)
-        if v_max > v_min:
-            # [-1, 1] -> [v_min, v_max]
-            x = 0.5 * (g + 1.0) * (v_max - v_min) + v_min
-        else:
-            x = 0.0
-        phys.append(x)
-    return np.asarray(phys, dtype=np.float32)
-
-
 def _normalize_vec_phys(
     vec_phys: np.ndarray, feature_ranges: np.ndarray
 ) -> np.ndarray:
@@ -154,25 +127,25 @@ def _normalize_vec_phys(
 
 
 def intrinsic_reward_l2(
-    ego_next_sub_phys: np.ndarray,
-    goal_phys: np.ndarray,
+    ego_next_sub_rel: np.ndarray,
+    goal_rel: np.ndarray,
     norm_ranges: np.ndarray,
     coef: float = 1.0,
     weights: np.ndarray | Sequence[float] | None = None,
 ) -> float:
-    ego_next_sub_phys = np.asarray(ego_next_sub_phys, dtype=np.float32).reshape(-1)
-    goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
+    ego_next_sub_rel = np.asarray(ego_next_sub_rel, dtype=np.float32).reshape(-1)
+    goal_rel = np.asarray(goal_rel, dtype=np.float32).reshape(-1)
     norm_ranges = np.asarray(norm_ranges, dtype=np.float32)
 
-    assert ego_next_sub_phys.shape == goal_phys.shape, (
-        f"形状不一致: ego {ego_next_sub_phys.shape}, goal {goal_phys.shape}"
+    assert ego_next_sub_rel.shape == goal_rel.shape, (
+        f"形状不一致: ego {ego_next_sub_rel.shape}, goal {goal_rel.shape}"
     )
-    assert norm_ranges.shape[0] == ego_next_sub_phys.shape[0], (
-        f"norm_ranges 维度 {norm_ranges.shape[0]} 与状态维度 {ego_next_sub_phys.shape[0]} 不一致"
+    assert norm_ranges.shape[0] == ego_next_sub_rel.shape[0], (
+        f"norm_ranges 维度 {norm_ranges.shape[0]} 与状态维度 {ego_next_sub_rel.shape[0]} 不一致"
     )
 
-    ego_norm = _normalize_vec_phys(ego_next_sub_phys, norm_ranges)
-    goal_norm = _normalize_vec_phys(goal_phys, norm_ranges)
+    ego_norm = _normalize_vec_phys(ego_next_sub_rel, norm_ranges)
+    goal_norm = _normalize_vec_phys(goal_rel, norm_ranges)
     delta = ego_norm - goal_norm  # (n,)
     n = delta.shape[0]
 
@@ -202,10 +175,10 @@ def map_y_code_to_target_y(y_code: float, y_current: float, lane_center_ys: np.n
     lanes_y = np.asarray(lane_center_ys, dtype=np.float32)
     # 当前 ego 所在车道：y 轴上最近的一条
     k = int(np.argmin(np.abs(lanes_y - y_current)))
-    if y_code > 0 and k < len(lanes_y) - 1:
-        k_target = k + 1   # 左侧相邻车道
-    elif y_code < 0 and k > 0:
-        k_target = k - 1   # 右侧相邻车道
+    if y_code < -1/3 and k > 0:
+        k_target = k - 1   # 左侧相邻车道
+    elif y_code > 1/3 and k < len(lanes_y) - 1:
+        k_target = k + 1   # 右侧相邻车道
     else:
         k_target = k       # 保持当前车道
     return float(lanes_y[k_target])
