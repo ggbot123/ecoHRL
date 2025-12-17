@@ -232,7 +232,7 @@ class HIROSAC:
         t, kin, kin_flat = utils.split_time_kinematics(obs_flat, self.n_veh, self.feat_dim)
         return obs_flat, kin_flat, kin, float(t)
 
-    def _build_low_obs(self, t_rel: float, kin_flat: np.ndarray, kin: np.ndarray, goal_action: np.ndarray) -> np.ndarray:
+    def _build_low_obs(self, t_rel: float, kin_flat: np.ndarray, kin: np.ndarray, goal_phys: np.ndarray) -> np.ndarray:
         """
         低层观测 = flatten(kinematics) + goal_rel
         其中 goal_action 是高层 SAC 的动作向量 a=[Δx, y_code, vx_target]，
@@ -240,9 +240,9 @@ class HIROSAC:
         """
         t_arr = np.array([t_rel], dtype=np.float32)
         kin_flat = np.asarray(kin_flat, dtype=np.float32)
-        goal_action = np.asarray(goal_action, dtype=np.float32).reshape(-1)
+        goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
         ego_sub = utils.extract_ego_substate(kin, self.ego_feature_idx).astype(np.float32)
-        goal_phys = utils.goal_action_to_abs(ego_sub, goal_action, self.lane_center_ys)
+        
         goal_rel = (goal_phys - ego_sub).astype(np.float32)     # 相对目标：goal_rel = goal_abs - ego_sub
 
         return np.concatenate([t_arr, kin_flat, goal_rel], axis=0)
@@ -266,6 +266,7 @@ class HIROSAC:
 
             # 缓存开始状态，用于计算 intrinsic reward
             ego_start = utils.extract_ego_substate(kin, self.ego_feature_idx).astype(np.float32)
+            goal_phys = utils.goal_action_to_abs(ego_start, goal_action, self.lane_center_ys)
 
             # === 2. Low Level Rollout (Interval) ===
             high_ret = 0.0
@@ -277,7 +278,7 @@ class HIROSAC:
             callback.on_rollout_start()
 
             for c in range(self.cfg.high_interval):
-                low_obs = self._build_low_obs(c, kin_flat, kin, goal_action)
+                low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys)
                 low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
                 
                 next_obs, reward, done, truncated, info = env.step(low_action)
@@ -303,7 +304,7 @@ class HIROSAC:
                 is_last_step = (c == self.cfg.high_interval - 1) or terminated      # 目前采用sparse reward
                 if is_last_step:
                     ego_next_sub_rel = utils.extract_ego_substate(kin_next, self.ego_feature_idx) - ego_start
-                    goal_rel = utils.goal_action_to_abs(ego_start, goal_action, self.lane_center_ys) - ego_start
+                    goal_rel = goal_phys - ego_start
                     intrinsic = utils.intrinsic_reward_l2(
                         ego_next_sub_rel=ego_next_sub_rel,
                         goal_rel=goal_rel,
@@ -319,7 +320,7 @@ class HIROSAC:
                 low_len += 1
                 
                 # --- Store & Train Low Level ---
-                next_low_obs = self._build_low_obs(c+1, kin_flat_next, kin_next, goal_action)
+                next_low_obs = self._build_low_obs(c+1, kin_flat_next, kin_next, goal_phys)
                 
                 self.low_agent.store_transition(
                     obs=low_obs,
