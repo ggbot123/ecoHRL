@@ -232,13 +232,13 @@ class HIROSAC:
         t, kin, kin_flat = utils.split_time_kinematics(obs_flat, self.n_veh, self.feat_dim)
         return obs_flat, kin_flat, kin, float(t)
 
-    def _build_low_obs(self, t: float, kin_flat: np.ndarray, kin: np.ndarray, goal_action: np.ndarray) -> np.ndarray:
+    def _build_low_obs(self, t_rel: float, kin_flat: np.ndarray, kin: np.ndarray, goal_action: np.ndarray) -> np.ndarray:
         """
         低层观测 = flatten(kinematics) + goal_rel
         其中 goal_action 是高层 SAC 的动作向量 a=[Δx, y_code, vx_target]，
         goal_rel = goal_abs - ego_abs，y 维在这里按照 y_code 映射到相邻车道中心线。
         """
-        t_arr = np.array([t], dtype=np.float32)
+        t_arr = np.array([t_rel], dtype=np.float32)
         kin_flat = np.asarray(kin_flat, dtype=np.float32)
         goal_action = np.asarray(goal_action, dtype=np.float32).reshape(-1)
         ego_sub = utils.extract_ego_substate(kin, self.ego_feature_idx).astype(np.float32)
@@ -277,7 +277,7 @@ class HIROSAC:
             callback.on_rollout_start()
 
             for c in range(self.cfg.high_interval):
-                low_obs = self._build_low_obs(t, kin_flat, kin, goal_action)
+                low_obs = self._build_low_obs(c, kin_flat, kin, goal_action)
                 low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
                 
                 next_obs, reward, done, truncated, info = env.step(low_action)
@@ -294,6 +294,8 @@ class HIROSAC:
                 punctual_contrib = float(r_components.get("punctual_reward", 0.0))
                 low_reward_ext = reward_env - punctual_contrib
                 for name, val in r_components.items():
+                    if name == "punctual_reward":
+                        continue
                     low_comp_sums[name] = low_comp_sums.get(name, 0.0) + float(val)     # 用于callback统计
                 
                 intrinsic = 0.0
@@ -308,14 +310,16 @@ class HIROSAC:
                         norm_ranges=[[0, 37.5], [-8, 8], [-8, 8], [-2, 2]], # 根据实际修改
                         coef=self.cfg.intrinsic_coef,
                         weights=[1, 2, 8, 1],
+                        # weights=[1, 1, 1, 1],
                     )
+                    low_comp_sums["intrinsic_reward"] = low_comp_sums.get("intrinsic_reward", 0.0) + float(intrinsic)
                 
                 low_reward_total = low_reward_ext + intrinsic
                 low_ret += low_reward_total
                 low_len += 1
                 
                 # --- Store & Train Low Level ---
-                next_low_obs = self._build_low_obs(t_next, kin_flat_next, kin_next, goal_action)
+                next_low_obs = self._build_low_obs(c+1, kin_flat_next, kin_next, goal_action)
                 
                 self.low_agent.store_transition(
                     obs=low_obs,
