@@ -238,14 +238,14 @@ class HIROSAC:
         其中 goal_action 是高层 SAC 的动作向量 a=[Δx, y_code, vx_target]，
         goal_rel = goal_abs - ego_abs，y 维在这里按照 y_code 映射到相邻车道中心线。
         """
-        t_arr = np.array([t_rel], dtype=np.float32)
+        t_norm = np.array([t_rel], dtype=np.float32) / self.cfg.high_interval
         kin_flat = np.asarray(kin_flat, dtype=np.float32)
         goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
         ego_sub = utils.extract_ego_substate(kin, self.ego_feature_idx).astype(np.float32)
         
         goal_rel = (goal_phys - ego_sub).astype(np.float32)     # 相对目标：goal_rel = goal_abs - ego_sub
 
-        return np.concatenate([t_arr, kin_flat, goal_rel], axis=0)
+        return np.concatenate([t_norm, kin_flat, goal_rel], axis=0)
 
 
     # ------------------------------------------------------------------
@@ -321,13 +321,14 @@ class HIROSAC:
                 
                 # --- Store & Train Low Level ---
                 next_low_obs = self._build_low_obs(c+1, kin_flat_next, kin_next, goal_phys)
+                done_low = is_last_step
                 
                 self.low_agent.store_transition(
                     obs=low_obs,
                     action=low_buffer_action, # 存 buffer action
                     next_obs=next_low_obs,
                     reward=low_reward_total,
-                    done=terminated,
+                    done=done_low,
                     info=info
                 )
                 self.low_agent.train_if_needed()
