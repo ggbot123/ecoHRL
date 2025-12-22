@@ -6,6 +6,8 @@ from custom_env.envs.common.action import Action
 from custom_env import utils
 from custom_env.vehicle.objects import Obstacle
 
+from configs.conf import get_env_config
+
 Observation = np.ndarray
 
 class BusStop(Obstacle):
@@ -32,73 +34,7 @@ class MultiLaneEnv(AbstractEnv):
     @classmethod
     def default_config(cls):
         cfg = super().default_config()
-        cfg.update(
-            {
-                # 基本设置
-                "simulation_frequency": 10,    # [Hz]
-                "policy_frequency": 1,         # [Hz]
-                "duration": 50,               # [s]
-
-                # 道路设置
-                "lanes_count": 3,
-                "road_length": 500.0,
-                "speed_limit": 15.0,          # 限速 [m/s]
-
-                # 交通流设置
-                "spawn_probability": 0.07,       # 每个仿真步生成一辆新车的概率
-                "flow_speed_range": [10.0, 10.0],   # 环境车 初始速度
-                "speed_distribution": "Uniform",
-                # "flow_speed_range": [12.0, 2, 4],   # 环境车 初始速度
-                # "speed_distribution": "Gaussian",
-                "spawn_min_gap": 10.0,           # 入口附近的最小空间间距 [m]
-                "spawn_min_t_headway": 1.5,      # 最小时间车头时距 [s]
-                "behavior_vehicle_types": [     # 三种风格 IDM 类型及其概率
-                    "custom_env.vehicle.behavior.NormalIDMVehicle",
-                    "custom_env.vehicle.behavior.AggressiveIDMVehicle",
-                    "custom_env.vehicle.behavior.DefensiveIDMVehicle",
-                ],
-                "behavior_probs": [0.4, 0.3, 0.3],
-                "behavior_lane_probs": [
-                    [0.6, 0.3, 0.1],   # 0 号车道
-                    [0.6, 0.3, 0.1],   # 1 号车道
-                    [0.4, 0.3, 0.3],   # 2 号车道
-                ],
-                "vid": 0,
-
-                # ego设置
-                "controlled_vehicles": 1,
-                "ego_speed": 10.0,        # [m/s]
-                # "initial_lane_id": 1,
-                "initial_lane_id": "random",
-                "warmup_time": 100.0,             # 只跑环境车的时间 [s]
-                "warmup_each_episode": False,
-                "ego_clear_radius": 10.0,        # 在插入ego前，清除入口附近多远范围内的车辆 [m]
-                
-                # 观测-动作-奖励空间配置
-                "observation": {
-                    "type": "Kinematics",
-                    "normalize": False,
-                    "see_behind": False,
-                    "include_obstacles": False,
-                },
-                "action": {
-                    "type": "ParamLaneAccelAction",
-                    "acceleration_range": [-5.0, 5.0],
-                    "lane_actions": ["KEEP", "LANE_LEFT", "LANE_RIGHT"],
-                },
-                "goal_longitudinal": 400.0,        # 任务 / 目标设置
-                "goal_lane_id": 2,
-                "punctual_time_window": [30.0, 40.0],   # punctual arrival reward
-                "punctual_time_target": 35.0,
-                "punctual_reward": 10.0,
-                "collision_reward": -10.0,  # collision penalty
-                "progress_reward": 10.0,  # progress reward
-                "comfort_reward": 0.7,  # comfort reward
-                "comfort_max_accel": 3.0, 
-                "lane_change_reward": -0.5,  # lane change penalty
-                "offroad_terminal": False,
-            }
-        )
+        cfg.update(get_env_config())
         return cfg
 
     # ----------------- 建路 ----------------- #
