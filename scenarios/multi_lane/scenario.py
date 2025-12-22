@@ -278,7 +278,7 @@ class MultiLaneEnv(AbstractEnv):
         """The episode is over if the ego vehicle crashed, reached the goal, or went off-road."""
         return (
             self.vehicle.crashed
-            or self._goal_reached()
+            or self._goal_longitudinal_reached()
             or self.config["offroad_terminal"]
             and not self.vehicle.on_road
         )
@@ -456,17 +456,16 @@ class MultiLaneEnv(AbstractEnv):
         self._arrival_time = None
 
     def _goal_reached(self) -> bool:
-        """判断是否到达右侧车道的目标位置 x >= goal_longitudinal。"""
-        goal_lane_id = self.config["goal_lane_id"]
-
-        lane_index = self.vehicle.lane_index
-        if lane_index[2] != goal_lane_id:
+        """在目标车道且 x >= goal_longitudinal"""
+        if self.vehicle.lane_index[2] != int(self.config["goal_lane_id"]):
             return False
-
-        lane = self.road.network.get_lane(lane_index)
+        return self._goal_longitudinal_reached()
+    
+    def _goal_longitudinal_reached(self) -> bool:
+        """x >= goal_longitudinal（不要求在目标车道）"""
+        lane = self.road.network.get_lane(self.vehicle.lane_index)
         longi, _ = lane.local_coordinates(self.vehicle.position)
-
-        goal_long = float(self.config.get("goal_longitudinal", 300.0))
+        goal_long = float(self.config["goal_longitudinal"])
         return longi >= goal_long
     
     def _punctual_factor(self, t: float) -> float:
