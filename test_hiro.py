@@ -242,15 +242,20 @@ def main(
             runner.step_end(done)
             obs = obs_next
 
+        n_low_intervals = len(low_interval_rets) or 1
+        low_ext_mean = low_ext_ret / float(n_low_intervals)
+        low_int_mean = low_int_ret / float(n_low_intervals)
+        low_total_mean = low_total_ret / float(n_low_intervals)
+
         ep_lens.append(int(steps))
         high_ep_rets.append(float(high_ret))
-        low_ep_ext_rets.append(float(low_ext_ret))
-        low_ep_int_rets.append(float(low_int_ret))
-        low_ep_total_rets.append(float(low_total_ret))
+        low_ep_ext_rets.append(float(low_ext_mean))
+        low_ep_int_rets.append(float(low_int_mean))
+        low_ep_total_rets.append(float(low_total_mean))
         for k in reward_keys_high:
             high_comp_sum[k] += high_comp[k]
         for k in reward_keys_low:
-            low_comp_sum[k] += low_comp[k]
+            low_comp_sum[k] += low_comp[k] / float(n_low_intervals)
 
         base_env = env.unwrapped
         arrived = bool(getattr(base_env, "_has_arrived", False))
@@ -266,9 +271,9 @@ def main(
         log(f"  length (steps)          : {steps}")
         log(f"  terminated info         : {reason}")
         log(f"  high total reward       : {high_ret:.6f}")
-        log(f"  low  ext reward         : {low_ext_ret:.6f}   (env_reward - punctual)")
-        log(f"  low  intrinsic reward   : {low_int_ret:.6f}")
-        log(f"  low  total reward       : {low_total_ret:.6f}   (ext + intrinsic)")
+        log(f"  low  ext reward (per interval mean)       : {low_ext_mean:.6f}   (env_reward - punctual)")
+        log(f"  low  intrinsic reward (per interval mean) : {low_int_mean:.6f}")
+        log(f"  low  total reward (per interval mean)     : {low_total_mean:.6f}   (ext + intrinsic)")
         if high_interval_rets:
             log(f"  high intervals          : {len(high_interval_rets)}  (mean={float(np.mean(high_interval_rets)):.6f})")
         if low_interval_rets:
@@ -278,9 +283,9 @@ def main(
         for k in reward_keys_high:
             log(f"    {k:18s}: {high_comp[k]: .6f}")
 
-        log("  low reward components (sum over episode):")
+        log("  low reward components (mean per interval):")
         for k in reward_keys_low:
-            log(f"    {k:18s}: {low_comp[k]: .6f}")
+            log(f"    {k:18s}: {low_comp[k] / float(n_low_intervals): .6f}")
 
         if arrived and arrival_time is not None:
             log(f"  ARRIVED at t = {float(arrival_time):.3f} s")
@@ -293,14 +298,14 @@ def main(
     log(f"  episodes                : {n}")
     log(f"  mean length             : {float(np.mean(ep_lens)):.3f} steps")
     log(f"  mean high total reward  : {float(np.mean(high_ep_rets)):.6f}")
-    log(f"  mean low  ext reward    : {float(np.mean(low_ep_ext_rets)):.6f}")
-    log(f"  mean low  intrinsic     : {float(np.mean(low_ep_int_rets)):.6f}")
-    log(f"  mean low  total reward  : {float(np.mean(low_ep_total_rets)):.6f}")
+    log(f"  mean low  ext (per interval mean)    : {float(np.mean(low_ep_ext_rets)):.6f}")
+    log(f"  mean low  intrinsic (per interval)   : {float(np.mean(low_ep_int_rets)):.6f}")
+    log(f"  mean low  total (per interval mean)  : {float(np.mean(low_ep_total_rets)):.6f}")
 
     log("  mean high reward components (per episode):")
     for k in reward_keys_high:
         log(f"    {k:18s}: {high_comp_sum[k] / n: .6f}")
-    log("  mean low reward components (per episode):")
+    log("  mean low reward components (per interval):")
     for k in reward_keys_low:
         log(f"    {k:18s}: {low_comp_sum[k] / n: .6f}")
 
