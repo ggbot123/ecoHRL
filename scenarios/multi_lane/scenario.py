@@ -21,7 +21,7 @@ class BusStop(Obstacle):
 
 class MultiLaneEnv(AbstractEnv):
     """
-    四车道直路 + 顺序交通流 + 30s 预热 + 更安全的生成逻辑
+    四车道直路 + 顺序交通流 + 预热 + 更安全的生成逻辑
     - 道路：节点 "0" -> "1" 的四车道直路，长度 road_length
     - 环境车：从左端（x=0）按概率生成，跑到右端后删除
     - warmup：先只跑环境车 warmup_time 秒，再在入口插入 ego
@@ -30,6 +30,11 @@ class MultiLaneEnv(AbstractEnv):
         "render_modes": ["human", "rgb_array"],
         "render_fps": 10,  # 例如 10fps，对应你的 policy_frequency=10Hz
     }
+    def __init__(self, config: dict = None, render_mode: str | None = None):
+        super().__init__(config=config, render_mode=render_mode)
+        if self.config['PERCEPTION_DISTANCE'] is not None:
+            self.PERCEPTION_DISTANCE = self.config['PERCEPTION_DISTANCE']
+
     # ----------------- 配置 ----------------- #
     @classmethod
     def default_config(cls):

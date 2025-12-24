@@ -58,15 +58,22 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "ego_clear_radius": 10.0,
 
     # Observation / Action
+    "PERCEPTION_DISTANCE": None,
     "observation": {
         "type": "Kinematics",
         "vehicles_count": 5,
         "features": ["presence", "x", "y", "vx", "vy"],
+        "features_range": {
+            "x": [-200, 200],
+            "y": [-10, 10],
+            "vx": [-15, 15],
+            "vy": [-10, 10]
+        },
         "normalize": False,
         "see_behind": False,
         "include_obstacles": False,
         "include_time": True,
-        "time_range": [0.0, 40.0],
+        "time_range": [0.0, 50.0],
     },
     "action": {
         "type": "ParamLaneAccelAction",

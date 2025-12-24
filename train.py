@@ -61,10 +61,21 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
     print(f"[MAIN] log_dir={log_dir}")
     print(f"[MAIN] save_dir={save_dir}")
 
-    # Train-time overrides (optional): override any subset of keys in conf.get_env_config().
+    #### ================ Train-time overrides (optional) ================ ####
     env_overrides = {
         "initial_lane_id": "random",
+        "PERCEPTION_DISTANCE": 200,
+        "observation": {
+            "vehicles_count": 30,
+            "features_range": {
+                "x": [-200, 200],
+                "y": [-10, 10],
+                "vx": [-15, 15],
+                "vy": [-10, 10]
+            },
+        }
     }
+    #### ================================================================= ####
 
     if algo == "ppo":
         ppo_kwargs = get_ppo_kwargs(log_dir=log_dir, seed=MASTER_SEED)
@@ -131,18 +142,18 @@ if __name__ == "__main__":
     #     save_freq=50_000,
     #     n_envs=8,
     # )
-    # main(
-    #     algo="sac",
-    #     total_timesteps=5_000_000,
-    #     eval_freq=10_000,
-    #     save_freq=50_000,
-    #     n_envs=4,
-    # )
     main(
-        algo="hiro",
-        log_root="./logs/current",
-        total_timesteps=10_000_000,
+        algo="sac",
+        total_timesteps=5_000_000,
         eval_freq=10_000,
         save_freq=50_000,
-        n_envs=8,
+        n_envs=4,
     )
+    # main(
+    #     algo="hiro",
+    #     log_root="./logs/current",
+    #     total_timesteps=10_000_000,
+    #     eval_freq=10_000,
+    #     save_freq=50_000,
+    #     n_envs=8,
+    # )
