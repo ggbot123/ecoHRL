@@ -9,8 +9,9 @@ from stable_baselines3.common.callbacks import CallbackList
 def train_hiro(env, total_timesteps, log_dir, save_dir, high_sac_kwargs, low_sac_kwargs, cfg, save_name_prefix: str):
     os.makedirs(save_dir, exist_ok=True)
     model = HIROSAC(env, high_sac_kwargs, low_sac_kwargs, cfg)
+    n_envs = int(env.num_envs)
 
-    logging_cb = HIROLoggingCallback(log_interval=1)
+    logging_cb = HIROLoggingCallback(high_log_interval_episodes=n_envs * 1, low_log_interval_hi=n_envs * 4)
     checkpoint_cb = HIROCheckpointCallback(
         save_freq=50_000,                 # 或从参数传进来
         save_dir=save_dir,

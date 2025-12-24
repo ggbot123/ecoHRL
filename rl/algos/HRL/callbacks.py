@@ -20,11 +20,18 @@ class HIROLoggingCallback(BaseCallback):
     - low_ret: np.ndarray (k,) for finished low-episodes at this step
     - low_len: np.ndarray (k,)
     - low_comp_sums: dict[str, np.ndarray (k,)]
+    - goal_err: np.ndarray (k, ego_dim) for finished low-episodes at this step
+        Signed tracking error at the end of each high-interval:
+        goal_err = ego_next_rel - goal_rel.
+        With the default ego_dim==4, components correspond to (x, y, vx, vy).
+    - intrinsic_unweighted: np.ndarray (k,)
+        intrinsic / intrinsic_coef at the same boundary.
     """
 
-    def __init__(self, log_interval: int = 1, verbose: int = 0):
+    def __init__(self, high_log_interval_episodes: int = 1, low_log_interval_hi: int = 1, verbose: int = 0):
         super().__init__(verbose)
-        self.log_interval = int(log_interval)
+        self.high_log_interval_episodes = int(high_log_interval_episodes)
+        self.low_log_interval_hi = int(low_log_interval_hi)
         self._episode_counter = 0
         self._rollout_counter = 0
         self._last_dump_high = 0
@@ -39,7 +46,10 @@ class HIROLoggingCallback(BaseCallback):
 
     @staticmethod
     def _record_smooth(logger, buffers: dict, tag: str, value: float, window: int = 50):
-        buf = buffers.setdefault(tag, deque(maxlen=window)); buf.append(float(value)); logger.record(tag, float(sum(buf) / len(buf)))
+        buf = buffers.setdefault(tag, deque(maxlen=window))
+        buf.append(float(value))
+        # logger.record_mean(tag, float(sum(buf) / len(buf)))
+        logger.record(tag, float(sum(buf) / len(buf)))
 
     def _on_rollout_end(self) -> None:
         loc = self.locals
@@ -58,7 +68,24 @@ class HIROLoggingCallback(BaseCallback):
             if arr.size:
                 self._record_smooth(self.model.low_logger, self._low_buffers, f"rollout/{k}", float(arr.mean()))
 
-        if self._rollout_counter - self._last_dump_low >= self.log_interval:
+        # goal tracking error at the end of each high-interval
+        goal_err = np.asarray(loc.get("goal_err", []), dtype=np.float32)
+        self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/x", float(goal_err[:, 0].mean()), window=1)
+        self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/y", float(goal_err[:, 1].mean()), window=1)
+        self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/vx", float(goal_err[:, 2].mean()), window=1)
+        self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/vy", float(goal_err[:, 3].mean()), window=1)
+
+        intrinsic_unweighted = np.asarray(loc.get("intrinsic_unweighted", []), dtype=np.float32).reshape(-1)
+        if intrinsic_unweighted.size:
+            self._record_smooth(
+                self.model.low_logger,
+                self._low_buffers,
+                "goal_err/intrinsic_unweighted",
+                float(intrinsic_unweighted.mean()),
+                window=1,
+            )
+
+        if self._rollout_counter - self._last_dump_low >= self.low_log_interval_hi:
             self.model.low_logger.dump(step=self.model.num_timesteps)
             self._last_dump_low = self._rollout_counter
 
@@ -92,7 +119,7 @@ class HIROLoggingCallback(BaseCallback):
             for arr in self._ep_comp_sums.values():
                 arr[idx] = 0.0
 
-            if self._episode_counter - self._last_dump_high >= self.log_interval:
+            if self._episode_counter - self._last_dump_high >= self.high_log_interval_episodes:
                 self.model.high_logger.dump(step=self.model.num_timesteps)
                 self._last_dump_high = self._episode_counter
 

@@ -141,7 +141,7 @@ if __name__ == "__main__":
     main(
         algo="hiro",
         log_root="./logs/current",
-        total_timesteps=1_000_000,
+        total_timesteps=10_000_000,
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,

@@ -51,7 +51,15 @@ def _normalize_vec_phys(vec: np.ndarray, feature_ranges: np.ndarray) -> np.ndarr
     return np.clip(norm, -1.0, 1.0).astype(np.float32)
 
 
-def intrinsic_reward_l2(ego_next_sub_rel: np.ndarray, goal_rel: np.ndarray, norm_ranges: np.ndarray, coef: float = 1.0, weights: np.ndarray | Sequence[float] | None = None) -> np.ndarray:
+def intrinsic_reward_l2(
+    ego_next_sub_rel: np.ndarray,
+    goal_rel: np.ndarray,
+    norm_ranges: np.ndarray,
+    coef: float,
+    weights: np.ndarray | Sequence[float] | None = None,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute HIRO intrinsic reward based on weighted L2 distance."""
+
     ego = np.asarray(ego_next_sub_rel, dtype=np.float32)
     goal = np.asarray(goal_rel, dtype=np.float32)
 
@@ -68,8 +76,13 @@ def intrinsic_reward_l2(ego_next_sub_rel: np.ndarray, goal_rel: np.ndarray, norm
         s = float(w.sum())
         w = (np.ones(n, dtype=np.float32) / float(n)) if s == 0.0 else (w / s)
 
-    dist = np.sqrt(np.sum((delta * delta) * w[None, :], axis=1))
-    return (-float(coef) * dist).astype(np.float32)
+    dist = np.sqrt(np.sum((delta * delta) * w[None, :], axis=1)).astype(np.float32)
+    reward = (-coef * dist).astype(np.float32)
+
+    goal_err_phys = (ego - goal).astype(np.float32)
+    reward_unweighted = (reward / coef).astype(np.float32)
+
+    return reward, goal_err_phys, reward_unweighted
 
 
 def map_y_code_to_target_y(y_code: np.ndarray, y_current: np.ndarray, lane_center_ys: np.ndarray) -> np.ndarray:

@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List
 import gymnasium as gym
 import numpy as np
 
 from rl.algos.sac.sac import SAC
 from rl.utils import utils
-from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.utils import get_device, configure_logger
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -185,6 +184,13 @@ class HIROSAC:
         callback.init_callback(self)
         return callback
 
+    @staticmethod
+    def _propagate_log_interval(callback, log_interval: int):
+        if isinstance(callback, CallbackList):
+            for cb in callback.callbacks: HIROSAC._propagate_log_interval(cb, log_interval)
+        elif hasattr(callback, "log_interval"):
+            callback.log_interval = int(log_interval)
+
     
     # ------------------------------------------------------------------
     # 内部工具函数：obs 处理
@@ -192,7 +198,7 @@ class HIROSAC:
     def _build_high_obs(self, obs: np.ndarray) -> np.ndarray:
         return np.asarray(obs, dtype=np.float32)
 
-    def _build_low_obs(self, t_rel: float, kin_flat: np.ndarray, kin: np.ndarray, goal_phys: np.ndarray) -> np.ndarray:
+    def _build_low_obs(self, t_rel: np.ndarray, kin_flat: np.ndarray, kin: np.ndarray, goal_phys: np.ndarray) -> np.ndarray:
         """
         低层观测 = t_norm + kin_flat + goal_rel
         接收绝对坐标系 goal_phys，根据当前 ego 状态计算 goal_rel
@@ -218,6 +224,7 @@ class HIROSAC:
 
         # ========== 0. initialization ========== #
         callback = self._init_callback(callback, progress_bar=progress_bar)
+        self._propagate_log_interval(callback, log_interval)
         env = self.env
         obs = env.reset()
         done, truncated = False, False
@@ -238,6 +245,8 @@ class HIROSAC:
         low_ret = np.zeros(n_envs, dtype=np.float32)
         low_len = np.zeros(n_envs, dtype=np.int32)
         low_comp_sums: dict[str, np.ndarray] = {}
+        goal_err_all = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
+        intrinsic_unweighted = np.zeros(n_envs, dtype=np.float32)
 
         callback.on_training_start(locals(), globals())
 
@@ -298,7 +307,9 @@ class HIROSAC:
                 ego_next_rel = utils.extract_ego_substate(kin_next[idx_last], self.ego_feature_idx) - ego_start[idx_last]
                 goal_rel = goal_phys[idx_last] - ego_start[idx_last]
 
-                intrinsic[idx_last] = utils.intrinsic_reward_l2(ego_next_rel, goal_rel, self._intrinsic_norm_ranges, self.cfg.intrinsic_coef, self._intrinsic_weights)
+                intrinsic[idx_last], goal_err_all[idx_last], intrinsic_unweighted[idx_last] = utils.intrinsic_reward_l2(
+                    ego_next_rel, goal_rel, self._intrinsic_norm_ranges, self.cfg.intrinsic_coef, self._intrinsic_weights
+                )
 
             low_reward_total = low_reward_ext + intrinsic
             low_ret += low_reward_total
@@ -350,7 +361,11 @@ class HIROSAC:
                 low_len_end = low_len[idx_end].copy()
                 low_comp_end = {k: v[idx_end].copy() for k, v in low_comp_sums.items()}
 
-                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_comp_sums": low_comp_end})
+                # goal tracking diagnostics for these finished low-episodes
+                goal_err_end = goal_err_all[idx_end].copy()
+                intrinsic_unweighted_end = intrinsic_unweighted[idx_end].copy()
+
+                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end,})
                 callback.on_rollout_end()
 
                 self.high_agent.num_timesteps += int(idx_end.size)
