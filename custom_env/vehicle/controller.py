@@ -282,19 +282,18 @@ class RLControlledVehicle(ControlledVehicle):
         """
         lane_change_cmd: 0=KEEP, 1=LANE_LEFT, 2=LANE_RIGHT
         """
-        if lane_change_cmd == 0:
-            return
+        _from, _to, cur_id = self.lane_index
+        max_lane_id = len(self.road.network.graph[_from][_to]) - 1
 
-        _from, _to, _id = self.target_lane_index
-        lanes_on_edge = self.road.network.graph[_from][_to]
-        max_lane_id = len(lanes_on_edge) - 1
-
-        if lane_change_cmd == 1:  # LANE_LEFT
-            self.target_lane_index = (_from, _to, int(np.clip(_id - 1, 0, max_lane_id)))
+        if lane_change_cmd == 0:  # KEEP：回到当前车道中心跟踪
+            desired_id = int(cur_id)
+        elif lane_change_cmd == 1:  # LANE_LEFT
+            desired_id = int(np.clip(cur_id - 1, 0, max_lane_id))
         elif lane_change_cmd == 2:  # LANE_RIGHT
-            self.target_lane_index = (_from, _to, int(np.clip(_id + 1, 0, max_lane_id)))
+            desired_id = int(np.clip(cur_id + 1, 0, max_lane_id))
         else:
             return
+        self.target_lane_index = (_from, _to, desired_id)
     
     def act(self, action: Union[dict, str, None] = None) -> None:
         """
