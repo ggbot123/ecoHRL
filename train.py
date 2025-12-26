@@ -71,17 +71,17 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
     #### ================ Train-time overrides (optional) ================ ####
     env_overrides = {
         "initial_lane_id": "random",
-        # "PERCEPTION_DISTANCE": 200,
-        # "observation": {
-        #     "vehicles_count": 20,
-        #     "vehicles_count_local": 5,
-        #     "features_range": {
-        #         "x": [-200, 200],
-        #         "y": [-10, 10],
-        #         "vx": [-15, 15],
-        #         "vy": [-10, 10]
-        #     },
-        # }
+        "PERCEPTION_DISTANCE": 200,
+        "observation": {
+            "vehicles_count": 20,
+            "vehicles_count_local": 5,
+            "features_range": {
+                "x": [-200, 200],
+                "y": [-10, 10],
+                "vx": [-15, 15],
+                "vy": [-10, 10]
+            },
+        }
     }
     #### ================================================================= ####
 

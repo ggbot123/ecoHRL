@@ -275,6 +275,7 @@ class HIROSAC:
         goal_buffer_action = np.zeros_like(goal_action)
         goal_phys = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
         ego_start = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
+        goal_dist_start = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
 
         high_ret = np.zeros(n_envs, dtype=np.float32)
         low_ret = np.zeros(n_envs, dtype=np.float32)
@@ -316,6 +317,7 @@ class HIROSAC:
                 ego_sub = utils.extract_ego_substate(kin[idx], self.ego_feature_idx)
                 ego_start[idx] = ego_sub
                 goal_phys[idx] = utils.goal_action_to_abs(ego_sub, a, self.lane_center_ys)
+                goal_dist_start[idx] = goal_phys[idx] - ego_start[idx]
 
                 high_ret[idx] = 0.0
                 low_ret[idx] = 0.0
@@ -419,8 +421,9 @@ class HIROSAC:
                 # goal tracking diagnostics for these finished low-episodes
                 goal_err_end = goal_err_all[idx_end].copy()
                 intrinsic_unweighted_end = intrinsic_unweighted[idx_end].copy()
+                goal_dist_start_end = goal_dist_start[idx_end].copy()
 
-                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end,})
+                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end, "goal_dist_start": goal_dist_start_end})
                 callback.on_rollout_end()
 
                 self.high_agent.num_timesteps += int(idx_end.size)

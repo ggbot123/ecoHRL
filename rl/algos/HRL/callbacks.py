@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import csv
 from collections import deque
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
@@ -85,6 +86,13 @@ class HIROLoggingCallback(BaseCallback):
                 window=1,
             )
 
+        goal_dist_start = np.asarray(loc.get("goal_dist_start", []), dtype=np.float32)
+        if goal_dist_start.size:
+            self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/start_dist_x", float(goal_dist_start[:, 0].mean()))
+            self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/start_dist_y", float(goal_dist_start[:, 1].mean()))
+            self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/start_dist_vx", float(goal_dist_start[:, 2].mean()))
+            self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/start_dist_vy", float(goal_dist_start[:, 3].mean()))
+
         if self._rollout_counter - self._last_dump_low >= self.low_log_interval_hi:
             self.model.low_logger.dump(step=self.model.num_timesteps)
             self._last_dump_low = self._rollout_counter
@@ -142,4 +150,133 @@ class HIROCheckpointCallback(BaseCallback):
             self.model.low_agent.save(low_path)
             if self.verbose:
                 print(f"[Checkpoint] Saved HIRO models at step={self.num_timesteps}")
+        return True
+
+
+class HIROTrajectoryLogger(BaseCallback):
+    def __init__(self, log_freq_episodes: int, save_dir: str, verbose: int = 0):
+        super().__init__(verbose)
+        self.log_freq = int(log_freq_episodes)
+        self.save_dir = save_dir
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+        self.ep_count = 0
+        self.current_ep_high_traj = []
+        self.current_ep_low_traj = []
+        self.logging_active = False
+        self.low_traj_recorded = False
+
+        # CSV Headers
+        self.high_header = ["episode", "step", "start_x", "start_y", "start_vx", "start_vy", 
+                            "goal_x", "goal_y", "goal_vx", "goal_vy", 
+                            "end_x", "end_y", "end_vx", "end_vy", "intrinsic_reward"]
+        self.low_header = ["episode", "step_in_episode", "x", "y", "vx", "vy", 
+                           "action_acc", "action_steer", "reward"]
+
+        # Initialize files with headers if they don't exist
+        self.high_csv_path = os.path.join(self.save_dir, "high_traj.csv")
+        self.low_csv_path = os.path.join(self.save_dir, "low_traj.csv")
+        
+        if not os.path.exists(self.high_csv_path):
+            with open(self.high_csv_path, "w", newline="") as f:
+                csv.writer(f).writerow(self.high_header)
+        
+        if not os.path.exists(self.low_csv_path):
+            with open(self.low_csv_path, "w", newline="") as f:
+                csv.writer(f).writerow(self.low_header)
+
+    def _on_step(self) -> bool:
+        # We only track env 0
+        loc = self.locals
+        
+        # Check if episode ended for env 0
+        done = loc.get("done")[0]
+        
+        # Check if we should be logging this episode
+        if self.ep_count % self.log_freq == 0:
+            self.logging_active = True
+        else:
+            self.logging_active = False
+
+        if self.logging_active:
+            # Collect Low Trajectory
+            # We want to record ONE high interval's low trajectory.
+            # Let's record the FIRST interval of the episode.
+            
+            # If we haven't recorded low traj yet, we record every step until done_low[0] is True.
+            if not self.low_traj_recorded:
+                ego_idx = self.model.ego_feature_idx
+                kin_next = loc.get("kin_next")[0]
+                # Assuming ego is vehicle 0
+                ego_state = kin_next[0][ego_idx]
+                
+                # Low action
+                low_action = loc.get("low_action")[0]
+                reward = loc.get("reward")[0]
+                
+                # Store
+                self.current_ep_low_traj.append({
+                    "episode": self.ep_count,
+                    "step_in_episode": len(self.current_ep_low_traj),
+                    "x": float(ego_state[0]),
+                    "y": float(ego_state[1]),
+                    "vx": float(ego_state[2]),
+                    "vy": float(ego_state[3]),
+                    "action_acc": float(low_action[0]),
+                    "action_steer": float(low_action[1]),
+                    "reward": float(reward)
+                })
+                
+                if loc.get("done_low")[0]:
+                    self.low_traj_recorded = True
+
+            # Collect High Trajectory (at end of interval)
+            if loc.get("done_low")[0]:
+                # Get interval data
+                ego_start = loc.get("ego_start")[0]
+                goal_phys = loc.get("goal_phys")[0]
+                intrinsic = loc.get("intrinsic")[0]
+                
+                # End state
+                ego_idx = self.model.ego_feature_idx
+                kin_next = loc.get("kin_next")[0]
+                ego_end = kin_next[0][ego_idx]
+                
+                self.current_ep_high_traj.append({
+                    "episode": self.ep_count,
+                    "step": len(self.current_ep_high_traj),
+                    "start_x": float(ego_start[0]),
+                    "start_y": float(ego_start[1]),
+                    "start_vx": float(ego_start[2]),
+                    "start_vy": float(ego_start[3]),
+                    "goal_x": float(goal_phys[0]),
+                    "goal_y": float(goal_phys[1]),
+                    "goal_vx": float(goal_phys[2]),
+                    "goal_vy": float(goal_phys[3]),
+                    "end_x": float(ego_end[0]),
+                    "end_y": float(ego_end[1]),
+                    "end_vx": float(ego_end[2]),
+                    "end_vy": float(ego_end[3]),
+                    "intrinsic_reward": float(intrinsic)
+                })
+
+        if done:
+            if self.logging_active:
+                # Write to CSV
+                if self.current_ep_high_traj:
+                    with open(self.high_csv_path, "a", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=self.high_header)
+                        writer.writerows(self.current_ep_high_traj)
+                
+                if self.current_ep_low_traj:
+                    with open(self.low_csv_path, "a", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=self.low_header)
+                        writer.writerows(self.current_ep_low_traj)
+            
+            # Reset for next episode
+            self.ep_count += 1
+            self.current_ep_high_traj = []
+            self.current_ep_low_traj = []
+            self.low_traj_recorded = False
+            
         return True

@@ -10,7 +10,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 
 from rl.algos.sac.sac import SAC
-from rl.utils.callbacks import RewardComponentsTensorboardCallback
+from rl.algos.sac.callbacks import RewardComponentsTensorboardCallback
 
 
 def train_sac(
@@ -51,7 +51,7 @@ def train_sac(
         save_replay_buffer=True,
         save_vecnormalize=False,
     )
-    rc_tb_callback = RewardComponentsTensorboardCallback(log_freq=1, verbose=0)
+    rc_tb_callback = RewardComponentsTensorboardCallback(verbose=0)
 
     sac_kwargs = dict(sac_kwargs)
     sac_kwargs.pop("env", None)

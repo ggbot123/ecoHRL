@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 from rl.algos.HRL.hiro import HIROSAC
 from rl.algos.HRL.buffer import HiROHighReplayBuffer
-from rl.algos.HRL.callbacks import HIROLoggingCallback, HIROCheckpointCallback
+from rl.algos.HRL.callbacks import HIROLoggingCallback, HIROCheckpointCallback, HIROTrajectoryLogger
 from stable_baselines3.common.callbacks import CallbackList
 
 
@@ -45,7 +45,12 @@ def train_hiro(
         prefix=save_name_prefix,
         verbose=1,
     )
-    callback = CallbackList([logging_cb, checkpoint_cb])
+    traj_logger = HIROTrajectoryLogger(
+        log_freq_episodes=20,
+        save_dir=log_dir,
+        verbose=1,
+    )
+    callback = CallbackList([logging_cb, checkpoint_cb, traj_logger])
 
     model.learn(
         total_timesteps=total_timesteps,
