@@ -11,7 +11,13 @@ import scenarios.multi_lane  # 注册 multi-lane-custom-v0
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from configs.conf import get_env_config, get_ppo_kwargs, get_sac_kwargs, get_hiro_config
+from configs.conf import (
+    get_env_config,
+    get_ppo_kwargs,
+    get_sac_kwargs,
+    get_hiro_config,
+    get_hiro_replay_buffer_kwargs,
+)
 from rl.algos.ppo.trainer import train_ppo
 from rl.algos.sac.trainer import train_sac
 from rl.algos.HRL.trainer import train_hiro
@@ -19,6 +25,7 @@ from rl.algos.HRL.hiro import HIROConfig
 
 MASTER_SEED = 42
 master_rng: np.random.Generator
+
 
 def set_global_seed(seed: int) -> None:
     random.seed(seed)
@@ -64,17 +71,17 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
     #### ================ Train-time overrides (optional) ================ ####
     env_overrides = {
         "initial_lane_id": "random",
-        "PERCEPTION_DISTANCE": 200,
-        "observation": {
-            "vehicles_count": 20,
-            "vehicles_count_local": 5,
-            "features_range": {
-                "x": [-200, 200],
-                "y": [-10, 10],
-                "vx": [-15, 15],
-                "vy": [-10, 10]
-            },
-        }
+        # "PERCEPTION_DISTANCE": 200,
+        # "observation": {
+        #     "vehicles_count": 20,
+        #     "vehicles_count_local": 5,
+        #     "features_range": {
+        #         "x": [-200, 200],
+        #         "y": [-10, 10],
+        #         "vx": [-15, 15],
+        #         "vy": [-10, 10]
+        #     },
+        # }
     }
     #### ================================================================= ####
 
@@ -113,7 +120,9 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
     elif algo == "hiro":
         sac_kwargs_high = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_high"), seed=MASTER_SEED, level="high")
         sac_kwargs_low = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED, level="low")
+
         hiro_cfg: HIROConfig = get_hiro_config()
+        hiro_rb_kwargs = get_hiro_replay_buffer_kwargs()
 
         env = SubprocVecEnv([make_env(env_overrides) for _ in range(n_envs)])
 
@@ -125,6 +134,7 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
             high_sac_kwargs=sac_kwargs_high,
             low_sac_kwargs=sac_kwargs_low,
             cfg=hiro_cfg,
+            high_rb_kwargs=hiro_rb_kwargs,
             save_name_prefix="hiro",
         )
         env.close()

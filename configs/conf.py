@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 
 def _deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> Dict[str, Any]:
@@ -62,6 +62,7 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "observation": {
         "type": "Kinematics",
         "vehicles_count": 5,
+        "vehicles_count_local": 5,
         "features": ["presence", "x", "y", "vx", "vy"],
         "features_range": {
             "x": [-200, 200],
@@ -152,8 +153,31 @@ def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, An
     return sac_kwargs
 
 
+# =========================
+# HiRO centralized configs
+# =========================
+
+def get_hiro_replay_buffer_kwargs() -> Dict[str, Any]:
+    """Centralized kwargs for the HiRO high-level replay buffer (OPC)."""
+    return dict(
+        n_candidates=10,
+        noise_std=0.5,  # std in *scaled* action space [-1, 1]
+        enable_off_policy_correction=True,
+    )
+
+
 def get_hiro_config():
+    """Centralized HiRO algorithm config."""
     from rl.algos.HRL.hiro import HIROConfig
+
+    intrinsic_norm_ranges = [
+        [0.0, 37.5],
+        [-8.0, 8.0],
+        [-8.0, 8.0],
+        [-2.0, 2.0],
+    ]
+    intrinsic_weights = [1.0, 2.0, 8.0, 1.0]
+
     return HIROConfig(
         high_interval=25,
         batch_size=256,
@@ -162,4 +186,7 @@ def get_hiro_config():
         train_freq=1,
         intrinsic_coef=8.0,
         device="auto",
+        intrinsic_norm_ranges=intrinsic_norm_ranges,
+        intrinsic_weights=intrinsic_weights,
+        use_off_policy_correction=True,
     )
