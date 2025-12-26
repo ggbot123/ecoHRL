@@ -8,6 +8,7 @@ import numpy as np
 
 from rl.algos.sac.sac import SAC
 from rl.utils import utils
+from rl.algos.HRL.buffer import HiROHighReplayBuffer
 from stable_baselines3.common.utils import get_device, configure_logger
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -102,6 +103,9 @@ class HIROConfig:
     train_freq: int
     intrinsic_coef: float     # 末状态距离 goal 的 intrinsic reward 系数
     device: str
+    use_off_policy_correction: bool = True
+    opc_n_candidates: int = 10
+    opc_noise_std: float = 0.5         # std in *scaled* action space [-1, 1]
 
 
 class HIROSAC:
@@ -118,11 +122,13 @@ class HIROSAC:
         keep_features = ("x", "y", "vx", "vy")  # ego 子状态中参与 HIRO goal 的特征
         (
             self.n_veh,
+            self.n_veh_local,
             self.feat_dim,
             self.feature_names,
             self.ego_feature_idx,
         ) = utils.init_kinematics_meta(env, obs0_flat, keep_features)
         self.kin_flat_dim = int(self.n_veh * self.feat_dim)
+        self.local_kin_flat_dim = int(self.n_veh_local * self.feat_dim)
         self.ego_dim = len(self.ego_feature_idx)
 
         # ---- 从env中获取的必要变量 --- #
@@ -143,13 +149,39 @@ class HIROSAC:
         goal_high = np.array([self.v_max * t_h, 1, self.v_max], dtype=np.float32)
         high_act_space = gym.spaces.Box(goal_low, goal_high, dtype=np.float32)
 
-        low_obs_dim = self.kin_flat_dim + self.ego_dim + 1
+        low_obs_dim = self.local_kin_flat_dim + self.ego_dim + 1
         low_obs_space = gym.spaces.Box(-np.inf, np.inf, shape=(low_obs_dim,), dtype=np.float32)
         low_act_space = env.action_space
 
         # ----- 创建 Wrapper 实例 ----- #
-        high_sac = SAC(env=_make_dummy_vec_env(high_obs_space, high_act_space, 1), **high_sac_kwargs)
+        # 先创建 low-level SAC：HiRO 的 high-level off-policy correction 需要访问当前 low-level policy
         low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
+
+        # HiRO Off-Policy Correction (OPC) for high-level replay buffer
+        self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", True))
+        if self.use_off_policy_correction:
+            high_sac_kwargs = dict(high_sac_kwargs)
+            rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
+            rb_kwargs.update(
+                dict(
+                    max_seq_len=int(self.cfg.high_interval),
+                    kin_flat_dim=int(self.local_kin_flat_dim),
+                    low_action_dim=int(np.prod(low_act_space.shape)),
+                    feat_dim=int(self.feat_dim),
+                    ego_feature_idx=list(self.ego_feature_idx),
+                    lane_center_ys=self.lane_center_ys,
+                    low_policy=low_sac.policy,
+                    high_interval=int(self.cfg.high_interval),
+                    n_candidates=int(getattr(self.cfg, "opc_n_candidates", 10)),
+                    noise_std=float(getattr(self.cfg, "opc_noise_std", 0.5)),
+                    enable_off_policy_correction=True,
+                )
+            )
+            high_sac_kwargs["replay_buffer_class"] = HiROHighReplayBuffer
+            high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
+
+        high_sac = SAC(env=_make_dummy_vec_env(high_obs_space, high_act_space, 1), **high_sac_kwargs)
+
         self.high_agent = SB3AgentWrapper(high_sac, config.train_freq, config.gradient_steps_high, config.batch_size)
         self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
 
@@ -206,7 +238,8 @@ class HIROSAC:
         t_norm = (np.asarray(t_rel, dtype=np.float32) / float(self.cfg.high_interval)).reshape(-1, 1)
         ego_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
         goal_rel = (np.asarray(goal_phys, dtype=np.float32) - ego_sub).astype(np.float32)
-        return np.concatenate([t_norm, np.asarray(kin_flat, dtype=np.float32), goal_rel], axis=1)
+        local_kin_flat = kin_flat[:, :self.local_kin_flat_dim]
+        return np.concatenate([t_norm, np.asarray(local_kin_flat, dtype=np.float32), goal_rel], axis=1)
     
     @staticmethod
     def _terminal_obs(next_obs: np.ndarray, dones: np.ndarray, infos: List[Dict[str, Any]]) -> np.ndarray:
@@ -248,6 +281,17 @@ class HIROSAC:
         goal_err_all = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
         intrinsic_unweighted = np.zeros(n_envs, dtype=np.float32)
 
+        # HiRO high-level off-policy correction (OPC) requires the low-level trajectory for each high-level transition
+        opc_enabled = bool(getattr(self, "use_off_policy_correction", False))
+        if opc_enabled:
+            low_act_dim = int(np.prod(env.action_space.shape))
+            opc_kin_flat_seq = np.zeros((n_envs, hi, self.local_kin_flat_dim), dtype=np.float32)
+            opc_low_act_seq = np.zeros((n_envs, hi, low_act_dim), dtype=np.float32)
+        else:
+            low_act_dim = 0
+            opc_kin_flat_seq = None
+            opc_low_act_seq = None
+
         callback.on_training_start(locals(), globals())
 
         # ========== 1. Main Loop ========== #
@@ -276,12 +320,21 @@ class HIROSAC:
                 for v in low_comp_sums.values():
                     v[idx] = 0.0
                 
+                if opc_enabled:
+                    opc_kin_flat_seq[idx] = 0.0
+                    opc_low_act_seq[idx] = 0.0
+                
                 c[idx] = 0
                 need_high[idx] = False
 
             # === 1.2 Low Level Decision ===
             low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys)
             low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
+
+            if opc_enabled:
+                # record (s_i, a_i) for off-policy correction
+                opc_kin_flat_seq[np.arange(n_envs), c] = kin_flat
+                opc_low_act_seq[np.arange(n_envs), c] = low_buffer_action
 
             next_obs, reward, done, infos = env.step(low_action)
             reward = np.asarray(reward, dtype=np.float32)
@@ -370,7 +423,11 @@ class HIROSAC:
 
                 self.high_agent.num_timesteps += int(idx_end.size)
                 for j in idx_end:
-                    info_h = dict(infos[j]); info_h["high_interval_len"] = int(low_len[j])
+                    info_h = dict(infos[j])
+                    info_h["high_interval_len"] = int(low_len[j])
+                    if opc_enabled:
+                        info_h["opc_kin_flat_seq"] = opc_kin_flat_seq[j, : int(low_len[j])].copy()
+                        info_h["opc_low_act_seq"] = opc_low_act_seq[j, : int(low_len[j])].copy()
                     self.high_agent.store_transition(
                         high_obs_start[j:j + 1], 
                         goal_buffer_action[j:j + 1], 
