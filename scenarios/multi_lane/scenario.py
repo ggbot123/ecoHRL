@@ -4,11 +4,22 @@ from custom_env.envs.common.abstract import AbstractEnv
 from custom_env.road.road import Road, RoadNetwork
 from custom_env.envs.common.action import Action
 from custom_env import utils
-from custom_env.vehicle.objects import Obstacle
+from custom_env.vehicle.objects import Obstacle, Landmark
 
 from configs.conf import get_env_config
 
 Observation = np.ndarray
+
+class GoalMarker(Landmark):
+    """
+    Visual marker for HIRO high-level goal.
+    """
+    def __init__(self, road, position, heading=0, velocity=0):
+        super().__init__(road, position, heading, velocity)
+        self.color = (255, 0, 0)  # Red color for goal
+        self.LENGTH = 2.0
+        self.WIDTH = 2.0
+        self.collidable = False  # Purely visual, no collision physics
 
 class BusStop(Obstacle):
     """
@@ -444,3 +455,28 @@ class MultiLaneEnv(AbstractEnv):
         if not hasattr(self.road, "objects"):
             self.road.objects = []
         self.road.objects.append(bus_stop)
+
+    def set_hiro_goal(self, goal_phys: np.ndarray):
+        """
+        Update the visual marker for HIRO goal.
+        goal_phys: [x, y, vx, vy]
+        """
+        if not hasattr(self, "road") or self.road is None:
+            return
+            
+        # Remove existing goal marker
+        if hasattr(self, "_goal_marker") and self._goal_marker in self.road.objects:
+            self.road.objects.remove(self._goal_marker)
+            
+        # Create new marker
+        # goal_phys is absolute [x, y, vx, vy]
+        position = np.array([goal_phys[0], goal_phys[1]])
+        
+        # We can use heading 0 for point goal, or calculate if needed
+        heading = 0
+        
+        self._goal_marker = GoalMarker(self.road, position, heading)
+        
+        if not hasattr(self.road, "objects"):
+            self.road.objects = []
+        self.road.objects.append(self._goal_marker)

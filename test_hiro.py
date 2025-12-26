@@ -86,7 +86,7 @@ class HIROPolicyRunner:
     def _ego_sub(self, kin: np.ndarray) -> np.ndarray:
         return utils.extract_ego_substate(kin, self.ego_feature_idx)[0]
 
-    def _sample_goal(self, obs: np.ndarray, kin: np.ndarray):
+    def _sample_goal(self, obs: np.ndarray, kin: np.ndarray, env=None):
         ego_sub = self._ego_sub(kin)
         goal_action, _ = self.high_model.predict(np.asarray(obs, dtype=np.float32), deterministic=True)
         goal_action = np.asarray(goal_action, dtype=np.float32).reshape(1, -1)
@@ -94,11 +94,18 @@ class HIROPolicyRunner:
         self.goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
         self.ego_start = ego_sub.astype(np.float32, copy=True)
         self.need_high, self.c = False, 0
+        
+        # Update env with goal for rendering
+        if env is not None:
+            # Handle RecordVideo wrapper or other wrappers
+            unwrapped = env.unwrapped
+            if hasattr(unwrapped, "set_hiro_goal"):
+                unwrapped.set_hiro_goal(self.goal_phys)
 
     def act(self, env, obs: np.ndarray) -> np.ndarray:
         _, kin, kin_flat = self._split(obs)
         if self.need_high:
-            self._sample_goal(obs, kin)
+            self._sample_goal(obs, kin, env)
         ego_sub = self._ego_sub(kin)
         t_norm = np.array([self.c / float(self.hi)], dtype=np.float32)
         goal_rel = (self.goal_phys - ego_sub).astype(np.float32)

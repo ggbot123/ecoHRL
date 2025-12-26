@@ -70,7 +70,8 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
 
     #### ================ Train-time overrides (optional) ================ ####
     env_overrides = {
-        "initial_lane_id": "random",
+        # "initial_lane_id": "random",
+        "initial_lane_id": 1,
         "PERCEPTION_DISTANCE": 200,
         "observation": {
             "vehicles_count": 20,
@@ -79,7 +80,7 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
                 "x": [-200, 200],
                 "y": [-10, 10],
                 "vx": [-15, 15],
-                "vy": [-10, 10]
+                "vy": [-10, 10],
             },
         }
     }
@@ -156,10 +157,10 @@ if __name__ == "__main__":
     # main(
     #     algo="sac",
     #     log_root="./logs/current",
-    #     total_timesteps=5_000_000,
+    #     total_timesteps=10_000_000,
     #     eval_freq=10_000,
     #     save_freq=50_000,
-    #     n_envs=4,
+    #     n_envs=8,
     # )
     main(
         algo="hiro",

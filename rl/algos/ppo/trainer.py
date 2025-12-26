@@ -10,7 +10,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 
 from rl.algos.ppo.ppo import PPO
-from rl.utils.callbacks import RewardComponentsTensorboardCallback  # 你已有的 callback
+from rl.algos.ppo.callbacks import RewardComponentsTensorboardCallback  # 你已有的 callback
 
 
 def train_ppo(
