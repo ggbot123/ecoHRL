@@ -47,6 +47,7 @@ class HIROPolicyRunner:
         self._inited = False
         self.need_high, self.c = True, 0
         self.n_veh, self.feat_dim, self.feature_names, self.ego_feature_idx, self.ego_dim = 0, 0, [], [], 0
+        self.n_veh_local, self.local_kin_flat_dim = 0, 0
         self.lane_center_ys = np.zeros(0, dtype=np.float32)
         self.goal_phys = np.zeros(0, dtype=np.float32)
         self.ego_start = np.zeros(0, dtype=np.float32)
@@ -58,8 +59,10 @@ class HIROPolicyRunner:
 
     def init_from_env(self, env, obs0: np.ndarray, intrinsic_coef: float):
         keep = ("x", "y", "vx", "vy")
-        n_veh, feat_dim, feature_names, ego_idx = utils.init_kinematics_meta(env, obs0, keep)
+        n_veh, n_veh_local, feat_dim, feature_names, ego_idx = utils.init_kinematics_meta(env, obs0, keep)
         self.n_veh, self.feat_dim, self.feature_names, self.ego_feature_idx = int(n_veh), int(feat_dim), list(feature_names), list(ego_idx)
+        self.n_veh_local = int(n_veh_local)
+        self.local_kin_flat_dim = self.n_veh_local * self.feat_dim
         self.ego_dim = int(len(self.ego_feature_idx))
         cfg = getattr(env.unwrapped, "config", getattr(env, "config", {}))
         lanes, lane_w = int(cfg["lanes_count"]), float(cfg.get("lane_width", 4.0))
@@ -109,7 +112,10 @@ class HIROPolicyRunner:
         ego_sub = self._ego_sub(kin)
         t_norm = np.array([self.c / float(self.hi)], dtype=np.float32)
         goal_rel = (self.goal_phys - ego_sub).astype(np.float32)
-        low_obs = np.concatenate([t_norm, kin_flat[0], goal_rel]).astype(np.float32)
+        
+        local_kin_flat = kin_flat[0, :self.local_kin_flat_dim]
+        low_obs = np.concatenate([t_norm, local_kin_flat, goal_rel]).astype(np.float32)
+        
         action, _ = self.low_model.predict(low_obs, deterministic=True)
         return np.asarray(action, dtype=np.float32)
 
@@ -118,7 +124,7 @@ class HIROPolicyRunner:
         ego_next = self._ego_sub(kin_next)
         ego_rel = (ego_next - self.ego_start).astype(np.float32)
         goal_rel = (self.goal_phys - self.ego_start).astype(np.float32)
-        r = utils.intrinsic_reward_l2(ego_rel[None, :], goal_rel[None, :], self.norm_ranges, self.intrinsic_coef, self.weights)
+        r, _, _ = utils.intrinsic_reward_l2(ego_rel[None, :], goal_rel[None, :], self.norm_ranges, self.intrinsic_coef, self.weights)
         return float(np.asarray(r, dtype=np.float32).reshape(-1)[0])
 
     def step_end(self, done: bool):
@@ -141,15 +147,26 @@ def main(
         log_file.write(msg + "\n")
 
     test_overrides: Dict[str, Any] = {
-        "duration": 70.0,
         "initial_lane_id": 1,
+        "PERCEPTION_DISTANCE": 200,
+        "observation": {
+            "vehicles_count": 20,
+            "vehicles_count_local": 5,
+            "features_range": {
+                "x": [-200, 200],
+                "y": [-10, 10],
+                "vx": [-15, 15],
+                "vy": [-10, 10],
+            },
+        },
+        "duration": 70.0,
         "warmup_each_episode": False,
         "screen_width": 1800,
         "screen_height": 300,
         "scaling": 3,
         "centering_position": [0.5, 0.5],
         "show_trajectories": True,
-        "warmup_render": False,
+        "warmup_render": False,  
     }
     if env_overrides:
         test_overrides.update(env_overrides)
@@ -333,8 +350,9 @@ if __name__ == "__main__":
     # - model_dir: 训练产物目录（包含 *_high_final.zip / *_low_final.zip）
     # - model_name: 前缀（如 "hiro"）或其中一个 zip 文件名
     main(
-        model_dir="./models/hiro_20251222-164124", 
+        model_dir="./models/hiro_20251226-153035", 
         model_name="hiro", 
-        episodes=10, 
-        record_episodes=[1, 2, 3]
+        episodes=30, 
+        # record_episodes=[1, 2, 3],
+        record_episodes=[i for i in range(1, 31)],
     )

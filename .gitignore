@@ -2,3 +2,5 @@
 /logs
 /models
 *.csv
+/copy
+/gpt

@@ -29,25 +29,33 @@ def main(model_path: str, model_name: str, algo: str, episodes: int, record_epis
         log_file.write(msg + "\n")
 
     env_config = {
-        "policy_frequency": 10,  # [Hz]
-        "duration": 70,
         "initial_lane_id": 1,
-        # "initial_lane_id": "random",
-        "observation": {
-            "type": "Kinematics",
-            "normalize": False,
-            "include_time": True,  # 在观测中加入当前时间
-            "time_range": [0.0, 40.0],
-            "include_obstacles": False,
-        },
-        "warmup_each_episode": False,    # 每个 episode 重置交通流，使各个ep之间独立
-        # 可视化设置
+        # "PERCEPTION_DISTANCE": 200,
+        # "observation": {
+        #     "type": "Kinematics",
+        #     "vehicles_count": 20,
+        #     "vehicles_count_local": 5,
+        #     "features": ["presence", "x", "y", "vx", "vy"],
+        #     "features_range": {
+        #         "x": [-200, 200],
+        #         "y": [-10, 10],
+        #         "vx": [-15, 15],
+        #         "vy": [-10, 10]
+        #     },
+        #     "normalize": False,
+        #     "see_behind": False,
+        #     "include_obstacles": False,
+        #     "include_time": True,
+        #     "time_range": [0.0, 50.0],
+        # },
+        "duration": 70.0,
+        "warmup_each_episode": False,
         "screen_width": 1800,
         "screen_height": 300,
         "scaling": 3,
         "centering_position": [0.5, 0.5],
-        "show_trajectories": True,  # 记录并显示ego轨迹, all 时记录所有车辆轨迹
-        "warmup_render": False,      # 在 reset 期间也渲染 warmup 画面
+        "show_trajectories": True,
+        "warmup_render": False,  
     }
     # 视频录制触发器
     if record_episodes is None or len(record_episodes) == 0:
