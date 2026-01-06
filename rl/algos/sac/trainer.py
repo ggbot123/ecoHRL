@@ -48,7 +48,7 @@ def train_sac(
         save_freq=save_freq,
         save_path=save_dir,
         name_prefix=f"{save_name_prefix}_model",
-        save_replay_buffer=True,
+        save_replay_buffer=False,
         save_vecnormalize=False,
     )
     rc_tb_callback = RewardComponentsTensorboardCallback(verbose=0)

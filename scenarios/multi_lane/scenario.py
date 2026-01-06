@@ -30,6 +30,10 @@ class BusStop(Obstacle):
     LENGTH = 20.0  # m，沿 x 方向
     WIDTH = 3.0    # m，可以自己调宽一点，比如 3~4m
 
+    def __init__(self, road, position, heading=0, speed=0):
+        super().__init__(road, position, heading, speed)
+        self.collidable = False  # 设为 False，使其成为纯视觉物体，避免意外碰撞
+
 class MultiLaneEnv(AbstractEnv):
     """
     四车道直路 + 顺序交通流 + 预热 + 更安全的生成逻辑
@@ -231,6 +235,7 @@ class MultiLaneEnv(AbstractEnv):
         return (
             self.vehicle.crashed
             or self._goal_longitudinal_reached()
+            # or self._goal_reached()
             or self.config["offroad_terminal"]
             and not self.vehicle.on_road
         )

@@ -50,15 +50,17 @@ def make_env(env_overrides: dict | None = None, render_mode: str | None = None):
     return _init
 
 
-def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs: int, log_root: str = "./logs", save_root: str = "./models") -> None:
+def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs: int, log_root: str = "./logs", save_root: str = "./models", run_name: str | None = None) -> None:
     global master_rng
     set_global_seed(MASTER_SEED)
     master_rng = np.random.default_rng(MASTER_SEED)
 
     algo = algo.lower()
 
-    time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_name = f"{algo}_{time_str}"
+    if run_name is None:
+        time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_name = f"{algo}_{time_str}"
+
     log_dir = os.path.join(log_root, run_name)
     save_dir = os.path.join(save_root, run_name)
     os.makedirs(log_dir, exist_ok=True)
@@ -72,17 +74,18 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
     env_overrides = {
         # "initial_lane_id": "random",
         "initial_lane_id": 1,
-        "PERCEPTION_DISTANCE": 200,
-        "observation": {
-            "vehicles_count": 20,
-            "vehicles_count_local": 5,
-            "features_range": {
-                "x": [-200, 200],
-                "y": [-10, 10],
-                "vx": [-15, 15],
-                "vy": [-10, 10],
-            },
-        }
+        # "PERCEPTION_DISTANCE": 200,
+        # "observation": {
+        #     "vehicles_count": 20,
+        #     "vehicles_count_local": 5,
+        #     "features_range": {
+        #         "x": [-200, 200],
+        #         "y": [-10, 10],
+        #         "vx": [-15, 15],
+        #         "vy": [-10, 10],
+        #     },
+        # },
+        "goal_lane_id": 2,
     }
     #### ================================================================= ####
 
@@ -153,14 +156,16 @@ if __name__ == "__main__":
     #     eval_freq=10_000,
     #     save_freq=50_000,
     #     n_envs=8,
+    #     run_name=f"ppo_1e7_lane1_seed2"
     # )
     # main(
     #     algo="sac",
     #     log_root="./logs/current",
-    #     total_timesteps=10_000_000,
+    #     total_timesteps=5_000_000,
     #     eval_freq=10_000,
     #     save_freq=50_000,
     #     n_envs=8,
+    #     run_name=f"sac_1e7_lane1_seed2"
     # )
     main(
         algo="hiro",
@@ -169,4 +174,5 @@ if __name__ == "__main__":
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,
+        run_name=f"hiro_1e7_lane1_localObs_opc_seed42"
     )
