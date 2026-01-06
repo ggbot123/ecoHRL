@@ -6,8 +6,10 @@ from typing import Dict, Any, Tuple, List, Optional
 
 import gymnasium as gym
 import numpy as np
+np.set_printoptions(precision=2, suppress=True)
 
 from rl.algos.sac.sac import SAC
+from configs.conf import HIROConfig
 from rl.utils import utils
 from stable_baselines3.common.utils import get_device, configure_logger
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
@@ -100,20 +102,6 @@ class SB3AgentWrapper:
         return getattr(self.agent, name)
 
 
-@dataclass
-class HIROConfig:
-    high_interval: int         # 高层每 high_interval 个 env.step 决策一次
-    batch_size: int
-    gradient_steps_high: int
-    gradient_steps_low: int
-    train_freq: int
-    intrinsic_coef: float      # 末状态距离 goal 的 intrinsic reward 系数
-    device: str
-    use_off_policy_correction: bool = True
-    intrinsic_norm_ranges: Optional[np.ndarray | List[List[float]]] = None
-    intrinsic_weights: Optional[np.ndarray | List[float]] = None
-
-
 class HIROSAC:
     def __init__(self, env, high_sac_kwargs: Dict[str, Any], low_sac_kwargs: Dict[str, Any], config: HIROConfig):
         self.env = env
@@ -169,7 +157,6 @@ class HIROSAC:
         # HiRO Off-Policy Correction (OPC) for high-level replay buffer
         self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", True))
         if self.use_off_policy_correction:
-            high_sac_kwargs = dict(high_sac_kwargs)
             rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
             rb_kwargs.update(
                 dict(
@@ -262,14 +249,11 @@ class HIROSAC:
         self._propagate_log_interval(callback, log_interval)
         env = self.env
         obs = env.reset()
-        done, truncated = False, False
 
         n_envs = self.n_envs
         hi = int(self.cfg.high_interval)
-
         need_high = np.ones(n_envs, dtype=bool)
         c = np.zeros(n_envs, dtype=np.int32)
-
         high_obs_start = np.zeros_like(obs, dtype=np.float32)
         goal_action = np.zeros((n_envs, int(self.high_agent.action_space.shape[0])), dtype=np.float32)
         goal_buffer_action = np.zeros_like(goal_action)
@@ -277,6 +261,7 @@ class HIROSAC:
         ego_start = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
         goal_dist_start = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
 
+        # for callback logging
         high_ret = np.zeros(n_envs, dtype=np.float32)
         low_ret = np.zeros(n_envs, dtype=np.float32)
         low_len = np.zeros(n_envs, dtype=np.int32)

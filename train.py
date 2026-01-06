@@ -18,11 +18,11 @@ from configs.conf import (
     get_hiro_config,
     get_hiro_high_sac_kwargs,
     get_hiro_low_sac_kwargs,
+    HIROConfig,
 )
 from rl.algos.ppo.trainer import train_ppo
 from rl.algos.sac.trainer import train_sac
 from rl.algos.HRL.trainer import train_hiro
-from rl.algos.HRL.hiro import HIROConfig
 
 MASTER_SEED = 42
 master_rng: np.random.Generator
@@ -57,15 +57,11 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
     master_rng = np.random.default_rng(MASTER_SEED)
 
     algo = algo.lower()
-
     if run_name is None:
         time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_name = f"{algo}_{time_str}"
-
     log_dir = os.path.join(log_root, run_name)
     save_dir = os.path.join(save_root, run_name)
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(save_dir, exist_ok=True)
 
     print(f"[MAIN] algo={algo}")
     print(f"[MAIN] log_dir={log_dir}")
@@ -125,7 +121,6 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
     elif algo == "hiro":
         sac_kwargs_high = get_hiro_high_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_high"), seed=MASTER_SEED)
         sac_kwargs_low = get_hiro_low_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED)
-
         hiro_cfg: HIROConfig = get_hiro_config()
 
         env = SubprocVecEnv([make_env(env_overrides) for _ in range(n_envs)])
@@ -139,6 +134,7 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
             low_sac_kwargs=sac_kwargs_low,
             cfg=hiro_cfg,
             save_name_prefix="hiro",
+            save_freq=save_freq,
             seed=MASTER_SEED,
         )
         env.close()
@@ -174,5 +170,5 @@ if __name__ == "__main__":
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,
-        run_name=f"hiro_1e7_lane1_localObs_opc_seed42"
+        run_name=f"hiro_test"
     )

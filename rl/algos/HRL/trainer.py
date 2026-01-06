@@ -19,6 +19,7 @@ def train_hiro(
     low_sac_kwargs: Dict[str, Any],
     cfg,
     save_name_prefix: str,
+    save_freq: int = 50_000,
     seed: int = 42,
 ):
     """Train HiRO (SAC high + SAC low).
@@ -26,13 +27,16 @@ def train_hiro(
     The HiRO high-level replay buffer (with OPC) is configured here (trainer),
     so hiro.py stays focused on the algorithm logic.
     """
+    os.makedirs(log_dir, exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
 
-    high_sac_kwargs = dict(high_sac_kwargs)
-    if bool(getattr(cfg, 'use_off_policy_correction', True)):
-        # Inject the custom buffer class.
-        # The static buffer kwargs (n_candidates, etc.) should already be in high_sac_kwargs["replay_buffer_kwargs"]
-        # from get_hiro_high_sac_kwargs() in conf.py.
+    use_opc = bool(getattr(cfg, 'use_off_policy_correction', True))
+
+    # Inject static buffer kwargs for OPC switch consistency
+    rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
+    rb_kwargs["enable_off_policy_correction"] = use_opc
+    high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
+    if use_opc:
         high_sac_kwargs["replay_buffer_class"] = HiROHighReplayBuffer
 
     model = HIROSAC(env, high_sac_kwargs, low_sac_kwargs, cfg)
@@ -51,7 +55,7 @@ def train_hiro(
         verbose=1,
     )
     checkpoint_cb = HIROCheckpointCallback(
-        save_freq=50_000,
+        save_freq=save_freq,
         save_dir=save_dir,
         prefix=save_name_prefix,
         verbose=1,

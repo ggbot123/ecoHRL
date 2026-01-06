@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, Mapping, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Optional, List
+import numpy as np
 
 
 def _deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> Dict[str, Any]:
@@ -166,7 +168,7 @@ def get_hiro_high_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
     kwargs["replay_buffer_kwargs"] = dict(
         n_candidates=10,
         noise_std=0.5,  # std in *scaled* action space [-1, 1]
-        enable_off_policy_correction=True,
+        # enable_off_policy_correction will be injected in trainer.py based on HIROConfig
     )
     return kwargs
 
@@ -176,9 +178,22 @@ def get_hiro_low_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
     return get_sac_kwargs(log_dir, seed, level="low")
 
 
+@dataclass
+class HIROConfig:
+    high_interval: int         # 高层每 high_interval 个 env.step 决策一次
+    batch_size: int
+    gradient_steps_high: int
+    gradient_steps_low: int
+    train_freq: int
+    intrinsic_coef: float      # 末状态距离 goal 的 intrinsic reward 系数
+    device: str
+    use_off_policy_correction: bool = True
+    intrinsic_norm_ranges: Optional[np.ndarray | List[List[float]]] = None
+    intrinsic_weights: Optional[np.ndarray | List[float]] = None
+
 def get_hiro_config():
     """Centralized HiRO algorithm config."""
-    from rl.algos.HRL.hiro import HIROConfig
+    # from rl.algos.HRL.hiro import HIROConfig
 
     intrinsic_norm_ranges = [
         [0.0, 37.5],

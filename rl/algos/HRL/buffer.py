@@ -258,36 +258,46 @@ class HiROHighReplayBuffer(ReplayBuffer):
         # mask padded timesteps
         t_idx = np.arange(max_L, dtype=np.int32).reshape(1, max_L)
         mask = (t_idx < seq_len.reshape(-1, 1))  # (B, max_L) bool
+ 
+        # 1. Get indices of valid timesteps
+        b_indices, t_indices = np.nonzero(mask)
+        n_valid = b_indices.shape[0]
+        if n_valid == 0:
+            return samples.actions
 
-        # Split low_obs into components
-        t_norm = low_obs_seq[:, :, 0:1]  # (B, max_L, 1)
-        kin_seq = low_obs_seq[:, :, 1 : 1 + self.kin_flat_dim]  # (B, max_L, kin_flat_dim)
+        # 2. Extract valid sequence data (N_valid, ...)
+        t_norm_valid = low_obs_seq[b_indices, t_indices, 0:1]                      # (N_valid, 1)
+        kin_valid = low_obs_seq[b_indices, t_indices, 1 : 1 + self.kin_flat_dim]   # (N_valid, kin_flat_dim)
+        
+        # Extract valid ego substate for goal_rel calculation
+        ego_full_valid = kin_valid[:, : self.feat_dim]
+        ego_valid = ego_full_valid[:, self.ego_feature_idx]                        # (N_valid, ego_dim)
 
-        # Ego substate at each low-level step, extracted from kin_seq
-        ego_full_seq = kin_seq[:, :, : self.feat_dim]  # (B, max_L, feat_dim)
-        ego_seq = ego_full_seq[:, :, self.ego_feature_idx]  # (B, max_L, ego_dim)
+        # Extract corresponding goal candidates for these batch indices
+        goal_phys_valid = goal_phys[b_indices]
 
-        # goal_rel for each candidate
-        goal_rel = (goal_phys[:, :, None, :] - ego_seq[:, None, :, :]).astype(np.float32)  # (B, n_cand, max_L, ego_dim)
+        # 3. Construct inputs for candidates (N_valid, n_cand, ...)
+        goal_rel_valid = (goal_phys_valid - ego_valid[:, None, :]).astype(np.float32)
+        t_rep = np.broadcast_to(t_norm_valid[:, None, :], (n_valid, n_cand, 1))
+        kin_rep = np.broadcast_to(kin_valid[:, None, :], (n_valid, n_cand, self.kin_flat_dim))
+        low_obs_valid = np.concatenate([t_rep, kin_rep, goal_rel_valid], axis=-1)
+        low_obs_flat = low_obs_valid.reshape(-1, self.low_obs_dim)  # (N_valid * n_cand, obs_dim)
 
-        # Build candidate low-level obs: (B, n_cand, max_L, low_obs_dim)
-        t_rep = np.broadcast_to(t_norm[:, None, :, :], (batch_size, n_cand, max_L, 1))
-        kin_rep = np.broadcast_to(kin_seq[:, None, :, :], (batch_size, n_cand, max_L, self.kin_flat_dim))
-        low_obs_all = np.concatenate([t_rep, kin_rep, goal_rel], axis=-1).astype(np.float32)
+        # 4. Inference (only on valid data)
+        obs_tensor = th.as_tensor(low_obs_flat, device=self.device, dtype=th.float32)
+        pred_low_flat = self._low_policy_deterministic(obs_tensor, obs_np=low_obs_flat)
+        pred_low = pred_low_flat.view(n_valid, n_cand, self.low_action_dim)
 
-        low_obs_all_flat = low_obs_all.reshape(batch_size * n_cand * max_L, self.low_obs_dim)
+        # 5. Compute MSE per valid step
+        act_true_valid = th.as_tensor(low_act_seq[b_indices, t_indices], device=pred_low.device, dtype=pred_low.dtype).unsqueeze(1)
+        mse_per_step = th.sum((pred_low - act_true_valid) ** 2, dim=2)
 
-        # --- evaluate likelihood under current low-level policy ---
-        obs_tensor = th.as_tensor(low_obs_all_flat, device=self.device, dtype=th.float32)
-        pred_low = self._low_policy_deterministic(obs_tensor, obs_np=low_obs_all_flat)  # (B*n_cand*max_L, low_action_dim)
-        pred_low = pred_low.reshape(batch_size, n_cand, max_L, self.low_action_dim)
+        # 6. Aggregate MSE back to batch dimension (B, n_cand)
+        total_mse = th.zeros((batch_size, n_cand), device=mse_per_step.device, dtype=mse_per_step.dtype)
+        b_idx_th = th.as_tensor(b_indices, device=mse_per_step.device, dtype=th.long)
+        total_mse.index_add_(0, b_idx_th, mse_per_step)
 
-        act_true = th.as_tensor(low_act_seq, device=pred_low.device, dtype=pred_low.dtype).unsqueeze(1)  # (B,1,max_L,low_action_dim)
-        mask_t = th.as_tensor(mask, device=pred_low.device, dtype=pred_low.dtype).unsqueeze(1).unsqueeze(-1)  # (B,1,max_L,1)
-
-        mse = th.sum(((pred_low - act_true) ** 2) * mask_t, dim=(2, 3))  # (B, n_cand)
-        best_idx = th.argmin(mse, dim=1).detach().cpu().numpy()  # (B,)
-
+        best_idx = th.argmin(total_mse, dim=1).detach().cpu().numpy()  # (B,)
         best_scaled = cand_scaled[np.arange(batch_size), best_idx].astype(np.float32)  # (B, act_dim)
         return th.as_tensor(best_scaled, device=act_t.device, dtype=act_t.dtype)
 
