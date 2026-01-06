@@ -9,35 +9,66 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 
 class HIROLoggingCallback(BaseCallback):
-    """VecEnv-friendly logging callback for HIRO.
+    """Unified logging callback for HIRO.
 
-    - High-level: logs true env episode stats (done from VecEnv) aggregated across envs.
-    - Low-level: logs low-episode (= one high_interval or early termination) stats for envs that finished a low-episode at the current step.
-
-    Expect locals provided by HIROSAC.learn:
-    - reward_env: np.ndarray (n_envs,)
-    - episode_end: np.ndarray (n_envs,) bool
-    - infos: list[dict] length n_envs
-    - low_ret: np.ndarray (k,) for finished low-episodes at this step
-    - low_len: np.ndarray (k,)
-    - low_comp_sums: dict[str, np.ndarray (k,)]
-    - goal_err: np.ndarray (k, ego_dim) for finished low-episodes at this step
-        Signed tracking error at the end of each high-interval:
-        goal_err = ego_next_rel - goal_rel.
-        With the default ego_dim==4, components correspond to (x, y, vx, vy).
-    - intrinsic_unweighted: np.ndarray (k,)
-        intrinsic / intrinsic_coef at the same boundary.
+    - TensorBoard:
+        - High-level: logs true env episode stats aggregated across envs.
+        - Low-level: logs low-episode (high_interval) stats.
+    - CSV (optional):
+        - Logs high-level and low-level trajectories for env 0 periodically.
     """
 
-    def __init__(self, high_log_interval_episodes: int = 1, low_log_interval_hi: int = 1, verbose: int = 0):
+    def __init__(
+        self,
+        high_log_interval_episodes: int = 1,
+        low_log_interval_hi: int = 1,
+        verbose: int = 0,
+        # CSV Logging args
+        csv_log_freq_episodes: int = 0,  # 0 to disable
+        csv_save_dir: str | None = None,
+    ):
         super().__init__(verbose)
         self.high_log_interval_episodes = int(high_log_interval_episodes)
         self.low_log_interval_hi = int(low_log_interval_hi)
-        self._episode_counter = 0
+        
+        self.csv_log_freq = int(csv_log_freq_episodes)
+        self.csv_save_dir = csv_save_dir
+        self.csv_active = False  # Whether current episode is being logged to CSV (env 0)
+        self.csv_low_traj_recorded = False # Only record first interval's low traj per logged episode
+        
+        self._episode_counter = 0     # Counts finished episodes (across all envs)
+        self._env0_ep_count = 0
+        
         self._rollout_counter = 0
         self._last_dump_high = 0
         self._last_dump_low = 0
         self._high_buffers, self._low_buffers = {}, {}
+
+        # CSV Headers
+        self.comp_keys = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "punctual_reward"]
+        if self.csv_log_freq > 0 and self.csv_save_dir:
+            os.makedirs(self.csv_save_dir, exist_ok=True)
+            self.high_csv_path = os.path.join(self.csv_save_dir, "high_traj.csv")
+            self.low_csv_path = os.path.join(self.csv_save_dir, "low_traj.csv")
+            
+            base_header = ["episode", "step", "s", "a", "r", "next_s", "done"]
+            comp_headers = [f"comp_{k}" for k in self.comp_keys]
+            self._init_csv(self.high_csv_path, base_header + comp_headers)
+            self._init_csv(self.low_csv_path, base_header + comp_headers)
+
+    def _init_csv(self, path, header):
+        if not os.path.exists(path):
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+
+    def _fmt_arr(self, arr):
+        return np.array2string(np.asarray(arr).reshape(-1), separator=',', max_line_width=np.inf).replace('\n', '')
+
+    def _append_csv(self, path, row):
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
 
     def _on_training_start(self) -> None:
         n_envs = int(getattr(self.model, "n_envs", 1))
@@ -61,6 +92,7 @@ class HIROLoggingCallback(BaseCallback):
         low_len = np.asarray(loc.get("low_len", []), dtype=np.float32).reshape(-1)
         low_comp_sums = loc.get("low_comp_sums", {})
 
+        # --- TensorBoard Logging ---
         self._rollout_counter += int(low_ret.size)
         self._record_smooth(self.model.low_logger, self._low_buffers, "rollout/ep_rew", float(low_ret.mean()))
         self._record_smooth(self.model.low_logger, self._low_buffers, "rollout/ep_len", float(low_len.mean()) if low_len.size else 0.0)
@@ -71,10 +103,11 @@ class HIROLoggingCallback(BaseCallback):
 
         # goal tracking error at the end of each high-interval
         goal_err = np.asarray(loc.get("goal_err", []), dtype=np.float32)
-        self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/x", float(goal_err[:, 0].mean()))
-        self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/y", float(goal_err[:, 1].mean()))
-        self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/vx", float(goal_err[:, 2].mean()))
-        self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/vy", float(goal_err[:, 3].mean()))
+        if goal_err.size:
+            self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/x", float(goal_err[:, 0].mean()))
+            self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/y", float(goal_err[:, 1].mean()))
+            self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/vx", float(goal_err[:, 2].mean()))
+            self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/vy", float(goal_err[:, 3].mean()))
 
         intrinsic_unweighted = np.asarray(loc.get("intrinsic_unweighted", []), dtype=np.float32).reshape(-1)
         if intrinsic_unweighted.size:
@@ -97,12 +130,44 @@ class HIROLoggingCallback(BaseCallback):
             self.model.low_logger.dump(step=self.model.num_timesteps)
             self._last_dump_low = self._rollout_counter
 
+        # --- CSV Logging (High Level Transition) ---
+        done_low = loc.get("done_low", [])
+        if self.csv_active and len(done_low) > 0 and done_low[0]:
+            # Env 0 finished a high interval
+            high_obs_start = loc.get("high_obs_start")[0]
+            goal_action = loc.get("goal_action")[0]
+            high_ret = loc.get("high_ret")[0]
+            next_high_obs = loc.get("next_high_obs")[0]
+            done = loc.get("done")[0]
+
+            row_high = [
+                self._env0_ep_count,
+                self.model.num_timesteps,
+                self._fmt_arr(high_obs_start),
+                self._fmt_arr(goal_action),
+                float(high_ret),
+                self._fmt_arr(next_high_obs),
+                int(done)
+            ]
+            
+            for k in self.comp_keys:
+                arr = low_comp_sums.get(k, np.array([]))
+                val = float(arr[0]) if arr.size > 0 else 0.0
+                row_high.append(val)
+            
+            self._append_csv(self.high_csv_path, row_high)
+            
+            # If we just finished the first interval, stop recording low traj
+            self.csv_low_traj_recorded = True
+
     def _on_step(self) -> bool:
         loc = self.locals
         reward_env = np.asarray(loc.get("reward_env", 0.0), dtype=np.float32).reshape(-1)
         episode_end = np.asarray(loc.get("episode_end", False), dtype=bool).reshape(-1)
         infos = loc.get("infos", [])
 
+        # --- Update TB stats & Capture env 0 components ---
+        rc_env0 = {}
         if reward_env.size:
             self._ep_ret += reward_env
             self._ep_len += 1
@@ -112,16 +177,43 @@ class HIROLoggingCallback(BaseCallback):
                 rc = info.get("reward_components", {})
                 for name, val in rc.items():
                     self._ep_comp_sums.setdefault(name, np.zeros_like(self._ep_ret))[i] += float(val)
+                if i == 0 and self.csv_active:
+                    rc_env0 = rc
 
+        # --- CSV Logs (Low Level Step) ---
+        # Record only if active and not yet done with first interval
+        if self.csv_active and not self.csv_low_traj_recorded:
+            low_obs = loc.get("low_obs")[0]
+            low_action = loc.get("low_action")[0]
+            low_reward = loc.get("low_reward_total")[0]
+            next_low_obs = loc.get("next_low_obs")[0]
+            done_low = loc.get("done_low")[0]
+            
+            row = [
+                self._env0_ep_count,
+                self.model.num_timesteps,
+                self._fmt_arr(low_obs),
+                self._fmt_arr(low_action),
+                float(low_reward),
+                self._fmt_arr(next_low_obs),
+                int(done_low)
+            ]
+            for k in self.comp_keys:
+                row.append(float(rc_env0.get(k, 0.0)))
+            self._append_csv(self.low_csv_path, row)
+
+        # --- Episode End Logic ---
         if episode_end.any():
             idx = np.flatnonzero(episode_end)
             self._episode_counter += int(idx.size)
 
+            # TB Logging
             self._record_smooth(self.model.high_logger, self._high_buffers, "rollout/ep_rew", float(self._ep_ret[idx].mean()))
             self._record_smooth(self.model.high_logger, self._high_buffers, "rollout/ep_len", float(self._ep_len[idx].mean()))
             for name, arr in self._ep_comp_sums.items():
                 self._record_smooth(self.model.high_logger, self._high_buffers, f"rollout/{name}", float(arr[idx].mean()))
 
+            # Reset TB buffers
             self._ep_ret[idx] = 0.0
             self._ep_len[idx] = 0
             for arr in self._ep_comp_sums.values():
@@ -130,6 +222,16 @@ class HIROLoggingCallback(BaseCallback):
             if self._episode_counter - self._last_dump_high >= self.high_log_interval_episodes:
                 self.model.high_logger.dump(step=self.model.num_timesteps)
                 self._last_dump_high = self._episode_counter
+            
+            # CSV Episode Counter Logic (Env 0)
+            if episode_end[0]:
+                self._env0_ep_count += 1
+                # Determines if NEXT episode should be logged
+                if self.csv_log_freq > 0 and (self._env0_ep_count % self.csv_log_freq == 0):
+                    self.csv_active = True
+                    self.csv_low_traj_recorded = False # Reset for new episode
+                else:
+                    self.csv_active = False
 
         return True
 
@@ -152,131 +254,3 @@ class HIROCheckpointCallback(BaseCallback):
                 print(f"[Checkpoint] Saved HIRO models at step={self.num_timesteps}")
         return True
 
-
-class HIROTrajectoryLogger(BaseCallback):
-    def __init__(self, log_freq_episodes: int, save_dir: str, verbose: int = 0):
-        super().__init__(verbose)
-        self.log_freq = int(log_freq_episodes)
-        self.save_dir = save_dir
-        os.makedirs(self.save_dir, exist_ok=True)
-        
-        self.ep_count = 0
-        self.current_ep_high_traj = []
-        self.current_ep_low_traj = []
-        self.logging_active = False
-        self.low_traj_recorded = False
-
-        # CSV Headers
-        self.high_header = ["episode", "step", "start_x", "start_y", "start_vx", "start_vy", 
-                            "goal_x", "goal_y", "goal_vx", "goal_vy", 
-                            "end_x", "end_y", "end_vx", "end_vy", "intrinsic_reward"]
-        self.low_header = ["episode", "step_in_episode", "x", "y", "vx", "vy", 
-                           "action_acc", "action_steer", "reward"]
-
-        # Initialize files with headers if they don't exist
-        self.high_csv_path = os.path.join(self.save_dir, "high_traj.csv")
-        self.low_csv_path = os.path.join(self.save_dir, "low_traj.csv")
-        
-        if not os.path.exists(self.high_csv_path):
-            with open(self.high_csv_path, "w", newline="") as f:
-                csv.writer(f).writerow(self.high_header)
-        
-        if not os.path.exists(self.low_csv_path):
-            with open(self.low_csv_path, "w", newline="") as f:
-                csv.writer(f).writerow(self.low_header)
-
-    def _on_step(self) -> bool:
-        # We only track env 0
-        loc = self.locals
-        
-        # Check if episode ended for env 0
-        done = loc.get("done")[0]
-        
-        # Check if we should be logging this episode
-        if self.ep_count % self.log_freq == 0:
-            self.logging_active = True
-        else:
-            self.logging_active = False
-
-        if self.logging_active:
-            # Collect Low Trajectory
-            # We want to record ONE high interval's low trajectory.
-            # Let's record the FIRST interval of the episode.
-            
-            # If we haven't recorded low traj yet, we record every step until done_low[0] is True.
-            if not self.low_traj_recorded:
-                ego_idx = self.model.ego_feature_idx
-                kin_next = loc.get("kin_next")[0]
-                # Assuming ego is vehicle 0
-                ego_state = kin_next[0][ego_idx]
-                
-                # Low action
-                low_action = loc.get("low_action")[0]
-                reward = loc.get("reward")[0]
-                
-                # Store
-                self.current_ep_low_traj.append({
-                    "episode": self.ep_count,
-                    "step_in_episode": len(self.current_ep_low_traj),
-                    "x": float(ego_state[0]),
-                    "y": float(ego_state[1]),
-                    "vx": float(ego_state[2]),
-                    "vy": float(ego_state[3]),
-                    "action_acc": float(low_action[0]),
-                    "action_steer": float(low_action[1]),
-                    "reward": float(reward)
-                })
-                
-                if loc.get("done_low")[0]:
-                    self.low_traj_recorded = True
-
-            # Collect High Trajectory (at end of interval)
-            if loc.get("done_low")[0]:
-                # Get interval data
-                ego_start = loc.get("ego_start")[0]
-                goal_phys = loc.get("goal_phys")[0]
-                intrinsic = loc.get("intrinsic")[0]
-                
-                # End state
-                ego_idx = self.model.ego_feature_idx
-                kin_next = loc.get("kin_next")[0]
-                ego_end = kin_next[0][ego_idx]
-                
-                self.current_ep_high_traj.append({
-                    "episode": self.ep_count,
-                    "step": len(self.current_ep_high_traj),
-                    "start_x": float(ego_start[0]),
-                    "start_y": float(ego_start[1]),
-                    "start_vx": float(ego_start[2]),
-                    "start_vy": float(ego_start[3]),
-                    "goal_x": float(goal_phys[0]),
-                    "goal_y": float(goal_phys[1]),
-                    "goal_vx": float(goal_phys[2]),
-                    "goal_vy": float(goal_phys[3]),
-                    "end_x": float(ego_end[0]),
-                    "end_y": float(ego_end[1]),
-                    "end_vx": float(ego_end[2]),
-                    "end_vy": float(ego_end[3]),
-                    "intrinsic_reward": float(intrinsic)
-                })
-
-        if done:
-            if self.logging_active:
-                # Write to CSV
-                if self.current_ep_high_traj:
-                    with open(self.high_csv_path, "a", newline="") as f:
-                        writer = csv.DictWriter(f, fieldnames=self.high_header)
-                        writer.writerows(self.current_ep_high_traj)
-                
-                if self.current_ep_low_traj:
-                    with open(self.low_csv_path, "a", newline="") as f:
-                        writer = csv.DictWriter(f, fieldnames=self.low_header)
-                        writer.writerows(self.current_ep_low_traj)
-            
-            # Reset for next episode
-            self.ep_count += 1
-            self.current_ep_high_traj = []
-            self.current_ep_low_traj = []
-            self.low_traj_recorded = False
-            
-        return True
