@@ -157,13 +157,23 @@ def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, An
 # HiRO centralized configs
 # =========================
 
-def get_hiro_replay_buffer_kwargs() -> Dict[str, Any]:
-    """Centralized kwargs for the HiRO high-level replay buffer (OPC)."""
-    return dict(
+def get_hiro_high_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
+    """Get SAC kwargs for HiRO high-level agent, including static buffer config."""
+    kwargs = get_sac_kwargs(log_dir, seed, level="high")
+    
+    # Static config for HiROHighReplayBuffer
+    # These will be passed to the buffer class in trainer.py/hiro.py
+    kwargs["replay_buffer_kwargs"] = dict(
         n_candidates=10,
         noise_std=0.5,  # std in *scaled* action space [-1, 1]
         enable_off_policy_correction=True,
     )
+    return kwargs
+
+
+def get_hiro_low_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
+    """Get SAC kwargs for HiRO low-level agent."""
+    return get_sac_kwargs(log_dir, seed, level="low")
 
 
 def get_hiro_config():

@@ -16,7 +16,8 @@ from configs.conf import (
     get_ppo_kwargs,
     get_sac_kwargs,
     get_hiro_config,
-    get_hiro_replay_buffer_kwargs,
+    get_hiro_high_sac_kwargs,
+    get_hiro_low_sac_kwargs,
 )
 from rl.algos.ppo.trainer import train_ppo
 from rl.algos.sac.trainer import train_sac
@@ -122,11 +123,10 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
         )
 
     elif algo == "hiro":
-        sac_kwargs_high = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_high"), seed=MASTER_SEED, level="high")
-        sac_kwargs_low = get_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED, level="low")
+        sac_kwargs_high = get_hiro_high_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_high"), seed=MASTER_SEED)
+        sac_kwargs_low = get_hiro_low_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED)
 
         hiro_cfg: HIROConfig = get_hiro_config()
-        hiro_rb_kwargs = get_hiro_replay_buffer_kwargs()
 
         env = SubprocVecEnv([make_env(env_overrides) for _ in range(n_envs)])
 
@@ -138,8 +138,8 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
             high_sac_kwargs=sac_kwargs_high,
             low_sac_kwargs=sac_kwargs_low,
             cfg=hiro_cfg,
-            high_rb_kwargs=hiro_rb_kwargs,
             save_name_prefix="hiro",
+            seed=MASTER_SEED,
         )
         env.close()
 

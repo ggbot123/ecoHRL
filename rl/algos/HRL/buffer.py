@@ -95,6 +95,13 @@ class HiROHighReplayBuffer(ReplayBuffer):
         # Cache action bounds for faster clipping
         self._high_low = np.asarray(self.action_space.low, dtype=np.float32).reshape(1, 1, -1)
         self._high_high = np.asarray(self.action_space.high, dtype=np.float32).reshape(1, 1, -1)
+        
+        # RNG for OPC noise
+        self.rng = np.random.default_rng()
+
+    def set_seed(self, seed: int) -> None:
+        """Set the random seed for the buffer's RNG."""
+        self.rng = np.random.default_rng(seed)
 
     # ------------------------- storing extra OPC data -------------------------
     def add(
@@ -228,7 +235,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
             cand_scaled[:, 1, :] = np.clip(achieved_scaled, -1.0, 1.0)
 
         if n_cand > 2:
-            noise = np.random.normal(loc=0.0, scale=self.noise_std, size=(batch_size, n_cand - 2, act_dim)).astype(np.float32)
+            noise = self.rng.normal(loc=0.0, scale=self.noise_std, size=(batch_size, n_cand - 2, act_dim)).astype(np.float32)
             cand_scaled[:, 2:, :] = cand_scaled[:, 1:2, :] + noise
 
         cand_scaled = np.clip(cand_scaled, -1.0, 1.0)
@@ -287,7 +294,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
     def sample(self, batch_size: int, env=None) -> ReplayBufferSamples:
         # Mirror SB3 ReplayBuffer.sample() but keep batch indices for OPC.
         upper_bound = self.buffer_size if self.full else self.pos
-        batch_inds = np.random.randint(0, upper_bound, size=batch_size)
+        batch_inds = self.rng.integers(0, upper_bound, size=batch_size)
         samples = self._get_samples(batch_inds, env=env)
 
         if not self.enable_off_policy_correction:

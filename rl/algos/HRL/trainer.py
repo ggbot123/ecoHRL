@@ -18,8 +18,8 @@ def train_hiro(
     high_sac_kwargs: Dict[str, Any],
     low_sac_kwargs: Dict[str, Any],
     cfg,
-    high_rb_kwargs: Optional[Dict[str, Any]],
     save_name_prefix: str,
+    seed: int = 42,
 ):
     """Train HiRO (SAC high + SAC low).
 
@@ -30,12 +30,17 @@ def train_hiro(
 
     high_sac_kwargs = dict(high_sac_kwargs)
     if bool(getattr(cfg, 'use_off_policy_correction', True)):
-        rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
-        rb_kwargs.update(dict(high_rb_kwargs))
+        # Inject the custom buffer class.
+        # The static buffer kwargs (n_candidates, etc.) should already be in high_sac_kwargs["replay_buffer_kwargs"]
+        # from get_hiro_high_sac_kwargs() in conf.py.
         high_sac_kwargs["replay_buffer_class"] = HiROHighReplayBuffer
-        high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
 
     model = HIROSAC(env, high_sac_kwargs, low_sac_kwargs, cfg)
+    
+    # Set seed for high-level replay buffer if it exists (for OPC noise reproducibility)
+    if hasattr(model.high_agent.replay_buffer, "set_seed"):
+        model.high_agent.replay_buffer.set_seed(seed)
+
     n_envs = int(env.num_envs)
 
     logging_cb = HIROLoggingCallback(high_log_interval_episodes=n_envs * 1, low_log_interval_hi=n_envs * 4)
