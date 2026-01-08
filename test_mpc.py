@@ -4,6 +4,7 @@ import scenarios.multi_lane  # Trigger registration
 
 import numpy as np
 import os
+import shutil
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from util.plot_result import *
@@ -79,7 +80,14 @@ def main(
 
     # 1. Create Environment
     base_env = gym.make("multi-lane-custom-v0", render_mode="rgb_array", config=env_config)
-    env = RecordVideo(base_env, video_folder=model_dir, episode_trigger=trigger, name_prefix="mpc")
+
+    # Define and clear video/result directory
+    video_dir = os.path.join(model_dir, "goal_distribution_mpc")
+    if os.path.exists(video_dir):
+        shutil.rmtree(video_dir)
+    os.makedirs(video_dir, exist_ok=True)
+
+    env = RecordVideo(base_env, video_folder=video_dir, episode_trigger=trigger, name_prefix="mpc")
 
     # 2. Load HIRO Models (for High-Level Goal Sampling)
     high_model, low_model = _load_hiro_models(model_dir, model_name)
