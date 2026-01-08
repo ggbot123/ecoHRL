@@ -162,10 +162,9 @@ def get_hiro_high_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
     kwargs = get_sac_kwargs(log_dir, seed, level="high")
     
     # Static config for HiROHighReplayBuffer
-    # These will be passed to the buffer class in trainer.py/hiro.py
     kwargs["replay_buffer_kwargs"] = dict(
-        n_candidates=10,
-        noise_std=0.5,  # std in *scaled* action space [-1, 1]
+        n_candidates=20,
+        noise_std=0.5,
         enable_off_policy_correction=True,
     )
     return kwargs

@@ -271,6 +271,8 @@ class RLControlledVehicle(ControlledVehicle):
         target_speed: float = None,
         route: Route = None,
     ):
+        if target_speed is None:
+            target_speed = speed
         super().__init__(road, position, heading, speed,
                          target_lane_index=target_lane_index,
                          target_speed=target_speed,

@@ -399,7 +399,7 @@ class MultiLaneEnv(AbstractEnv):
         position = lane.position(longi0, 0.0)
         heading = lane.heading_at(longi0)
         ego_speed = cfg["ego_speed"]
-        ego = self.action_type.vehicle_class(self.road, position, heading, ego_speed, target_speed=ego_speed)
+        ego = self.action_type.vehicle_class(self.road, position, heading, ego_speed)
 
         self.vehicle = ego
         self.controlled_vehicles = [ego]
