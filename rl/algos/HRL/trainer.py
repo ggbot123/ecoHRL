@@ -91,4 +91,5 @@ def train_hiro(
 
     if train_mode != "low_only":
         model.high_agent.save(os.path.join(save_dir, f"{save_name_prefix}_high_final.zip"))
-    model.low_agent.save(os.path.join(save_dir, f"{save_name_prefix}_low_final.zip"))
+    if train_mode != "high_only":
+        model.low_agent.save(os.path.join(save_dir, f"{save_name_prefix}_low_final.zip"))

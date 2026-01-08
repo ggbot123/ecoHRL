@@ -9,6 +9,7 @@ import numpy as np
 
 from rl.algos.sac.sac import SAC
 from rl.utils import utils
+from rl.algos.HRL.rule_based import RuleBasedAgentWrapper
 from stable_baselines3.common.utils import get_device, configure_logger
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -114,6 +115,7 @@ class HIROConfig:
     intrinsic_weights: Optional[np.ndarray | List[float]]
     train_mode: str  # "joint", "low_only", "high_only"
     goal_sampler_type: str
+    low_level_type: str = "sac" # "sac" or "rule_based" or "mpc"
 
 
 class HIROSAC:
@@ -165,13 +167,32 @@ class HIROSAC:
         low_act_space = env.action_space
 
         # ----- 创建 Wrapper 实例 ----- #
-        # 先创建 low-level SAC：HiRO 的 high-level off-policy correction 需要访问当前 low-level policy
-        low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
+        self.train_mode = getattr(config, "train_mode", "joint")
+        self.low_level_type = "sac"
+        if self.train_mode == "high_only":
+            self.low_level_type = getattr(config, "low_level_type", "sac")
+
+        if self.low_level_type == "rule_based":
+            self.low_agent = RuleBasedAgentWrapper(env, self.n_envs)
+        elif self.low_level_type == "sac":
+            # 先创建 low-level SAC：HiRO 的 high-level off-policy correction 需要访问当前 low-level policy
+            low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
+            self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
+        else:
+            raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
         # HiRO Off-Policy Correction (OPC) for high-level replay buffer
         self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", True))
+        high_sac_kwargs = dict(high_sac_kwargs)
+
         if self.use_off_policy_correction:
-            high_sac_kwargs = dict(high_sac_kwargs)
+            if self.train_mode == "high_only":
+                 print(f"[HIROSAC] Warning: Off-Policy Correction disabled because train mode is 'high_only'.")
+                 self.use_off_policy_correction = False
+                 if "replay_buffer_class" in high_sac_kwargs:
+                    del high_sac_kwargs["replay_buffer_class"]
+
+        if self.use_off_policy_correction:
             rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
             rb_kwargs.update(
                 dict(
@@ -182,24 +203,37 @@ class HIROSAC:
                     ego_feature_idx=list(self.ego_feature_idx),
                     lane_center_ys=self.lane_center_ys,
                     high_interval=int(self.cfg.high_interval),
-                    low_policy=low_sac.policy,  # must be current
+                    low_policy=self.low_agent.policy,  # must be current
                 )
             )
             rb_kwargs["enable_off_policy_correction"] = bool(self.use_off_policy_correction)
             high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
+        else:
+             # Clean up params that might have been passed for HiROHighReplayBuffer but now we are using standard buffer
+            if "replay_buffer_class" in high_sac_kwargs:
+                del high_sac_kwargs["replay_buffer_class"]
+            
+            if "replay_buffer_kwargs" in high_sac_kwargs:
+                # Clean up specific keys
+                rbk = dict(high_sac_kwargs["replay_buffer_kwargs"]) # copy it
+                for key in ["n_candidates", "noise_std", "enable_off_policy_correction"]:
+                    rbk.pop(key, None)
+                high_sac_kwargs["replay_buffer_kwargs"] = rbk
 
         high_sac = SAC(env=_make_dummy_vec_env(high_obs_space, high_act_space, 1), **high_sac_kwargs)
 
         self.high_agent = SB3AgentWrapper(high_sac, config.train_freq, config.gradient_steps_high, config.batch_size)
-        self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
+        # self.low_agent is set above
 
         # ----- logger ----- #
-        if self.cfg.train_mode != "low_only":
+        if self.train_mode != "low_only":
             self.high_logger = configure_logger(high_sac.verbose, high_sac_kwargs.get("tensorboard_log"), "hiro_high", True)
             self.high_agent.set_logger(self.high_logger)
         
-        self.low_logger = configure_logger(low_sac.verbose, low_sac_kwargs.get("tensorboard_log"), "hiro_low", True)
-        self.low_agent.set_logger(self.low_logger)
+        # Always initialize low_logger, even in high_only mode, because callbacks might rely on it for logging evaluation metrics
+        self.low_logger = configure_logger(0, low_sac_kwargs.get("tensorboard_log"), "hiro_low", True)
+        if self.low_level_type == "sac":
+            self.low_agent.set_logger(self.low_logger)
 
     # ------------------------------------------------------------------
     # SB3 Callback 兼容接口：让 BaseCallback 可以把 HIROSAC 当作 BaseAlgorithm 用
@@ -374,7 +408,14 @@ class HIROSAC:
 
             # === 1.2 Low Level Decision ===
             low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys)
-            low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
+            
+            if self.low_level_type == "rule_based":
+                low_action = self.low_agent.act(low_obs, goal_phys)
+                low_buffer_action = low_action.copy()
+            elif self.low_level_type == "sac":
+                low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
+            else:
+                raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
             if opc_enabled:
                 # record (o_i, a_i) for off-policy correction
@@ -431,7 +472,7 @@ class HIROSAC:
                 for i in np.flatnonzero(done_low):
                     low_infos[i]["terminal_observation"] = next_low_obs[i]
 
-            if train_low:
+            if train_low and self.low_level_type == "sac":
                 self.low_agent.store_transition(
                     low_obs,
                     low_buffer_action,
