@@ -173,7 +173,7 @@ class HIROSAC:
             self.low_level_type = getattr(config, "low_level_type", "sac")
 
         if self.low_level_type == "rule_based":
-            self.low_agent = RuleBasedAgentWrapper(env, self.n_envs)
+            self.low_agent = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
         elif self.low_level_type == "sac":
             # 先创建 low-level SAC：HiRO 的 high-level off-policy correction 需要访问当前 low-level policy
             low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)

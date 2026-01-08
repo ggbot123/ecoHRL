@@ -9,7 +9,7 @@ import torch as th
 
 import scenarios.multi_lane  # 注册 multi-lane-custom-v0
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
 from configs.conf import (
     get_env_config,
@@ -75,17 +75,17 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
     env_overrides = {
         # "initial_lane_id": "random",
         "initial_lane_id": 1,
-        # "PERCEPTION_DISTANCE": 200,
-        # "observation": {
-        #     "vehicles_count": 20,
-        #     "vehicles_count_local": 5,
-        #     "features_range": {
-        #         "x": [-200, 200],
-        #         "y": [-10, 10],
-        #         "vx": [-15, 15],
-        #         "vy": [-10, 10],
-        #     },
-        # },
+        "PERCEPTION_DISTANCE": 200,
+        "observation": {
+            "vehicles_count": 20,
+            "vehicles_count_local": 5,
+            "features_range": {
+                "x": [-200, 200],
+                "y": [-10, 10],
+                "vx": [-15, 15],
+                "vy": [-10, 10],
+            },
+        },
         "goal_lane_id": 2,
     }
     #### ================================================================= ####
@@ -127,8 +127,15 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
         sac_kwargs_low = get_hiro_low_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED)
 
         hiro_cfg: HIROConfig = get_hiro_config()
+        print(f"[HIRO] Train Mode: {hiro_cfg.train_mode}, Goal Sampler: {hiro_cfg.goal_sampler_type}")
 
-        env = SubprocVecEnv([make_env(env_overrides) for _ in range(n_envs)])
+        # Use DummyVecEnv when using RuleBasedController because it requires direct access to env objects
+        # Note: DummyVecEnv runs environments sequentially (serial execution), so it will be slower than SubprocVecEnv.
+        if hiro_cfg.low_level_type == "rule_based":
+            print("[HIRO] Using DummyVecEnv for Rule-Based Low-Level Controller (Direct object access required)")
+            env = DummyVecEnv([make_env(env_overrides) for _ in range(n_envs)])
+        else:
+            env = SubprocVecEnv([make_env(env_overrides) for _ in range(n_envs)])
 
         train_hiro(
             env=env,
@@ -174,5 +181,5 @@ if __name__ == "__main__":
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,
-        run_name=f"hiro_1e7_lane1_localObs_opc_seed42"
+        run_name=f"hiro_260108_onlyHigh_rule_varTargetV_hierObs"
     )

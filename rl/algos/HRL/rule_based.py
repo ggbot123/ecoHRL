@@ -124,7 +124,7 @@ class RuleBasedController:
 
         return True
 
-    def act(self, obs: Dict[str, Any], goal_phys: np.ndarray) -> np.ndarray:
+    def act(self, obs: Dict[str, Any], goal_phys: np.ndarray, remaining_time: float = None) -> np.ndarray:
         vehicle = self.env.unwrapped.vehicle
         if vehicle is None:
             return np.array([0.0, 0.0], dtype=np.float32)
@@ -132,7 +132,22 @@ class RuleBasedController:
         # 1. Parse Goal
         target_vx = goal_phys[2]
         target_vy = goal_phys[3] if len(goal_phys) > 3 else 0.0
-        target_speed = np.sqrt(target_vx**2 + target_vy**2) 
+        
+        # Original:
+        # target_speed = np.sqrt(target_vx**2 + target_vy**2) 
+        
+        # New Logic: Track longitudinal target X
+        target_x = goal_phys[0]
+        current_x = vehicle.position[0]
+        
+        if remaining_time is not None:
+            dt = 1.0 / self.config["policy_frequency"]
+            rt = max(remaining_time, dt)
+            target_speed = (target_x - current_x) / rt
+            target_speed = max(0.0, target_speed)
+        else:
+            target_speed = np.sqrt(target_vx**2 + target_vy**2)
+
         target_y = goal_phys[1]
         
         # Find closest lane to target_y
@@ -196,9 +211,16 @@ class RuleBasedController:
         return np.array([acc_norm, steer_norm], dtype=np.float32)
 
 class RuleBasedAgentWrapper:
-    def __init__(self, vec_env, n_envs):
+    def __init__(self, vec_env, n_envs, high_interval: int):
         self.vec_env = vec_env
         self.n_envs = n_envs
+        self.high_interval = high_interval
+        # Estimate dt from first env
+        if hasattr(vec_env, "envs") and len(vec_env.envs) > 0:
+            self.dt = 1.0 / vec_env.envs[0].unwrapped.config["policy_frequency"]
+        else:
+            self.dt = 0.1 # default fallback
+
         self.controllers = []
         
         if hasattr(vec_env, "envs"):
@@ -211,9 +233,13 @@ class RuleBasedAgentWrapper:
     def act(self, obs, goal_phys):
         actions = []
         for i in range(self.n_envs):
+            t_norm = obs[i, 0]
+            rem_steps = self.high_interval * (1.0 - t_norm)
+            rem_time = rem_steps * self.dt
+
             # goal_phys[i] is [x, y, vx, vy]
             if i < len(self.controllers):
-                a = self.controllers[i].act(None, goal_phys[i])
+                a = self.controllers[i].act(None, goal_phys[i], remaining_time=rem_time)
                 actions.append(a)
             else:
                 # Fallback zero
@@ -223,3 +249,10 @@ class RuleBasedAgentWrapper:
     @property
     def action_space(self):
         return self.vec_env.action_space
+
+    def save(self, path: str):
+        """
+        Dummy save method to satisfy CheckpointCallback.
+        RuleBasedController has no learnable parameters to save.
+        """
+        pass
