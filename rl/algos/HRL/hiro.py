@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List, Optional, Callable
 
 import gymnasium as gym
 import numpy as np
@@ -109,9 +109,11 @@ class HIROConfig:
     train_freq: int
     intrinsic_coef: float      # 末状态距离 goal 的 intrinsic reward 系数
     device: str
-    use_off_policy_correction: bool = True
-    intrinsic_norm_ranges: Optional[np.ndarray | List[List[float]]] = None
-    intrinsic_weights: Optional[np.ndarray | List[float]] = None
+    use_off_policy_correction: bool
+    intrinsic_norm_ranges: Optional[np.ndarray | List[List[float]]]
+    intrinsic_weights: Optional[np.ndarray | List[float]]
+    train_mode: str  # "joint", "low_only", "high_only"
+    goal_sampler_type: str
 
 
 class HIROSAC:
@@ -192,9 +194,11 @@ class HIROSAC:
         self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
 
         # ----- logger ----- #
-        self.high_logger = configure_logger(high_sac.verbose, high_sac_kwargs.get("tensorboard_log"), "hiro_high", True)
+        if self.cfg.train_mode != "low_only":
+            self.high_logger = configure_logger(high_sac.verbose, high_sac_kwargs.get("tensorboard_log"), "hiro_high", True)
+            self.high_agent.set_logger(self.high_logger)
+        
         self.low_logger = configure_logger(low_sac.verbose, low_sac_kwargs.get("tensorboard_log"), "hiro_low", True)
-        self.high_agent.set_logger(self.high_logger)
         self.low_agent.set_logger(self.low_logger)
 
     # ------------------------------------------------------------------
@@ -256,6 +260,35 @@ class HIROSAC:
 
 
     def learn(self, total_timesteps: int, callback=None, log_interval: int = 1, progress_bar: bool = False):
+        """
+        Standard HIRO training (Joint).
+        """
+        return self._train(total_timesteps, callback, log_interval, progress_bar, train_high=True, train_low=True)
+
+    def learn_low(self, total_timesteps: int, goal_sampler: Optional[Callable[[np.ndarray], np.ndarray]] = None, callback=None, log_interval: int = 1, progress_bar: bool = False):
+        """
+        Only train low-level agent. High-level agent is disabled; goals are sampled using goal_sampler (default: uniform).
+        """
+        if goal_sampler is None:
+            # Default uniform sampling
+            def uniform_sampler(obs: np.ndarray) -> np.ndarray:
+                 # obs shape (n_envs, dim)
+                 n = obs.shape[0]
+                 low = self.high_agent.action_space.low
+                 high = self.high_agent.action_space.high
+                 # Uniform sample in [low, high]
+                 return np.random.uniform(low, high, size=(n, low.shape[0])).astype(np.float32)
+            goal_sampler = uniform_sampler
+
+        return self._train(total_timesteps, callback, log_interval, progress_bar, train_high=False, train_low=True, high_policy=goal_sampler)
+
+    def learn_high(self, total_timesteps: int, callback=None, log_interval: int = 1, progress_bar: bool = False):
+        """
+        Only train high-level agent. Low-level agent is fixed (inference only).
+        """
+        return self._train(total_timesteps, callback, log_interval, progress_bar, train_high=True, train_low=False)
+
+    def _train(self, total_timesteps: int, callback, log_interval: int, progress_bar: bool, train_high: bool, train_low: bool, high_policy: Optional[Callable] = None):
 
         # ========== 0. initialization ========== #
         callback = self._init_callback(callback, progress_bar=progress_bar)
@@ -308,7 +341,14 @@ class HIROSAC:
             # step a high interval for required envs
             if need_high.any():
                 idx = np.flatnonzero(need_high)
-                a, a_buf = self.high_agent.sample_action(high_obs[idx])
+
+                if high_policy is not None:
+                    # Use custom high-level policy (e.g. random sampler)
+                    a = high_policy(high_obs[idx])
+                    # For buffer action, if not training high, exact value doesn't matter much unless logged
+                    a_buf = a.copy()
+                else:
+                    a, a_buf = self.high_agent.sample_action(high_obs[idx])
 
                 high_obs_start[idx] = high_obs[idx]
                 goal_action[idx] = a
@@ -391,19 +431,19 @@ class HIROSAC:
                 for i in np.flatnonzero(done_low):
                     low_infos[i]["terminal_observation"] = next_low_obs[i]
 
-            self.low_agent.store_transition(
-                low_obs,
-                low_buffer_action,
-                next_low_obs,
-                low_reward_total.astype(np.float32),
-                done_low,
-                low_infos,
-            )
-            self.total_timesteps += n_envs
-            self.low_agent.num_timesteps += n_envs
+            if train_low:
+                self.low_agent.store_transition(
+                    low_obs,
+                    low_buffer_action,
+                    next_low_obs,
+                    low_reward_total.astype(np.float32),
+                    done_low,
+                    low_infos,
+                )
+                self.low_agent.num_timesteps += n_envs
+                self.low_agent.train_if_needed()
 
-            # train lower model
-            self.low_agent.train_if_needed()
+            self.total_timesteps += n_envs
 
             reward_env = reward
             episode_end = done
@@ -426,24 +466,25 @@ class HIROSAC:
                 callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end, "goal_dist_start": goal_dist_start_end})
                 callback.on_rollout_end()
 
-                self.high_agent.num_timesteps += int(idx_end.size)
-                for j in idx_end:
-                    info_h = dict(infos[j])
-                    info_h["high_interval_len"] = int(low_len[j])
-                    if opc_enabled:
-                        info_h["opc_low_obs_seq"] = opc_low_obs_seq[j, : int(low_len[j])].copy()
-                        info_h["opc_low_act_seq"] = opc_low_act_seq[j, : int(low_len[j])].copy()
-                    self.high_agent.store_transition(
-                        high_obs_start[j:j + 1],
-                        goal_buffer_action[j:j + 1],
-                        next_high_obs[j:j + 1],
-                        np.asarray([high_ret[j]], dtype=np.float32),
-                        np.asarray([done[j]], dtype=np.bool_),
-                        [info_h],
-                    )
+                if train_high:
+                    self.high_agent.num_timesteps += int(idx_end.size)
+                    for j in idx_end:
+                        info_h = dict(infos[j])
+                        info_h["high_interval_len"] = int(low_len[j])
+                        if opc_enabled:
+                            info_h["opc_low_obs_seq"] = opc_low_obs_seq[j, : int(low_len[j])].copy()
+                            info_h["opc_low_act_seq"] = opc_low_act_seq[j, : int(low_len[j])].copy()
+                        self.high_agent.store_transition(
+                            high_obs_start[j:j + 1],
+                            goal_buffer_action[j:j + 1],
+                            next_high_obs[j:j + 1],
+                            np.asarray([high_ret[j]], dtype=np.float32),
+                            np.asarray([done[j]], dtype=np.bool_),
+                            [info_h],
+                        )
 
-                # train higher model
-                self.high_agent.train_if_needed()
+                    # train higher model
+                    self.high_agent.train_if_needed()
 
                 need_high[idx_end] = True
                 high_ret[idx_end] = 0.0
@@ -456,7 +497,7 @@ class HIROSAC:
 
             c[~done_low] += 1
             obs = next_obs
-
+        
         callback.on_training_end()
         print(f"[HIROSAC] 训练结束: env_steps={self.total_timesteps}")
         return self

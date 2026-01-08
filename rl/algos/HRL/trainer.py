@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from rl.algos.HRL.hiro import HIROSAC
 from rl.algos.HRL.buffer import HiROHighReplayBuffer
 from rl.algos.HRL.callbacks import HIROLoggingCallback, HIROCheckpointCallback
+from rl.algos.HRL.goal_samplers import get_goal_sampler
 from stable_baselines3.common.callbacks import CallbackList
 
 
@@ -58,12 +59,36 @@ def train_hiro(
     )
 
     callback = CallbackList([logging_cb, checkpoint_cb])
+    
+    # Retrieve mode from config
+    train_mode = getattr(cfg, "train_mode", "joint")
+    goal_sampler_type = getattr(cfg, "goal_sampler_type", "uniform")
 
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=callback,
-        progress_bar=True,
-    )
+    if train_mode == "joint":
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=callback,
+            progress_bar=True,
+        )
+    elif train_mode == "low_only":
+        print(f"[HIRO Trainer] Training Low-Level Only. Goal Sampler: {goal_sampler_type}")
+        sampler = get_goal_sampler(goal_sampler_type, model.high_agent.action_space)
+        model.learn_low(
+            total_timesteps=total_timesteps,
+            goal_sampler=sampler,
+            callback=callback,
+            progress_bar=True,
+        )
+    elif train_mode == "high_only":
+        print(f"[HIRO Trainer] Training High-Level Only.")
+        model.learn_high(
+            total_timesteps=total_timesteps,
+            callback=callback,
+            progress_bar=True,
+        )
+    else:
+        raise ValueError(f"Unknown train_mode: {train_mode}")
 
-    model.high_agent.save(os.path.join(save_dir, f"{save_name_prefix}_high_final.zip"))
+    if train_mode != "low_only":
+        model.high_agent.save(os.path.join(save_dir, f"{save_name_prefix}_high_final.zip"))
     model.low_agent.save(os.path.join(save_dir, f"{save_name_prefix}_low_final.zip"))

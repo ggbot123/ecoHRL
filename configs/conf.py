@@ -198,4 +198,8 @@ def get_hiro_config():
         intrinsic_norm_ranges=intrinsic_norm_ranges,
         intrinsic_weights=intrinsic_weights,
         use_off_policy_correction=True,
+        # train_mode="joint",
+        # train_mode="high_only",
+        train_mode="low_only",
+        goal_sampler_type="uniform",
     )

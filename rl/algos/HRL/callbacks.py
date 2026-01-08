@@ -206,12 +206,20 @@ class HIROLoggingCallback(BaseCallback):
         if episode_end.any():
             idx = np.flatnonzero(episode_end)
             self._episode_counter += int(idx.size)
+            
+            # Determine which logger to use
+            if hasattr(self.model, "high_logger"):
+                target_logger = self.model.high_logger
+                buffers = self._high_buffers
+            else:
+                target_logger = self.model.low_logger
+                buffers = self._low_buffers
 
             # TB Logging
-            self._record_smooth(self.model.high_logger, self._high_buffers, "rollout/ep_rew", float(self._ep_ret[idx].mean()))
-            self._record_smooth(self.model.high_logger, self._high_buffers, "rollout/ep_len", float(self._ep_len[idx].mean()))
+            self._record_smooth(target_logger, buffers, "rollout/ep_rew", float(self._ep_ret[idx].mean()))
+            self._record_smooth(target_logger, buffers, "rollout/ep_len", float(self._ep_len[idx].mean()))
             for name, arr in self._ep_comp_sums.items():
-                self._record_smooth(self.model.high_logger, self._high_buffers, f"rollout/{name}", float(arr[idx].mean()))
+                self._record_smooth(target_logger, buffers, f"rollout/{name}", float(arr[idx].mean()))
 
             # Reset TB buffers
             self._ep_ret[idx] = 0.0
@@ -220,7 +228,7 @@ class HIROLoggingCallback(BaseCallback):
                 arr[idx] = 0.0
 
             if self._episode_counter - self._last_dump_high >= self.high_log_interval_episodes:
-                self.model.high_logger.dump(step=self.model.num_timesteps)
+                target_logger.dump(step=self.model.num_timesteps)
                 self._last_dump_high = self._episode_counter
             
             # CSV Episode Counter Logic (Env 0)
@@ -246,9 +254,11 @@ class HIROCheckpointCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         if self.save_freq > 0 and self.n_calls % self.save_freq == 0:
-            high_path = os.path.join(self.save_dir, f"{self.prefix}_high_step_{self.num_timesteps}.zip")
+            if getattr(self.model.cfg, "train_mode", "joint") != "low_only":
+                high_path = os.path.join(self.save_dir, f"{self.prefix}_high_step_{self.num_timesteps}.zip")
+                self.model.high_agent.save(high_path)
+            
             low_path = os.path.join(self.save_dir, f"{self.prefix}_low_step_{self.num_timesteps}.zip")
-            self.model.high_agent.save(high_path)
             self.model.low_agent.save(low_path)
             if self.verbose:
                 print(f"[Checkpoint] Saved HIRO models at step={self.num_timesteps}")
