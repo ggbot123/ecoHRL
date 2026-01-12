@@ -487,7 +487,6 @@ class HIROSAC:
             self.total_timesteps += n_envs
 
             reward_env = reward
-            episode_end = done
             callback.update_locals(locals())
             if callback.on_step() is False:
                 break

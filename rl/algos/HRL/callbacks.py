@@ -6,6 +6,7 @@ import csv
 from collections import deque
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
+from rl.utils import utils
 
 
 class HIROLoggingCallback(BaseCallback):
@@ -46,12 +47,14 @@ class HIROLoggingCallback(BaseCallback):
 
         # CSV Headers
         self.comp_keys = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "punctual_reward"]
+        self.ego_keys = ["ego_x", "ego_y", "ego_vx", "ego_vy"]
+
         if self.csv_log_freq > 0 and self.csv_save_dir:
             os.makedirs(self.csv_save_dir, exist_ok=True)
             self.high_csv_path = os.path.join(self.csv_save_dir, "high_traj.csv")
             self.low_csv_path = os.path.join(self.csv_save_dir, "low_traj.csv")
             
-            base_header = ["episode", "step", "s", "a", "r", "next_s", "done"]
+            base_header = ["episode", "step", "s", "a", "r", "next_s", "done"] + self.ego_keys
             comp_headers = [f"comp_{k}" for k in self.comp_keys]
             self._init_csv(self.high_csv_path, base_header + comp_headers)
             self._init_csv(self.low_csv_path, base_header + comp_headers)
@@ -63,7 +66,14 @@ class HIROLoggingCallback(BaseCallback):
                 writer.writerow(header)
 
     def _fmt_arr(self, arr):
-        return np.array2string(np.asarray(arr).reshape(-1), separator=',', max_line_width=np.inf).replace('\n', '')
+        # Format array as string with 2 decimal places
+        arr = np.asarray(arr).reshape(-1)
+        return np.array2string(
+            arr, 
+            separator=',', 
+            max_line_width=np.inf, 
+            formatter={'float_kind': lambda x: f"{x:.2f}"}
+        ).replace('\n', '')
 
     def _append_csv(self, path, row):
         with open(path, "a", newline="", encoding="utf-8") as f:
@@ -133,37 +143,52 @@ class HIROLoggingCallback(BaseCallback):
         # --- CSV Logging (High Level Transition) ---
         done_low = loc.get("done_low", [])
         if self.csv_active and len(done_low) > 0 and done_low[0]:
-            # Env 0 finished a high interval
-            high_obs_start = loc.get("high_obs_start")[0]
-            goal_action = loc.get("goal_action")[0]
-            high_ret = loc.get("high_ret")[0]
-            next_high_obs = loc.get("next_high_obs")[0]
-            done = loc.get("done")[0]
+            if hasattr(self.model, "high_logger"):
+                # Env 0 finished a high interval
+                high_obs_start = loc.get("high_obs_start")[0]
+                goal_action = loc.get("goal_action")[0]
+                high_ret = loc.get("high_ret")[0]
+                next_high_obs = loc.get("next_high_obs")[0]
+                done = loc.get("done")[0]
+                
+                # Ego State
+                ego_s = loc.get("ego_start")[0]
 
-            row_high = [
-                self._env0_ep_count,
-                self.model.num_timesteps,
-                self._fmt_arr(high_obs_start),
-                self._fmt_arr(goal_action),
-                float(high_ret),
-                self._fmt_arr(next_high_obs),
-                int(done)
-            ]
-            
-            for k in self.comp_keys:
-                arr = low_comp_sums.get(k, np.array([]))
-                val = float(arr[0]) if arr.size > 0 else 0.0
-                row_high.append(val)
-            
-            self._append_csv(self.high_csv_path, row_high)
-            
-            # If we just finished the first interval, stop recording low traj
+                row_high = [
+                    self._env0_ep_count,
+                    self.model.num_timesteps,
+                    self._fmt_arr(high_obs_start),
+                    self._fmt_arr(goal_action),
+                    f"{float(high_ret):.2f}",
+                    self._fmt_arr(next_high_obs),
+                    int(done)
+                ]
+                for v in ego_s:
+                    row_high.append(f"{float(v):.2f}")
+
+                for k in self.comp_keys:
+                    arr = low_comp_sums.get(k, np.array([]))
+                    val = float(arr[0]) if arr.size > 0 else 0.0
+                    row_high.append(f"{val:.2f}")
+
+                self._append_csv(self.high_csv_path, row_high)
+
             self.csv_low_traj_recorded = True
+
+        done = loc.get("done", [])
+        if len(done) > 0 and done[0]:
+            self._env0_ep_count += 1
+            # Determines if NEXT episode should be logged
+            if self.csv_log_freq > 0 and (self._env0_ep_count % self.csv_log_freq == 0):
+                self.csv_active = True
+                self.csv_low_traj_recorded = False # Reset for new episode
+            else:
+                self.csv_active = False
 
     def _on_step(self) -> bool:
         loc = self.locals
         reward_env = np.asarray(loc.get("reward_env", 0.0), dtype=np.float32).reshape(-1)
-        episode_end = np.asarray(loc.get("episode_end", False), dtype=bool).reshape(-1)
+        dones = np.asarray(loc.get("done", False), dtype=bool).reshape(-1)
         infos = loc.get("infos", [])
 
         # --- Update TB stats & Capture env 0 components ---
@@ -189,57 +214,48 @@ class HIROLoggingCallback(BaseCallback):
             next_low_obs = loc.get("next_low_obs")[0]
             done_low = loc.get("done_low")[0]
             
+            # Ego
+            kin = loc.get("kin")
+            ego_s = utils.extract_ego_substate(kin, self.model.ego_feature_idx)[0]
+
             row = [
                 self._env0_ep_count,
                 self.model.num_timesteps,
                 self._fmt_arr(low_obs),
                 self._fmt_arr(low_action),
-                float(low_reward),
+                f"{float(low_reward):.2f}",
                 self._fmt_arr(next_low_obs),
                 int(done_low)
             ]
+            for v in ego_s:
+                row.append(f"{float(v):.2f}")
+
             for k in self.comp_keys:
-                row.append(float(rc_env0.get(k, 0.0)))
+                row.append(f"{float(rc_env0.get(k, 0.0)):.2f}")
             self._append_csv(self.low_csv_path, row)
 
         # --- Episode End Logic ---
-        if episode_end.any():
-            idx = np.flatnonzero(episode_end)
+        if dones.any():
+            idx = np.flatnonzero(dones)
             self._episode_counter += int(idx.size)
             
-            # Determine which logger to use
+            # Only log environment-level stats if high_logger exists
             if hasattr(self.model, "high_logger"):
-                target_logger = self.model.high_logger
                 buffers = self._high_buffers
-            else:
-                target_logger = self.model.low_logger
-                buffers = self._low_buffers
-
-            # TB Logging
-            self._record_smooth(target_logger, buffers, "rollout/ep_rew", float(self._ep_ret[idx].mean()))
-            self._record_smooth(target_logger, buffers, "rollout/ep_len", float(self._ep_len[idx].mean()))
-            for name, arr in self._ep_comp_sums.items():
-                self._record_smooth(target_logger, buffers, f"rollout/{name}", float(arr[idx].mean()))
+                self._record_smooth(self.model.high_logger, buffers, "rollout/ep_rew", float(self._ep_ret[idx].mean()))
+                self._record_smooth(self.model.high_logger, buffers, "rollout/ep_len", float(self._ep_len[idx].mean()))
+                for name, arr in self._ep_comp_sums.items():
+                    self._record_smooth(self.model.high_logger, buffers, f"rollout/{name}", float(arr[idx].mean()))
+                
+                if self._episode_counter - self._last_dump_high >= self.high_log_interval_episodes:
+                    self.model.high_logger.dump(step=self.model.num_timesteps)
+                    self._last_dump_high = self._episode_counter
 
             # Reset TB buffers
             self._ep_ret[idx] = 0.0
             self._ep_len[idx] = 0
             for arr in self._ep_comp_sums.values():
                 arr[idx] = 0.0
-
-            if self._episode_counter - self._last_dump_high >= self.high_log_interval_episodes:
-                target_logger.dump(step=self.model.num_timesteps)
-                self._last_dump_high = self._episode_counter
-            
-            # CSV Episode Counter Logic (Env 0)
-            if episode_end[0]:
-                self._env0_ep_count += 1
-                # Determines if NEXT episode should be logged
-                if self.csv_log_freq > 0 and (self._env0_ep_count % self.csv_log_freq == 0):
-                    self.csv_active = True
-                    self.csv_low_traj_recorded = False # Reset for new episode
-                else:
-                    self.csv_active = False
 
         return True
 

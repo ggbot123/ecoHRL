@@ -1,4 +1,5 @@
 import os
+import shutil
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
@@ -199,7 +200,12 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
     import matplotlib.colors as mcolors
     
     # 1. Directory Structure: separated by episode
-    debug_dir = os.path.join(model_dir, "debug", folder_name, f"ep{ep_idx:03d}")
+    # Clear output folder once at the beginning of a run
+    base_debug_dir = os.path.join(model_dir, "debug", folder_name)
+    if int(ep_idx) == 1 and int(step) == 0:
+        if os.path.exists(base_debug_dir):
+            shutil.rmtree(base_debug_dir)
+    debug_dir = os.path.join(base_debug_dir, f"ep{ep_idx:03d}")
     os.makedirs(debug_dir, exist_ok=True)
     
     base_env = env.unwrapped

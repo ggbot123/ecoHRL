@@ -129,13 +129,9 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
         hiro_cfg: HIROConfig = get_hiro_config()
         print(f"[HIRO] Train Mode: {hiro_cfg.train_mode}, Goal Sampler: {hiro_cfg.goal_sampler_type}")
 
-        # Use DummyVecEnv when using RuleBasedController because it requires direct access to env objects
-        # Note: DummyVecEnv runs environments sequentially (serial execution), so it will be slower than SubprocVecEnv.
-        if hiro_cfg.low_level_type == "rule_based":
-            print("[HIRO] Using DummyVecEnv for Rule-Based Low-Level Controller (Direct object access required)")
-            env = DummyVecEnv([make_env(env_overrides) for _ in range(n_envs)])
-        else:
-            env = SubprocVecEnv([make_env(env_overrides) for _ in range(n_envs)])
+        # Rule-based low-level now only depends on observations (no env object access),
+        # so it is compatible with SubprocVecEnv.
+        env = SubprocVecEnv([make_env(env_overrides) for _ in range(n_envs)])
 
         train_hiro(
             env=env,
@@ -181,5 +177,6 @@ if __name__ == "__main__":
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,
-        run_name=f"hiro_260108_onlyHigh_rule_varTargetV_hierObs"
+        # run_name=f"hiro_test",
+        run_name=f"hiro_0112_onlyhigh_rule_varTarV_hierObs",
     )
