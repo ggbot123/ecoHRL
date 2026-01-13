@@ -5,7 +5,7 @@ import scenarios.multi_lane  # Trigger registration
 import numpy as np
 import os
 import shutil
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from util.plot_result import *
 
@@ -36,9 +36,27 @@ def _resolve_hiro_model_paths(model_dir: str, model_name: str) -> Tuple[str, str
     return os.path.join(model_dir, high_name), os.path.join(model_dir, low_name)
 
 
+def _resolve_hiro_high_model_path(model_dir: str, model_name: str) -> str:
+    name = str(model_name)
+    if name.endswith(".zip"):
+        if "_high" in name:
+            high_name = name
+        else:
+            prefix = name[:-4]
+            high_name = f"{prefix}_high_final.zip"
+    else:
+        high_name = f"{name}_high_final.zip"
+    return os.path.join(model_dir, high_name)
+
+
 def _load_hiro_models(model_dir: str, model_name: str) -> Tuple[SAC, SAC]:
     high_path, low_path = _resolve_hiro_model_paths(model_dir, model_name)
     return SAC.load(high_path), SAC.load(low_path)
+
+
+def _load_hiro_high_model(model_dir: str, model_name: str) -> SAC:
+    high_path = _resolve_hiro_high_model_path(model_dir, model_name)
+    return SAC.load(high_path)
 
 
 def main(
@@ -93,11 +111,11 @@ def main(
     
     env = RecordVideo(base_env, video_folder=video_dir, episode_trigger=trigger, name_prefix="rule")
 
-    # 2. Load HIRO Models (for High-Level Goal Sampling)
-    high_model, low_model = _load_hiro_models(model_dir, model_name)
+    # 2. Load HIRO High Model (for High-Level Goal Sampling)
+    high_model = _load_hiro_high_model(model_dir, model_name)
     hiro_cfg = get_hiro_config()
     high_interval = int(getattr(hiro_cfg, "high_interval", 25))
-    runner = HIROPolicyRunner(high_model, low_model, high_interval)
+    runner = HIROPolicyRunner(high_model, low_model=None, high_interval=high_interval)
 
     # 3. Initialize Rule Based Controller
     controller = RuleBasedController(env)
@@ -155,7 +173,7 @@ def main(
                  if len(runner.goal_phys) > 0 and not (runner.c == 0 and steps == 0):
                       prev_goal_phys = runner.goal_phys.copy()
             
-            # 1. Update Goal via Runner (dummy act call)
+            # 1. Update Goal via Runner (side-effect: updates runner.goal_phys)
             _ = runner.act(env, obs)
             
             # 2. Get Goal
@@ -262,8 +280,8 @@ def main(
 
 if __name__ == "__main__":
     main(
-        model_dir="./models/hiro_1e7_lane1_localObs_opc_seed42_0106", 
+        model_dir="./models/hiro_0112_onlyhigh_rule_varTarV", 
         model_name="hiro",
         episodes=10,
-        record_episodes=[1, 2, 3],
+        record_episodes=[i for i in range(1, 11)],
     )

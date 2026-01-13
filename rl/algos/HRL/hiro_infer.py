@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Tuple, List, Optional
+from typing import Tuple, Optional
 from rl.algos.sac.sac import SAC
 from rl.utils import utils
 
@@ -11,7 +11,7 @@ class HIROPolicyRunner:
     - Maintains per-interval state needed for intrinsic reward logging.
     """
 
-    def __init__(self, high_model: SAC, low_model: SAC, high_interval: int):
+    def __init__(self, high_model: SAC, low_model: Optional[SAC], high_interval: int):
         self.high_model, self.low_model, self.hi = high_model, low_model, int(high_interval)
         self._inited = False
         self.need_high, self.c = True, 0
@@ -78,6 +78,12 @@ class HIROPolicyRunner:
         _, kin, kin_flat = self._split(obs)
         if self.need_high:
             self._sample_goal(obs, kin, env)
+
+        if self.low_model is None:
+            # Some evaluation scripts call runner.act() only to update self.goal_phys.
+            # In that case, allow low_model to be absent and return a dummy action.
+            return np.zeros(0, dtype=np.float32)
+
         ego_sub = self._ego_sub(kin)
         t_norm = np.array([self.c / float(self.hi)], dtype=np.float32)
         goal_rel = (self.goal_phys - ego_sub).astype(np.float32)
