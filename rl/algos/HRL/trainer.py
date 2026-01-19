@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from dataclasses import replace
+from typing import Any, Dict
 
 from rl.algos.HRL.hiro import HIROSAC
 from rl.algos.HRL.buffer import HiROHighReplayBuffer
 from rl.algos.HRL.callbacks import HIROLoggingCallback, HIROCheckpointCallback
-from rl.algos.HRL.goal_samplers import get_goal_sampler
+from rl.algos.HRL.goal_samplers import GoalSamplerConfig, get_goal_sampler
 from stable_baselines3.common.callbacks import CallbackList
 
 
@@ -29,14 +30,40 @@ def train_hiro(
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    high_sac_kwargs = dict(high_sac_kwargs)
-    if bool(getattr(cfg, 'use_off_policy_correction', True)):
-        # Inject the custom buffer class.
-        # The static buffer kwargs (n_candidates, etc.) should already be in high_sac_kwargs["replay_buffer_kwargs"]
-        # from get_hiro_high_sac_kwargs() in conf.py.
-        high_sac_kwargs["replay_buffer_class"] = HiROHighReplayBuffer
+    train_mode = str(getattr(cfg, "train_mode", "joint")).lower()
+    if train_mode not in {"joint", "low_only", "high_only"}:
+        raise ValueError(f"Unknown train_mode: {train_mode}")
 
-    model = HIROSAC(env, high_sac_kwargs, low_sac_kwargs, cfg)
+    # Resolve mode-dependent effective settings here; HIRO should not contain redundant guardrails.
+    opc_enabled = train_mode == "joint" and bool(getattr(cfg, "use_off_policy_correction", True))
+    low_level_type = str(getattr(cfg, "low_level_type", "sac")).lower() if train_mode == "high_only" else "sac"
+    goal_sampler_cfg = getattr(cfg, "goal_sampler", GoalSamplerConfig()) if train_mode == "low_only" else GoalSamplerConfig()
+
+    effective_cfg = replace(
+        cfg,
+        train_mode=train_mode,
+        use_off_policy_correction=bool(opc_enabled),
+        low_level_type=low_level_type,
+        goal_sampler=goal_sampler_cfg,
+    )
+
+    high_sac_kwargs = dict(high_sac_kwargs)
+    rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
+
+    if opc_enabled:
+        high_sac_kwargs["replay_buffer_class"] = HiROHighReplayBuffer
+        rb_kwargs["enable_off_policy_correction"] = True
+        high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
+    else:
+        high_sac_kwargs.pop("replay_buffer_class", None)
+        for k in ("n_candidates", "noise_std", "enable_off_policy_correction"):
+            rb_kwargs.pop(k, None)
+        if rb_kwargs:
+            high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
+        else:
+            high_sac_kwargs.pop("replay_buffer_kwargs", None)
+
+    model = HIROSAC(env, high_sac_kwargs, low_sac_kwargs, effective_cfg)
     
     # Set seed for high-level replay buffer if it exists (for OPC noise reproducibility)
     if hasattr(model.high_agent.replay_buffer, "set_seed"):
@@ -60,10 +87,6 @@ def train_hiro(
 
     callback = CallbackList([logging_cb, checkpoint_cb])
     
-    # Retrieve mode from config
-    train_mode = getattr(cfg, "train_mode", "joint")
-    goal_sampler_type = getattr(cfg, "goal_sampler_type", "uniform")
-
     if train_mode == "joint":
         model.learn(
             total_timesteps=total_timesteps,
@@ -71,8 +94,8 @@ def train_hiro(
             progress_bar=True,
         )
     elif train_mode == "low_only":
-        print(f"[HIRO Trainer] Training Low-Level Only. Goal Sampler: {goal_sampler_type}")
-        sampler = get_goal_sampler(goal_sampler_type, model.high_agent.action_space)
+        print(f"[HIRO Trainer] Training Low-Level Only. Goal Sampler: {effective_cfg.goal_sampler.type}")
+        sampler = get_goal_sampler(effective_cfg.goal_sampler, model.high_agent.action_space)
         model.learn_low(
             total_timesteps=total_timesteps,
             goal_sampler=sampler,

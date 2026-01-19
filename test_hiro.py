@@ -7,42 +7,22 @@ import os
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from util.plot_result import *
-
-from rl.algos.sac.sac import SAC
-from rl.utils import utils
+from util.hiro_utils import unique_path, load_hiro_models
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from configs.conf import get_env_config, get_hiro_config
-
-def _resolve_hiro_model_paths(model_dir: str, model_name: str) -> Tuple[str, str]:
-    name = str(model_name)
-    if name.endswith(".zip"):
-        if "_high" in name and "_low" not in name:
-            high_name = name
-            low_name = name.replace("_high_final", "_low_final").replace("_high_", "_low_").replace("_high", "_low", 1)
-        elif "_low" in name:
-            low_name = name
-            high_name = name.replace("_low_final", "_high_final").replace("_low_", "_high_").replace("_low", "_high", 1)
-        else:
-            prefix = name[:-4]
-            high_name, low_name = f"{prefix}_high_final.zip", f"{prefix}_low_final.zip"
-    else:
-        high_name, low_name = f"{name}_high_final.zip", f"{name}_low_final.zip"
-    return os.path.join(model_dir, high_name), os.path.join(model_dir, low_name)
-
-
-def _load_hiro_models(model_dir: str, model_name: str) -> Tuple[SAC, SAC]:
-    high_path, low_path = _resolve_hiro_model_paths(model_dir, model_name)
-    return SAC.load(high_path), SAC.load(low_path)
 
 
 def main(
     model_dir: str,
-    model_name: str,
     episodes: int,
     record_episodes: Optional[Sequence[int]] = None,
     env_overrides: Optional[Dict[str, Any]] = None,
+    high_model_dir: Optional[str] = None,
+    low_model_dir: Optional[str] = None,
 ):
-    log_path = os.path.join(model_dir, "eval_hiro.txt")
+    eval_dir = os.path.join(model_dir, "eval_results")
+    os.makedirs(eval_dir, exist_ok=True)
+    log_path = unique_path(os.path.join(eval_dir, "eval_hiro.txt"))
     log_file = open(log_path, "w", encoding="utf-8")
     def log(msg: str = ""):
         print(msg)
@@ -81,9 +61,9 @@ def main(
         def trigger(ep_id: int) -> bool: return ep_id in record_set
 
     base_env = gym.make("multi-lane-custom-v0", render_mode="rgb_array", config=env_config)
-    env = RecordVideo(base_env, video_folder=model_dir, episode_trigger=trigger, name_prefix="hiro")
+    env = RecordVideo(base_env, video_folder=eval_dir, episode_trigger=trigger, name_prefix="hiro")
 
-    high_model, low_model = _load_hiro_models(model_dir, model_name)
+    high_model, low_model = load_hiro_models(model_dir, high_model_dir=high_model_dir, low_model_dir=low_model_dir)
     hiro_cfg = get_hiro_config()
     runner = HIROPolicyRunner(high_model, low_model, int(getattr(hiro_cfg, "high_interval", 25)))
 
@@ -92,10 +72,14 @@ def main(
 
     log("=" * 80)
     log(f"Eval HIRO model dir: {model_dir}")
+    log(f"Eval results dir   : {eval_dir}")
     log(f"Episodes           : {episodes}")
-    hp, lp = _resolve_hiro_model_paths(model_dir, model_name)
-    log(f"HIRO high          : {os.path.basename(hp)}")
-    log(f"HIRO low           : {os.path.basename(lp)}")
+    hd = high_model_dir or model_dir
+    ld = low_model_dir or model_dir
+    hp = os.path.join(hd, "hiro_high_final.zip")
+    lp = os.path.join(ld, "hiro_low_final.zip")
+    log(f"HIRO high          : {hp}")
+    log(f"HIRO low           : {lp}")
     log(f"High interval      : {runner.hi}")
     log("=" * 80)
 
@@ -269,12 +253,12 @@ def main(
 
 if __name__ == "__main__":
     # 用法示例：
-    # - model_dir: 训练产物目录（包含 *_high_final.zip / *_low_final.zip）
-    # - model_name: 前缀（如 "hiro"）或其中一个 zip 文件名
+    # - model_dir: 训练产物目录（默认从该目录读取 hiro_high_final.zip / hiro_low_final.zip）
     main(
-        model_dir="./models/hiro_1e7_lane1_localObs_opc_seed42_0106", 
-        model_name="hiro", 
-        episodes=30, 
+        model_dir="./models",
+        high_model_dir="./models/hiro_0112_onlyhigh_rule_varTarV", 
+        low_model_dir="./models/hiro_260115_onlyLow_preTrainedSampling_noTrackVx_maskEgoPos", 
+        episodes=10, 
         # record_episodes=[1, 2, 3],
-        record_episodes=[i for i in range(1, 31)],
+        record_episodes=[i for i in range(1, 11)],
     )

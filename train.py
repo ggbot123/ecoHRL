@@ -75,17 +75,17 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
     env_overrides = {
         # "initial_lane_id": "random",
         "initial_lane_id": 1,
-        "PERCEPTION_DISTANCE": 200,
-        "observation": {
-            "vehicles_count": 20,
-            "vehicles_count_local": 5,
-            "features_range": {
-                "x": [-200, 200],
-                "y": [-10, 10],
-                "vx": [-15, 15],
-                "vy": [-10, 10],
-            },
-        },
+        # "PERCEPTION_DISTANCE": 200,
+        # "observation": {
+        #     "vehicles_count": 20,
+        #     "vehicles_count_local": 5,
+        #     "features_range": {
+        #         "x": [-200, 200],
+        #         "y": [-10, 10],
+        #         "vx": [-15, 15],
+        #         "vy": [-10, 10],
+        #     },
+        # },
         "goal_lane_id": 2,
     }
     #### ================================================================= ####
@@ -127,7 +127,7 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
         sac_kwargs_low = get_hiro_low_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED)
 
         hiro_cfg: HIROConfig = get_hiro_config()
-        print(f"[HIRO] Train Mode: {hiro_cfg.train_mode}, Goal Sampler: {hiro_cfg.goal_sampler_type}")
+        print(f"[HIRO] Train Mode: {hiro_cfg.train_mode}, Goal Sampler: {hiro_cfg.goal_sampler.type}")
 
         # Rule-based low-level now only depends on observations (no env object access),
         # so it is compatible with SubprocVecEnv.
@@ -178,5 +178,5 @@ if __name__ == "__main__":
         save_freq=50_000,
         n_envs=8,
         # run_name=f"hiro_test",
-        run_name=f"hiro_0112_onlyhigh_rule_varTarV_hierObs",
+        run_name=f"hiro_260114_onlyLow_preTrainedSampling_noTrackVx",
     )

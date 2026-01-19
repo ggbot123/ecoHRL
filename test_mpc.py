@@ -9,60 +9,23 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 from util.plot_result import *
 from util.mpc import MPCController  # Custom MPC
+from util.hiro_utils import load_hiro_high_model, unique_path
 
-from rl.algos.sac.sac import SAC
 from rl.utils import utils
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from configs.conf import get_env_config, get_hiro_config
 
-def _resolve_hiro_model_paths(model_dir: str, model_name: str) -> Tuple[str, str]:
-    name = str(model_name)
-    if name.endswith(".zip"):
-        if "_high" in name and "_low" not in name:
-            high_name = name
-            low_name = name.replace("_high_final", "_low_final").replace("_high_", "_low_").replace("_high", "_low", 1)
-        elif "_low" in name:
-            low_name = name
-            high_name = name.replace("_low_final", "_high_final").replace("_low_", "_high_").replace("_low", "_high", 1)
-        else:
-            prefix = name[:-4]
-            high_name, low_name = f"{prefix}_high_final.zip", f"{prefix}_low_final.zip"
-    else:
-        high_name, low_name = f"{name}_high_final.zip", f"{name}_low_final.zip"
-    return os.path.join(model_dir, high_name), os.path.join(model_dir, low_name)
-
-
-def _resolve_hiro_high_model_path(model_dir: str, model_name: str) -> str:
-    name = str(model_name)
-    if name.endswith(".zip"):
-        if "_high" in name:
-            high_name = name
-        else:
-            prefix = name[:-4]
-            high_name = f"{prefix}_high_final.zip"
-    else:
-        high_name = f"{name}_high_final.zip"
-    return os.path.join(model_dir, high_name)
-
-
-def _load_hiro_models(model_dir: str, model_name: str) -> Tuple[SAC, SAC]:
-    high_path, low_path = _resolve_hiro_model_paths(model_dir, model_name)
-    return SAC.load(high_path), SAC.load(low_path)
-
-
-def _load_hiro_high_model(model_dir: str, model_name: str) -> SAC:
-    high_path = _resolve_hiro_high_model_path(model_dir, model_name)
-    return SAC.load(high_path)
-
 
 def main(
     model_dir: str,
-    model_name: str,
     episodes: int,
     record_episodes: Optional[Sequence[int]] = None,
     env_overrides: Optional[Dict[str, Any]] = None,
+    high_model_dir: Optional[str] = None,
 ):
-    log_path = os.path.join(model_dir, "eval_mpc.txt")
+    eval_dir = os.path.join(model_dir, "eval_results")
+    os.makedirs(eval_dir, exist_ok=True)
+    log_path = unique_path(os.path.join(eval_dir, "eval_mpc.txt"))
     log_file = open(log_path, "w", encoding="utf-8")
     def log(msg: str = ""):
         print(msg)
@@ -108,7 +71,7 @@ def main(
     env = RecordVideo(base_env, video_folder=video_dir, episode_trigger=trigger, name_prefix="mpc")
 
     # 2. Load HIRO High Model (for High-Level Goal Sampling)
-    high_model = _load_hiro_high_model(model_dir, model_name)
+    high_model = load_hiro_high_model(high_model_dir or model_dir)
     hiro_cfg = get_hiro_config()
     high_interval = int(getattr(hiro_cfg, "high_interval", 25))
     runner = HIROPolicyRunner(high_model, low_model=None, high_interval=high_interval)
@@ -141,6 +104,7 @@ def main(
     log("=" * 80)
     log(f"Eval MPC with HIRO High-Level Goals")
     log(f"Model Dir: {model_dir}")
+    log(f"Eval Results Dir: {eval_dir}")
     log(f"Episodes: {episodes}")
     log("=" * 80)
 
@@ -292,7 +256,6 @@ def main(
 if __name__ == "__main__":
     main(
         model_dir="./models/hiro_1e7_lane1_localObs_opc_seed42_0106", # Change to your actual model path
-        model_name="hiro",
         episodes=10,
         record_episodes=[1, 2, 3],
     )

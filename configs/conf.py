@@ -178,6 +178,7 @@ def get_hiro_low_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
 def get_hiro_config():
     """Centralized HiRO algorithm config."""
     from rl.algos.HRL.hiro import HIROConfig
+    from rl.algos.HRL.goal_samplers import GoalSamplerConfig
 
     intrinsic_norm_ranges = [
         [0.0, 37.5],
@@ -185,7 +186,8 @@ def get_hiro_config():
         [-8.0, 8.0],
         [-2.0, 2.0],
     ]
-    intrinsic_weights = [1.0, 2.0, 8.0, 1.0]
+    # intrinsic_weights = [1.0, 2.0, 8.0, 1.0]
+    intrinsic_weights = [1.0, 2.0, 0, 1.0]
 
     return HIROConfig(
         high_interval=25,
@@ -197,10 +199,23 @@ def get_hiro_config():
         device="auto",
         intrinsic_norm_ranges=intrinsic_norm_ranges,
         intrinsic_weights=intrinsic_weights,
+        # use_off_policy_correction=False,
         use_off_policy_correction=True,
         # train_mode="joint",
-        train_mode="high_only",
-        # train_mode="low_only",
-        goal_sampler_type="uniform",
+        # train_mode="high_only",
+        train_mode="low_only",
+        # goal_sampler=GoalSamplerConfig(
+        #     type="uniform",
+        # ),
+        goal_sampler=GoalSamplerConfig(
+            type="pretrained",
+            path="./models/hiro_0112_onlyhigh_rule_varTarV/hiro_high_final.zip",
+            device="auto",
+            deterministic=True,
+        ),
+        # goal_sampler=GoalSamplerConfig(
+        #     type="fixed",
+        #     action=[25.0, 0.0, 10.0],
+        # ),
         low_level_type="rule_based",
     )

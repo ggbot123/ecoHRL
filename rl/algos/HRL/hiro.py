@@ -10,6 +10,7 @@ import numpy as np
 from rl.algos.sac.sac import SAC
 from rl.utils import utils
 from rl.algos.HRL.rule_based import RuleBasedAgentWrapper
+from rl.algos.HRL.goal_samplers import GoalSamplerConfig
 from stable_baselines3.common.utils import get_device, configure_logger
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -114,7 +115,7 @@ class HIROConfig:
     intrinsic_norm_ranges: Optional[np.ndarray | List[List[float]]]
     intrinsic_weights: Optional[np.ndarray | List[float]]
     train_mode: str  # "joint", "low_only", "high_only"
-    goal_sampler_type: str
+    goal_sampler: GoalSamplerConfig
     low_level_type: str = "sac" # "sac" or "rule_based" or "mpc"
 
 
@@ -166,32 +167,21 @@ class HIROSAC:
         low_obs_space = gym.spaces.Box(-np.inf, np.inf, shape=(low_obs_dim,), dtype=np.float32)
         low_act_space = env.action_space
 
-        # ----- 创建 Wrapper 实例 ----- #
-        self.train_mode = getattr(config, "train_mode", "joint")
-        self.low_level_type = "sac"
-        if self.train_mode == "high_only":
-            self.low_level_type = getattr(config, "low_level_type", "sac")
+        self.train_mode = str(getattr(config, "train_mode", "joint")).lower()
+        self.low_level_type = str(getattr(config, "low_level_type", "sac")).lower()
+        self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", False))
 
+        # ----- Build low-level agent ----- #
         if self.low_level_type == "rule_based":
             self.low_agent = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
         elif self.low_level_type == "sac":
-            # 先创建 low-level SAC：HiRO 的 high-level off-policy correction 需要访问当前 low-level policy
             low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
             self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
         else:
             raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
-        # HiRO Off-Policy Correction (OPC) for high-level replay buffer
-        self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", True))
+        # ----- High-level buffer config (dynamic OPC metadata only) ----- #
         high_sac_kwargs = dict(high_sac_kwargs)
-
-        if self.use_off_policy_correction:
-            if self.train_mode == "high_only":
-                 print(f"[HIROSAC] Warning: Off-Policy Correction disabled because train mode is 'high_only'.")
-                 self.use_off_policy_correction = False
-                 if "replay_buffer_class" in high_sac_kwargs:
-                    del high_sac_kwargs["replay_buffer_class"]
-
         if self.use_off_policy_correction:
             rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
             rb_kwargs.update(
@@ -203,22 +193,11 @@ class HIROSAC:
                     ego_feature_idx=list(self.ego_feature_idx),
                     lane_center_ys=self.lane_center_ys,
                     high_interval=int(self.cfg.high_interval),
-                    low_policy=self.low_agent.policy,  # must be current
+                    low_policy=self.low_agent.policy,
                 )
             )
-            rb_kwargs["enable_off_policy_correction"] = bool(self.use_off_policy_correction)
+            rb_kwargs["enable_off_policy_correction"] = True
             high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
-        else:
-             # Clean up params that might have been passed for HiROHighReplayBuffer but now we are using standard buffer
-            if "replay_buffer_class" in high_sac_kwargs:
-                del high_sac_kwargs["replay_buffer_class"]
-            
-            if "replay_buffer_kwargs" in high_sac_kwargs:
-                # Clean up specific keys
-                rbk = dict(high_sac_kwargs["replay_buffer_kwargs"]) # copy it
-                for key in ["n_candidates", "noise_std", "enable_off_policy_correction"]:
-                    rbk.pop(key, None)
-                high_sac_kwargs["replay_buffer_kwargs"] = rbk
 
         high_sac = SAC(env=_make_dummy_vec_env(high_obs_space, high_act_space, 1), **high_sac_kwargs)
 
@@ -301,19 +280,8 @@ class HIROSAC:
 
     def learn_low(self, total_timesteps: int, goal_sampler: Optional[Callable[[np.ndarray], np.ndarray]] = None, callback=None, log_interval: int = 1, progress_bar: bool = False):
         """
-        Only train low-level agent. High-level agent is disabled; goals are sampled using goal_sampler (default: uniform).
+        Only train low-level agent. High-level agent is disabled; goals are sampled using goal_sampler.
         """
-        if goal_sampler is None:
-            # Default uniform sampling
-            def uniform_sampler(obs: np.ndarray) -> np.ndarray:
-                 # obs shape (n_envs, dim)
-                 n = obs.shape[0]
-                 low = self.high_agent.action_space.low
-                 high = self.high_agent.action_space.high
-                 # Uniform sample in [low, high]
-                 return np.random.uniform(low, high, size=(n, low.shape[0])).astype(np.float32)
-            goal_sampler = uniform_sampler
-
         return self._train(total_timesteps, callback, log_interval, progress_bar, train_high=False, train_low=True, high_policy=goal_sampler)
 
     def learn_high(self, total_timesteps: int, callback=None, log_interval: int = 1, progress_bar: bool = False):

@@ -2,6 +2,7 @@ import numpy as np
 from typing import Tuple, Optional
 from rl.algos.sac.sac import SAC
 from rl.utils import utils
+from configs.conf import get_hiro_config
 
 class HIROPolicyRunner:
     """Single-env HIRO inference runner.
@@ -13,6 +14,7 @@ class HIROPolicyRunner:
 
     def __init__(self, high_model: SAC, low_model: Optional[SAC], high_interval: int):
         self.high_model, self.low_model, self.hi = high_model, low_model, int(high_interval)
+        self.cfg = get_hiro_config()
         self._inited = False
         self.need_high, self.c = True, 0
         self.n_veh, self.feat_dim, self.feature_names, self.ego_feature_idx, self.ego_dim = 0, 0, [], [], 0
@@ -20,10 +22,8 @@ class HIROPolicyRunner:
         self.lane_center_ys = np.zeros(0, dtype=np.float32)
         self.goal_phys = np.zeros(0, dtype=np.float32)
         self.ego_start = np.zeros(0, dtype=np.float32)
-
-        # dx_max is set from env config in init_from_env (speed_limit * high_interval * dt)
-        self.norm_ranges = np.asarray([[0.0, 1.0], [-8.0, 8.0], [-8.0, 8.0], [-2.0, 2.0]], dtype=np.float32)
-        self.weights = np.asarray([1.0, 2.0, 8.0, 1.0], dtype=np.float32)
+        self.norm_ranges: Optional[np.ndarray] = None
+        self.weights: Optional[np.ndarray] = None
         self.intrinsic_coef = 1.0
 
     def init_from_env(self, env, obs0: np.ndarray, intrinsic_coef: float):
@@ -37,9 +37,11 @@ class HIROPolicyRunner:
         lanes, lane_w = int(cfg["lanes_count"]), float(cfg.get("lane_width", 4.0))
         self.lane_center_ys = (np.arange(lanes, dtype=np.float32) * lane_w).astype(np.float32)
 
-        v_max = float(cfg.get("speed_limit", 15.0))
-        dt = 1.0 / float(cfg.get("policy_frequency", 10.0))
-        self.norm_ranges[0, 1] = max(v_max * float(self.hi) * dt, 1e-6)
+        intrinsic_norm = getattr(self.cfg, "intrinsic_norm_ranges", None)
+        self.norm_ranges = np.asarray(intrinsic_norm, dtype=np.float32)
+
+        w = getattr(self.cfg, "intrinsic_weights", None)
+        self.weights = None if w is None else np.asarray(w, dtype=np.float32)
         self.goal_phys = np.zeros(self.ego_dim, dtype=np.float32)
         self.ego_start = np.zeros(self.ego_dim, dtype=np.float32)
         self.intrinsic_coef = float(intrinsic_coef)
@@ -88,7 +90,15 @@ class HIROPolicyRunner:
         t_norm = np.array([self.c / float(self.hi)], dtype=np.float32)
         goal_rel = (self.goal_phys - ego_sub).astype(np.float32)
         
-        local_kin_flat = kin_flat[0, :self.local_kin_flat_dim]
+        local_kin_flat = np.asarray(kin_flat[0, :self.local_kin_flat_dim], dtype=np.float32).copy()
+
+        # Keep inference low_obs consistent with training: mask ego absolute position (x/y).
+        if bool(getattr(self.cfg, "mask_ego_position_in_low_obs", False)):
+            if int(self.feat_dim) > 0 and local_kin_flat.shape[0] >= int(self.feat_dim):
+                idx_x = int(self.feature_names.index("x"))
+                idx_y = int(self.feature_names.index("y"))
+                local_kin_flat[idx_x] = 0.0
+                local_kin_flat[idx_y] = 0.0
         low_obs = np.concatenate([t_norm, local_kin_flat, goal_rel]).astype(np.float32)
         
         action, _ = self.low_model.predict(low_obs, deterministic=True)
