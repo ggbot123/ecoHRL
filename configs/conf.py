@@ -180,23 +180,28 @@ def get_hiro_config():
     from rl.algos.HRL.hiro import HIROConfig
     from rl.algos.HRL.goal_samplers import GoalSamplerConfig
 
-    # intrinsic_norm_ranges = [
-    #     [0.0, 37.5],
-    #     [-8.0, 8.0],
-    #     # [-4.0, 4.0],
-    #     [-8.0, 8.0],
-    #     [-2.0, 2.0],
-    # ]
-    # # intrinsic_weights = [1.0, 2.0, 8.0, 1.0]
-    # intrinsic_weights = [1.0, 2.0, 0, 1.0]
-
-    intrinsic_norm_ranges = [
-        [0, 10],
-        [-4.0, 4.0],
-        [-10.0, 10.0],
-        [-2.0, 2.0],
-    ]
-    intrinsic_weights = [1.0, 1.0, 0, 0.5]
+    # Intrinsic reward presets. (ego feature order in HIRO: x, y, vx, vy)
+    ENABLE_HIRO_REWARD_SHAPING = True
+    if ENABLE_HIRO_REWARD_SHAPING:
+        intrinsic_type = "huber_shaping"
+        intrinsic_coef = 10.0
+        intrinsic_norm_ranges = [
+            [0.0, 10.0],
+            [-4.0, 4.0],
+            [-10.0, 10.0],
+            [-2.0, 2.0],
+        ]
+        intrinsic_weights = [1.0, 1.0, 0.0, 0.5]
+    else:
+        intrinsic_type = "l2"
+        intrinsic_coef = 8.0
+        intrinsic_norm_ranges = [
+            [0.0, 37.5],
+            [-8.0, 8.0],
+            [-8.0, 8.0],
+            [-2.0, 2.0],
+        ]
+        intrinsic_weights = [1.0, 2.0, 0.0, 1.0]
 
     return HIROConfig(
         high_interval=25,
@@ -204,18 +209,14 @@ def get_hiro_config():
         gradient_steps_high=1,
         gradient_steps_low=1,
         train_freq=1,
-        # intrinsic_coef=8.0,
-        intrinsic_coef=10.0,
         device="auto",
-        intrinsic_norm_ranges=intrinsic_norm_ranges,
-        intrinsic_weights=intrinsic_weights,
-        # intrinsic_type="l2",
-        intrinsic_type="huber_shaping",
-        use_off_policy_correction=False,
-        # use_off_policy_correction=True,
         # train_mode="joint",
         # train_mode="high_only",
         train_mode="low_only",
+        intrinsic_coef=intrinsic_coef,
+        intrinsic_norm_ranges=intrinsic_norm_ranges,
+        intrinsic_weights=intrinsic_weights,
+        intrinsic_type=intrinsic_type,
         # goal_sampler=GoalSamplerConfig(
         #     type="uniform",
         # ),
@@ -230,6 +231,8 @@ def get_hiro_config():
         #     action=[25.0, 0.0, 10.0],
         # ),
         low_level_type="rule_based",
+        use_off_policy_correction=False,
+        # use_off_policy_correction=True,
         # use_low_safety_layer=False,
         use_low_safety_layer=True,
         mask_ego_position_in_low_obs=True,

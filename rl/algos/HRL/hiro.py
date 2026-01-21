@@ -433,7 +433,6 @@ class HIROSAC:
                 low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
                 if bool(getattr(self.cfg, "use_low_safety_layer", False)):
                     low_action = self.low_safety.apply_safety_layer(low_obs, goal_phys, low_action)
-                    low_buffer_action = low_action.copy()
             else:
                 raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
