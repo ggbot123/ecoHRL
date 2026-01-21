@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Tuple, Union
 
 import numpy as np
+
+# Suppress a noisy third-party warning from pygame (setuptools/pkg_resources deprecation).
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API\..*",
+    category=UserWarning,
+    module=r"pygame\.pkgdata",
+)
 import pygame
 
 from custom_env.road.lane import AbstractLane, LineType

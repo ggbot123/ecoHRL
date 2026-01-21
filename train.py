@@ -1,5 +1,15 @@
 # train.py
 from __future__ import annotations
+import warnings
+
+# Suppress a noisy third-party warning from pygame (setuptools/pkg_resources deprecation).
+# Keep this at the very top so it applies before any indirect pygame imports.
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API\..*",
+    category=UserWarning,
+    module=r"pygame\.pkgdata",
+)
 import os
 import random
 from datetime import datetime
@@ -178,6 +188,6 @@ if __name__ == "__main__":
         save_freq=50_000,
         n_envs=8,
         # run_name=f"hiro_test",
-        # run_name=f"hiro_260120_joint_safetyLayer_noOpc_rewShaping",
-        run_name=f"hiro_260120_onlyLow_safetyLayer_rewShaping",
+        run_name=f"hiro_260121_joint_safetyLayer_noOpc_rewShaping",
+        # run_name=f"hiro_260120_onlyLow_safetyLayer_rewShaping",
     )
