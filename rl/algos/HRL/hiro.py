@@ -114,9 +114,12 @@ class HIROConfig:
     use_off_policy_correction: bool
     intrinsic_norm_ranges: Optional[np.ndarray | List[List[float]]]
     intrinsic_weights: Optional[np.ndarray | List[float]]
+    intrinsic_type: str # "l2" | "huber_shaping"
     train_mode: str  # "joint", "low_only", "high_only"
     goal_sampler: GoalSamplerConfig
     low_level_type: str = "sac" # "sac" or "rule_based" or "mpc"
+    mask_ego_position_in_low_obs: bool = False
+    use_low_safety_layer: bool = False
 
 
 class HIROSAC:
@@ -170,6 +173,7 @@ class HIROSAC:
         self.train_mode = str(getattr(config, "train_mode", "joint")).lower()
         self.low_level_type = str(getattr(config, "low_level_type", "sac")).lower()
         self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", False))
+        self.low_gamma = float(low_sac_kwargs.get("gamma", 0.99))
 
         # ----- Build low-level agent ----- #
         if self.low_level_type == "rule_based":
@@ -177,6 +181,8 @@ class HIROSAC:
         elif self.low_level_type == "sac":
             low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
             self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
+            if bool(getattr(self.cfg, "use_low_safety_layer", False)):
+                self.low_safety = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
         else:
             raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
@@ -205,9 +211,9 @@ class HIROSAC:
         # self.low_agent is set above
 
         # ----- logger ----- #
-        if self.train_mode != "low_only":
-            self.high_logger = configure_logger(high_sac.verbose, high_sac_kwargs.get("tensorboard_log"), "hiro_high", True)
-            self.high_agent.set_logger(self.high_logger)
+        # Always initialize high_logger so high-level metrics are recorded even in low_only mode.
+        self.high_logger = configure_logger(high_sac.verbose, high_sac_kwargs.get("tensorboard_log"), "hiro_high", True)
+        self.high_agent.set_logger(self.high_logger)
         
         # Always initialize low_logger, even in high_only mode, because callbacks might rely on it for logging evaluation metrics
         self.low_logger = configure_logger(0, low_sac_kwargs.get("tensorboard_log"), "hiro_low", True)
@@ -257,8 +263,51 @@ class HIROSAC:
         t_norm = (np.asarray(t_rel, dtype=np.float32) / float(self.cfg.high_interval)).reshape(-1, 1)
         ego_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
         goal_rel = (np.asarray(goal_phys, dtype=np.float32) - ego_sub).astype(np.float32)
-        local_kin_flat = kin_flat[:, :self.local_kin_flat_dim]
+        local_kin_flat = np.asarray(kin_flat[:, :self.local_kin_flat_dim], dtype=np.float32).copy()
+
+        # Mask ego absolute position in low_obs.
+        # Controlled via cfg, but forced OFF for rule_based and safety layer (RuleBasedAgentWrapper relies on ego x/y).
+        mask_ego_pos = bool(getattr(self.cfg, "mask_ego_position_in_low_obs", False))
+        if self.low_level_type == "rule_based" or bool(getattr(self.cfg, "use_low_safety_layer", False)):
+            mask_ego_pos = False
+        if mask_ego_pos:
+            idx_x = int(self.feature_names.index("x"))
+            idx_y = int(self.feature_names.index("y"))
+            local_kin_flat[:, idx_x] = 0.0
+            local_kin_flat[:, idx_y] = 0.0
         return np.concatenate([t_norm, np.asarray(local_kin_flat, dtype=np.float32), goal_rel], axis=1)
+
+    def _compute_intrinsic(self, kin: np.ndarray, kin_next: np.ndarray, goal_phys: np.ndarray, ego_start: np.ndarray, is_last_step: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        n_envs = int(kin.shape[0])
+        intrinsic = np.zeros(n_envs, dtype=np.float32)
+        goal_err = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
+        intrinsic_unweighted = np.zeros(n_envs, dtype=np.float32)
+
+        intrinsic_type = str(getattr(self.cfg, "intrinsic_type", "l2")).lower()
+        if intrinsic_type == "huber_shaping":
+            ego_rel_now = utils.extract_ego_substate(kin, self.ego_feature_idx) - ego_start
+            ego_rel_next = utils.extract_ego_substate(kin_next, self.ego_feature_idx) - ego_start
+            goal_rel_all = goal_phys - ego_start
+
+            intrinsic_val, goal_err_val, intrinsic_unw, _terminal_bonus = utils.intrinsic_reward_shaping_huber(ego_rel_now, ego_rel_next, goal_rel_all,
+                self._intrinsic_norm_ranges, self.cfg.intrinsic_coef, self._intrinsic_weights, gamma=float(self.low_gamma), is_terminal=is_last_step)
+            intrinsic = intrinsic_val
+
+            if is_last_step.any():
+                idx_last = np.flatnonzero(is_last_step)
+                goal_err[idx_last] = goal_err_val[idx_last]
+                intrinsic_unweighted[idx_last] = intrinsic_unw[idx_last]
+        else:
+            if is_last_step.any():
+                idx_last = np.flatnonzero(is_last_step)
+                ego_next_rel = utils.extract_ego_substate(kin_next[idx_last], self.ego_feature_idx) - ego_start[idx_last]
+                goal_rel = goal_phys[idx_last] - ego_start[idx_last]
+
+                intrinsic[idx_last], goal_err[idx_last], intrinsic_unweighted[idx_last] = utils.intrinsic_reward_l2(
+                    ego_next_rel, goal_rel, self._intrinsic_norm_ranges, self.cfg.intrinsic_coef, self._intrinsic_weights
+                )
+
+        return intrinsic, goal_err, intrinsic_unweighted
 
     @staticmethod
     def _terminal_obs(next_obs: np.ndarray, dones: np.ndarray, infos: List[Dict[str, Any]]) -> np.ndarray:
@@ -382,6 +431,9 @@ class HIROSAC:
                 low_buffer_action = low_action.copy()
             elif self.low_level_type == "sac":
                 low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
+                if bool(getattr(self.cfg, "use_low_safety_layer", False)):
+                    low_action = self.low_safety.apply_safety_layer(low_obs, goal_phys, low_action)
+                    low_buffer_action = low_action.copy()
             else:
                 raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
@@ -404,18 +456,17 @@ class HIROSAC:
             r_components = [info.get("reward_components", {}) for info in infos]
             punctual = np.asarray([rc.get("punctual_reward", 0.0) for rc in r_components], dtype=np.float32)
             low_reward_ext = reward - punctual
+            if str(getattr(self.cfg, "intrinsic_type", "l2")).lower() == "huber_shaping":
+                progress = np.asarray([rc.get("progress_reward", 0.0) for rc in r_components], dtype=np.float32)
+                low_reward_ext = low_reward_ext - progress
 
-            # calculate intrinsic reward at last step for required envs
+            # calculate intrinsic reward
             is_last_step = (c == hi - 1) | done
-            intrinsic = np.zeros(n_envs, dtype=np.float32)
+            intrinsic, goal_err, intrinsic_unw = self._compute_intrinsic(kin, kin_next, goal_phys, ego_start, is_last_step)
             if is_last_step.any():
                 idx_last = np.flatnonzero(is_last_step)
-                ego_next_rel = utils.extract_ego_substate(kin_next[idx_last], self.ego_feature_idx) - ego_start[idx_last]
-                goal_rel = goal_phys[idx_last] - ego_start[idx_last]
-
-                intrinsic[idx_last], goal_err_all[idx_last], intrinsic_unweighted[idx_last] = utils.intrinsic_reward_l2(
-                    ego_next_rel, goal_rel, self._intrinsic_norm_ranges, self.cfg.intrinsic_coef, self._intrinsic_weights
-                )
+                goal_err_all[idx_last] = goal_err[idx_last]
+                intrinsic_unweighted[idx_last] = intrinsic_unw[idx_last]
 
             low_reward_total = low_reward_ext + intrinsic
             low_ret += low_reward_total

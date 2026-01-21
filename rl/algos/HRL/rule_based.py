@@ -242,12 +242,114 @@ class RuleBasedController:
         x = 2.0 * (float(acc_phys) - lo) / (hi - lo) - 1.0
         return float(np.clip(x, -1.0, 1.0))
 
+    def _acc_norm_to_phys(self, acc_norm: float) -> float:
+        lo, hi = float(self.acc_min), float(self.acc_max)
+        if hi == lo:
+            return float(lo)
+        return float(lo + 0.5 * (float(acc_norm) + 1.0) * (hi - lo))
+
     def _lane_to_scalar(self, ego_lane: int, target_lane: int) -> float:
         if target_lane < ego_lane:
             return -1.0
         if target_lane > ego_lane:
             return 1.0
         return 0.0
+
+    def _scalar_to_lane(self, ego_lane: int, lane_scalar: float) -> int:
+        if lane_scalar < -1.0 / 3.0:
+            return int(np.clip(ego_lane - 1, 0, self.lanes_count - 1))
+        if lane_scalar > 1.0 / 3.0:
+            return int(np.clip(ego_lane + 1, 0, self.lanes_count - 1))
+        return int(np.clip(ego_lane, 0, self.lanes_count - 1))
+
+    def safety_filter_action(
+        self,
+        ego_abs: np.ndarray,
+        others_rel: np.ndarray,
+        goal_phys: np.ndarray,
+        action: np.ndarray,
+        dt: float,
+        remaining_time: Optional[float] = None,
+    ) -> np.ndarray:
+        """Safety layer: clamp unsafe lane change & longitudinal acceleration.
+
+        For ParamLaneAccelAction: adjust lane_scalar if MOBIL disallows, and
+        clamp acc by IDM safety for current/target lane.
+        """
+        ego_x, ego_y, ego_vx, ego_vy = [float(v) for v in np.asarray(ego_abs).reshape(-1)]
+        ego_speed = float(math.sqrt(ego_vx * ego_vx + ego_vy * ego_vy))
+        ego_heading = float(math.atan2(ego_vy, ego_vx)) if ego_speed > 0.1 else 0.0
+        ego_lane = self.get_lane_index(ego_y)
+
+        # Align target_speed with compute_action (use goal and remaining_time if provided)
+        goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
+        goal_x = float(goal_phys[0])
+        goal_vx = float(goal_phys[2])
+        if remaining_time is not None:
+            rt = max(float(remaining_time), float(dt))
+            target_speed = max((goal_x - ego_x) / rt, 0.0)
+        else:
+            target_speed = abs(goal_vx)
+        target_speed = float(np.clip(target_speed, 0.0, self.speed_limit))
+
+        # Build other vehicles in absolute frame
+        others: List[VirtualVehicle] = []
+        for row in np.asarray(others_rel, dtype=np.float32).reshape(-1, 4):
+            dx, dy, dvx, dvy = [float(v) for v in row]
+            ox = ego_x + dx
+            oy = ego_y + dy
+            ovx = ego_vx + dvx
+            ovy = ego_vy + dvy
+            ospeed = float(math.sqrt(ovx * ovx + ovy * ovy))
+            oheading = float(math.atan2(ovy, ovx)) if ospeed > 0.1 else 0.0
+            olane = self.get_lane_index(oy)
+            others.append(
+                VirtualVehicle(
+                    position=np.array([ox, oy], dtype=np.float32),
+                    velocity=np.array([ovx, ovy], dtype=np.float32),
+                    heading=oheading,
+                    speed=ospeed,
+                    lane_index=olane,
+                    target_speed=max(ospeed, 0.1),
+                    length=self.LENGTH,
+                )
+            )
+
+        ego = VirtualVehicle(
+            position=np.array([ego_x, ego_y], dtype=np.float32),
+            velocity=np.array([ego_vx, ego_vy], dtype=np.float32),
+            heading=ego_heading,
+            speed=ego_speed,
+            lane_index=ego_lane,
+            target_speed=target_speed,
+            length=self.LENGTH,
+        )
+
+        act = np.asarray(action, dtype=np.float32).reshape(-1)
+        if self.action_type == "ParamLaneAccelAction":
+            lane_scalar = float(act[0])
+            acc_norm = float(act[1])
+
+            target_lane = self._scalar_to_lane(ego_lane, lane_scalar)
+            if target_lane != ego_lane:
+                if not self.mobil_ok(ego, target_lane, others):
+                    lane_scalar = 0.0
+                    target_lane = ego_lane
+
+            acc_phys = self._acc_norm_to_phys(acc_norm)
+            front, _ = self._get_neighbors(ego, others, ego_lane)
+            acc_idm = self.idm_acceleration(ego, front)
+            if target_lane != ego_lane:
+                front_t, _ = self._get_neighbors(ego, others, target_lane)
+                acc_idm = min(acc_idm, self.idm_acceleration(ego, front_t))
+
+            if acc_idm < acc_phys:
+                acc_phys = acc_idm
+            acc_phys = float(np.clip(acc_phys, self.acc_min, self.acc_max))
+            acc_norm = self._acc_phys_to_norm(acc_phys)
+            return np.array([lane_scalar, acc_norm], dtype=np.float32)
+
+        return act.astype(np.float32)
 
     def compute_action(
         self,
@@ -438,6 +540,51 @@ class RuleBasedAgentWrapper:
             actions.append(a)
 
         return np.asarray(actions, dtype=np.float32)
+
+    def apply_safety_layer(self, low_obs: np.ndarray, goal_phys: np.ndarray, action: np.ndarray) -> np.ndarray:
+        low_obs = np.asarray(low_obs, dtype=np.float32)
+        goal_phys = np.asarray(goal_phys, dtype=np.float32)
+        action = np.asarray(action, dtype=np.float32)
+
+        kin_slice = low_obs[:, : 1 + self.n_veh_local * self.feat_dim]
+        _, kin, _ = rl_utils.split_time_kinematics(kin_slice, self.n_veh_local, self.feat_dim)
+
+        safe_actions: List[np.ndarray] = []
+        for i in range(int(low_obs.shape[0])):
+            t_norm = float(low_obs[i, 0])
+            rem_time = float(self.high_interval) * (1.0 - t_norm) * float(self.dt)
+
+            ego_feat = kin[i, 0]
+            ego_abs = np.array(
+                [
+                    ego_feat[self.idx_x],
+                    ego_feat[self.idx_y],
+                    ego_feat[self.idx_vx],
+                    ego_feat[self.idx_vy],
+                ],
+                dtype=np.float32,
+            )
+
+            others_feat = kin[i, 1:]
+            others_rel: List[List[float]] = []
+            for j in range(int(others_feat.shape[0])):
+                d = others_feat[j]
+                if d[self.idx_presence] == 0:
+                    continue
+                others_rel.append([float(d[self.idx_x]), float(d[self.idx_y]), float(d[self.idx_vx]), float(d[self.idx_vy])])
+
+            others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
+            safe_a = self.controller.safety_filter_action(
+                ego_abs,
+                others_rel_arr,
+                goal_phys[i],
+                action[i],
+                self.dt,
+                remaining_time=rem_time,
+            )
+            safe_actions.append(safe_a)
+
+        return np.asarray(safe_actions, dtype=np.float32)
 
     @property
     def action_space(self):

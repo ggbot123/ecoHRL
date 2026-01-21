@@ -51,7 +51,8 @@ def _normalize_vec_phys(vec: np.ndarray, feature_ranges: np.ndarray) -> np.ndarr
     denom = v_max - v_min
     norm = 2.0 * (vec - v_min) / denom - 1.0
     norm = np.where(denom > 0.0, norm, 0.0)
-    return np.clip(norm, -1.0, 1.0).astype(np.float32)
+    return norm.astype(np.float32)
+    # return np.clip(norm, -1.0, 1.0).astype(np.float32)
 
 
 def intrinsic_reward_l2(
@@ -94,6 +95,89 @@ def intrinsic_reward_l2(
 
     goal_err_phys = (ego - goal).astype(np.float32)
     return reward, goal_err_phys, reward_unweighted
+
+
+def _normalize_delta_by_max(delta: np.ndarray, norm_ranges: np.ndarray) -> np.ndarray:
+    delta = np.asarray(delta, dtype=np.float32)
+    ranges = np.asarray(norm_ranges, dtype=np.float32)
+    max_vals = np.abs(ranges[:, 1])
+    max_vals = np.where(max_vals > 0.0, max_vals, 1.0)
+    return (delta / max_vals[None, :]).astype(np.float32)
+
+
+def _huber(x: np.ndarray, delta: float = 1.0) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    abs_x = np.abs(x)
+    quad = 0.5 * (x * x)
+    lin = delta * (abs_x - 0.5 * delta)
+    return np.where(abs_x <= delta, quad, lin).astype(np.float32)
+
+
+def huber_potential(
+    err_rel: np.ndarray,
+    norm_ranges: np.ndarray,
+    weights: np.ndarray | Sequence[float] | None = None,
+) -> np.ndarray:
+    """Compute Huber potential Phi(s) from normalized error.
+
+    Phi(s) = -sum_i w_i * Huber(e_i), e_i = err_i / max_i
+    """
+    err = np.asarray(err_rel, dtype=np.float32)
+    n = int(err.shape[1])
+    if weights is None:
+        w = np.ones(n, dtype=np.float32) / float(n)
+    else:
+        w = np.asarray(weights, dtype=np.float32).reshape(-1)
+        s = float(w.sum())
+        w = (np.ones(n, dtype=np.float32) / float(n)) if s == 0.0 else (w / s)
+
+    err_norm = _normalize_delta_by_max(err, norm_ranges)
+    huber_val = _huber(err_norm)
+    phi = -np.sum(huber_val * w[None, :], axis=1).astype(np.float32)
+    return phi
+
+
+def intrinsic_reward_shaping_huber(
+    ego_rel_now: np.ndarray,
+    ego_rel_next: np.ndarray,
+    goal_rel: np.ndarray,
+    norm_ranges: np.ndarray,
+    coef: float,
+    weights: np.ndarray | Sequence[float] | None = None,
+    gamma: float = 1.0,
+    is_terminal: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Intrinsic reward with Huber potential shaping + terminal bonus.
+
+    Phi(s) = -sum_i w_i * Huber(e_i), e_i = delta_i / max_i
+    Shaping reward (per-step): (gamma * Phi(s_{t+1}) - Phi(s_t))
+    Terminal bonus (only for terminal): |Phi(s_{t+1})| * coef
+    """
+    ego_now = np.asarray(ego_rel_now, dtype=np.float32)
+    ego_next = np.asarray(ego_rel_next, dtype=np.float32)
+    goal = np.asarray(goal_rel, dtype=np.float32)
+
+    err_now = (ego_now - goal).astype(np.float32)
+    err_next = (ego_next - goal).astype(np.float32)
+
+    phi_now = huber_potential(err_now, norm_ranges, weights)
+    phi_next = huber_potential(err_next, norm_ranges, weights)
+
+    shaping = (float(gamma) * phi_next - phi_now)
+
+    terminal_bonus = np.zeros_like(phi_next, dtype=np.float32)
+    if float(coef) != 0.0 and is_terminal is not None:
+        term_mask = np.asarray(is_terminal, dtype=bool).reshape(-1)
+        terminal_bonus[term_mask] = phi_next[term_mask] * float(coef)
+    
+    if is_terminal.any():
+        pass
+
+    reward = shaping + terminal_bonus
+
+    reward_unweighted = (float(gamma) * phi_next - phi_now).astype(np.float32)
+    goal_err_phys = err_next.astype(np.float32)
+    return reward.astype(np.float32), goal_err_phys, reward_unweighted, terminal_bonus.astype(np.float32)
 
 
 def map_y_code_to_target_y(y_code: np.ndarray, y_current: np.ndarray, lane_center_ys: np.ndarray) -> np.ndarray:
