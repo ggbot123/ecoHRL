@@ -19,6 +19,8 @@ def main(
     env_overrides: Optional[Dict[str, Any]] = None,
     high_model_dir: Optional[str] = None,
     low_model_dir: Optional[str] = None,
+    model_suffix: Optional[str] = "final",
+    use_low_safety_layer: Optional[bool] = None,
 ):
     eval_dir = os.path.join(model_dir, "eval_results")
     os.makedirs(eval_dir, exist_ok=True)
@@ -63,9 +65,19 @@ def main(
     base_env = gym.make("multi-lane-custom-v0", render_mode="rgb_array", config=env_config)
     env = RecordVideo(base_env, video_folder=eval_dir, episode_trigger=trigger, name_prefix="hiro")
 
-    high_model, low_model = load_hiro_models(model_dir, high_model_dir=high_model_dir, low_model_dir=low_model_dir)
+    high_model, low_model = load_hiro_models(
+        model_dir,
+        high_model_dir=high_model_dir,
+        low_model_dir=low_model_dir,
+        model_suffix=model_suffix,
+    )
     hiro_cfg = get_hiro_config()
-    runner = HIROPolicyRunner(high_model, low_model, int(getattr(hiro_cfg, "high_interval", 25)))
+    runner = HIROPolicyRunner(
+        high_model,
+        low_model,
+        int(getattr(hiro_cfg, "high_interval", 25)),
+        use_low_safety_layer=use_low_safety_layer,
+    )
 
     reward_keys_high = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "punctual_reward", "on_road_reward"]
     reward_keys_low = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "on_road_reward", "intrinsic_reward"]
@@ -76,10 +88,12 @@ def main(
     log(f"Episodes           : {episodes}")
     hd = high_model_dir or model_dir
     ld = low_model_dir or model_dir
-    hp = os.path.join(hd, "hiro_high_final.zip")
-    lp = os.path.join(ld, "hiro_low_final.zip")
+    suffix = model_suffix or "final"
+    hp = os.path.join(hd, f"hiro_high_{suffix}.zip")
+    lp = os.path.join(ld, f"hiro_low_{suffix}.zip")
     log(f"HIRO high          : {hp}")
     log(f"HIRO low           : {lp}")
+    log(f"Low safety layer   : {runner.use_low_safety_layer}")
     log(f"High interval      : {runner.hi}")
     log("=" * 80)
 
@@ -255,9 +269,12 @@ if __name__ == "__main__":
     # 用法示例：
     # - model_dir: 训练产物目录（默认从该目录读取 hiro_high_final.zip / hiro_low_final.zip）
     main(
-        model_dir="./models",
-        high_model_dir="./models/hiro_0112_onlyhigh_rule_varTarV", 
-        low_model_dir="./models/hiro_260115_onlyLow_preTrainedSampling_noTrackVx_maskEgoPos", 
+        model_dir="./models/hiro_260120_joint_safetyLayer_noOpc_rewShaping",
+        # model_dir="./models",
+        # high_model_dir="./models/hiro_0112_onlyhigh_rule_varTarV", 
+        # low_model_dir="./models/hiro_260115_onlyLow_preTrainedSampling_noTrackVx_maskEgoPos", 
+        # model_suffix="step_6400000",
+        # use_low_safety_layer=True,
         episodes=10, 
         # record_episodes=[1, 2, 3],
         record_episodes=[i for i in range(1, 11)],

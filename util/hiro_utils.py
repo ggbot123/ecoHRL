@@ -21,6 +21,7 @@ def load_hiro_models(
     *,
     high_model_dir: Optional[str] = None,
     low_model_dir: Optional[str] = None,
+    model_suffix: Optional[str] = None,
 ) -> Tuple[SAC, SAC]:
     """Load HIRO high/low models.
 
@@ -33,8 +34,11 @@ def load_hiro_models(
     """
     high_dir = high_model_dir or model_dir
     low_dir = low_model_dir or model_dir
-    high_path = os.path.join(high_dir, "hiro_high_final.zip")
-    low_path = os.path.join(low_dir, "hiro_low_final.zip")
+    suffix = model_suffix or "final"
+    high_name = f"hiro_high_{suffix}"
+    low_name = f"hiro_low_{suffix}"
+    high_path = os.path.join(high_dir, f"{high_name}.zip")
+    low_path = os.path.join(low_dir, f"{low_name}.zip")
     return SAC.load(high_path), SAC.load(low_path)
 
 
