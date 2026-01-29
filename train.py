@@ -61,7 +61,18 @@ def make_env(env_overrides: dict | None = None, render_mode: str | None = None):
     return _init
 
 
-def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs: int, log_root: str = "./logs", save_root: str = "./models", run_name: str | None = None) -> None:
+def main(
+    algo: str,
+    total_timesteps: int,
+    eval_freq: int,
+    save_freq: int,
+    n_envs: int,
+    log_root: str = "./logs",
+    save_root: str = "./models",
+    run_name: str | None = None,
+    hiro_low_target_entropy: str | float = "auto",
+    hiro_low_target_entropy_scale: float | None = 0.5,
+) -> None:
     global master_rng
     set_global_seed(MASTER_SEED)
     master_rng = np.random.default_rng(MASTER_SEED)
@@ -134,7 +145,12 @@ def main(algo: str, total_timesteps: int, eval_freq: int, save_freq: int, n_envs
 
     elif algo == "hiro":
         sac_kwargs_high = get_hiro_high_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_high"), seed=MASTER_SEED)
-        sac_kwargs_low = get_hiro_low_sac_kwargs(log_dir=os.path.join(log_dir, "hiro_low"), seed=MASTER_SEED)
+        sac_kwargs_low = get_hiro_low_sac_kwargs(
+            log_dir=os.path.join(log_dir, "hiro_low"),
+            seed=MASTER_SEED,
+            target_entropy=hiro_low_target_entropy,
+            target_entropy_scale=hiro_low_target_entropy_scale,
+        )
 
         hiro_cfg: HIROConfig = get_hiro_config()
         print(f"[HIRO] Train Mode: {hiro_cfg.train_mode}, Goal Sampler: {hiro_cfg.goal_sampler.type}")
@@ -187,7 +203,13 @@ if __name__ == "__main__":
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,
-        # run_name=f"hiro_test",
-        run_name=f"hiro_260121_joint_safetyLayer_noOpc_rewShaping",
-        # run_name=f"hiro_260120_onlyLow_safetyLayer_rewShaping",
+        hiro_low_target_entropy="auto",
+        hiro_low_target_entropy_scale=1,
+        # run_name=f"hiro_test_260128_joint_noOpc_rewShaping_vmin8",
+        # run_name=f"hiro_test_260128_joint_noOpc_safetyLayer_vmin8",
+        # run_name=f"hiro_test_260128_highonly_rule_vmin8",
+        # run_name=f"hiro_test_260128_highonly_pretrained_vmin8",
+        # run_name=f"hiro_test_260129_joint_opc_blank",
+        # run_name=f"hiro_test_260129_joint_opc_vmin8",
+        run_name=f"hiro_test_260129_joint_noOpc_rewShaping_safetyLayer_vmin0",
     )

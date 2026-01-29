@@ -118,6 +118,7 @@ class HIROConfig:
     train_mode: str  # "joint", "low_only", "high_only"
     goal_sampler: GoalSamplerConfig
     low_level_type: str = "sac" # "sac" or "rule_based" or "mpc"
+    low_pretrained_path: Optional[str] = None
     mask_ego_position_in_low_obs: bool = False
     use_low_safety_layer: bool = False
 
@@ -150,6 +151,7 @@ class HIROSAC:
 
         # ---- 从env中获取的必要变量 --- #
         env_cfg = env.get_attr("config", indices=0)[0]
+        # self.v_min, self.v_max = 0.0, float(env_cfg["speed_limit"])
         self.v_min, self.v_max = 0.0, float(env_cfg["speed_limit"])
         self.dt = 1.0 / float(env_cfg["policy_frequency"])
         lanes = int(env_cfg["lanes_count"])
@@ -179,7 +181,22 @@ class HIROSAC:
         if self.low_level_type == "rule_based":
             self.low_agent = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
         elif self.low_level_type == "sac":
-            low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
+            # Resolve scaled auto target entropy for low-level SAC: -scale * action_dim.
+            low_sac_kwargs = dict(low_sac_kwargs)
+            target_entropy = low_sac_kwargs.get("target_entropy", "auto")
+            target_entropy_scale = low_sac_kwargs.pop("target_entropy_scale", None)
+            if isinstance(target_entropy, str) and target_entropy == "auto" and target_entropy_scale is not None:
+                act_dim = float(np.prod(low_act_space.shape))
+                low_sac_kwargs["target_entropy"] = float(-float(target_entropy_scale) * act_dim)
+            low_pretrained_path = getattr(self.cfg, "low_pretrained_path", None)
+            if low_pretrained_path:
+                low_sac = SAC.load(
+                    low_pretrained_path,
+                    env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs),
+                    device=self.device,
+                )
+            else:
+                low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
             self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
             if bool(getattr(self.cfg, "use_low_safety_layer", False)):
                 self.low_safety = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
@@ -433,6 +450,7 @@ class HIROSAC:
                 low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
                 if bool(getattr(self.cfg, "use_low_safety_layer", False)):
                     low_action = self.low_safety.apply_safety_layer(low_obs, goal_phys, low_action)
+                    # low_buffer_action = low_action.copy()
             else:
                 raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 

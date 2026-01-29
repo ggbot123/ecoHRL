@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Union
 
 
 def _deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> Dict[str, Any]:
@@ -170,9 +170,21 @@ def get_hiro_high_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
     return kwargs
 
 
-def get_hiro_low_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
-    """Get SAC kwargs for HiRO low-level agent."""
-    return get_sac_kwargs(log_dir, seed, level="low")
+def get_hiro_low_sac_kwargs(
+    log_dir: str,
+    seed: int,
+    target_entropy: Union[str, float] = "auto",
+    target_entropy_scale: Optional[float] = 0.5,
+) -> Dict[str, Any]:
+    """Get SAC kwargs for HiRO low-level agent.
+
+    By default, we use a scaled auto target entropy: target_entropy = -target_entropy_scale * action_dim.
+    The actual action_dim is only known inside HIRO at runtime, so the scaling is applied there.
+    """
+    kwargs = get_sac_kwargs(log_dir, seed, level="low")
+    kwargs["target_entropy"] = target_entropy
+    kwargs["target_entropy_scale"] = target_entropy_scale
+    return kwargs
 
 
 def get_hiro_config():
@@ -182,6 +194,7 @@ def get_hiro_config():
 
     # Intrinsic reward presets. (ego feature order in HIRO: x, y, vx, vy)
     ENABLE_HIRO_REWARD_SHAPING = True
+    # ENABLE_HIRO_REWARD_SHAPING = False
     if ENABLE_HIRO_REWARD_SHAPING:
         intrinsic_type = "huber_shaping"
         intrinsic_coef = 10.0
@@ -201,7 +214,8 @@ def get_hiro_config():
             [-8.0, 8.0],
             [-2.0, 2.0],
         ]
-        intrinsic_weights = [1.0, 2.0, 0.0, 1.0]
+        # intrinsic_weights = [1.0, 2.0, 0.0, 1.0]
+        intrinsic_weights = [1.0, 2.0, 8.0, 1.0]
 
     return HIROConfig(
         high_interval=25,
@@ -210,30 +224,33 @@ def get_hiro_config():
         gradient_steps_low=1,
         train_freq=1,
         device="auto",
-        # train_mode="joint",
+        train_mode="joint",
         # train_mode="high_only",
-        train_mode="low_only",
+        # train_mode="low_only",
         intrinsic_coef=intrinsic_coef,
         intrinsic_norm_ranges=intrinsic_norm_ranges,
         intrinsic_weights=intrinsic_weights,
         intrinsic_type=intrinsic_type,
-        # goal_sampler=GoalSamplerConfig(
-        #     type="uniform",
-        # ),
         goal_sampler=GoalSamplerConfig(
-            type="pretrained",
-            path="./models/hiro_0112_onlyhigh_rule_varTarV/hiro_high_final.zip",
-            device="auto",
-            deterministic=True,
+            type="uniform",
         ),
+        # goal_sampler=GoalSamplerConfig(
+        #     type="pretrained",
+        #     path="./models/hiro_0112_onlyhigh_rule_varTarV/hiro_high_final.zip",
+        #     device="auto",
+        #     deterministic=True,
+        # ),
         # goal_sampler=GoalSamplerConfig(
         #     type="fixed",
         #     action=[25.0, 0.0, 10.0],
         # ),
         low_level_type="rule_based",
+        # low_level_type="sac",
+        # low_pretrained_path="./models/hiro_260126_onlyLow_uniform_safetyLayer_rewShaping_vmin8/hiro_low_final.zip",
         use_off_policy_correction=False,
         # use_off_policy_correction=True,
         # use_low_safety_layer=False,
         use_low_safety_layer=True,
-        mask_ego_position_in_low_obs=True,
+        # mask_ego_position_in_low_obs=True,
+        mask_ego_position_in_low_obs=False,
     )
