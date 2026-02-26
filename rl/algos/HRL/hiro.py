@@ -1,6 +1,7 @@
 # rl/algos/hiro/hiro.py
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Any, Tuple, List, Optional, Callable
 
@@ -118,6 +119,7 @@ class HIROConfig:
     train_mode: str  # "joint", "low_only", "high_only"
     goal_sampler: GoalSamplerConfig
     low_level_type: str = "sac" # "sac" or "rule_based" or "mpc"
+    high_pretrained_path: Optional[str] = None
     low_pretrained_path: Optional[str] = None
     mask_ego_position_in_low_obs: bool = False
     use_low_safety_layer: bool = False
@@ -135,13 +137,8 @@ class HIROSAC:
         obs0 = env.reset()
         obs0_flat = np.asarray(obs0[0], dtype=np.float32).reshape(-1)
         keep_features = ("x", "y", "vx", "vy")  # ego 子状态中参与 HIRO goal 的特征
-        (
-            self.n_veh,
-            self.n_veh_local,
-            self.feat_dim,
-            self.feature_names,
-            self.ego_feature_idx,
-        ) = utils.init_kinematics_meta(env, obs0_flat, keep_features)
+        (self.n_veh, self.n_veh_local, self.feat_dim, self.feature_names, self.ego_feature_idx) = \
+            utils.init_kinematics_meta(env, obs0_flat, keep_features)
         self.kin_flat_dim = int(self.n_veh * self.feat_dim)
         self.local_kin_flat_dim = int(self.n_veh_local * self.feat_dim)
         self.ego_dim = len(self.ego_feature_idx)
@@ -151,7 +148,7 @@ class HIROSAC:
 
         # ---- 从env中获取的必要变量 --- #
         env_cfg = env.get_attr("config", indices=0)[0]
-        # self.v_min, self.v_max = 0.0, float(env_cfg["speed_limit"])
+        # self.v_min, self.v_max = 8.0, float(env_cfg["speed_limit"])
         self.v_min, self.v_max = 0.0, float(env_cfg["speed_limit"])
         self.dt = 1.0 / float(env_cfg["policy_frequency"])
         lanes = int(env_cfg["lanes_count"])
@@ -172,12 +169,11 @@ class HIROSAC:
         low_obs_space = gym.spaces.Box(-np.inf, np.inf, shape=(low_obs_dim,), dtype=np.float32)
         low_act_space = env.action_space
 
+        # ----- Build low-level agent ----- #
         self.train_mode = str(getattr(config, "train_mode", "joint")).lower()
         self.low_level_type = str(getattr(config, "low_level_type", "sac")).lower()
         self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", False))
         self.low_gamma = float(low_sac_kwargs.get("gamma", 0.99))
-
-        # ----- Build low-level agent ----- #
         if self.low_level_type == "rule_based":
             self.low_agent = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
         elif self.low_level_type == "sac":
@@ -190,10 +186,14 @@ class HIROSAC:
                 low_sac_kwargs["target_entropy"] = float(-float(target_entropy_scale) * act_dim)
             low_pretrained_path = getattr(self.cfg, "low_pretrained_path", None)
             if low_pretrained_path:
+                if not os.path.isfile(low_pretrained_path):
+                    raise FileNotFoundError(f"Low-level pretrained model not found: {low_pretrained_path}")
+                print(f"[HIRO] Load low-level pretrained model from: {low_pretrained_path}")
                 low_sac = SAC.load(
                     low_pretrained_path,
                     env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs),
                     device=self.device,
+                    **low_sac_kwargs,
                 )
             else:
                 low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
@@ -222,17 +222,25 @@ class HIROSAC:
             rb_kwargs["enable_off_policy_correction"] = True
             high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
 
-        high_sac = SAC(env=_make_dummy_vec_env(high_obs_space, high_act_space, 1), **high_sac_kwargs)
+        high_pretrained_path = getattr(self.cfg, "high_pretrained_path", None)
+        if high_pretrained_path:
+            if not os.path.isfile(high_pretrained_path):
+                raise FileNotFoundError(f"High-level pretrained model not found: {high_pretrained_path}")
+            print(f"[HIRO] Load high-level pretrained model from: {high_pretrained_path}")
+            high_sac = SAC.load(
+                high_pretrained_path,
+                env=_make_dummy_vec_env(high_obs_space, high_act_space, 1),
+                device=self.device,
+                **high_sac_kwargs,
+            )
+        else:
+            high_sac = SAC(env=_make_dummy_vec_env(high_obs_space, high_act_space, 1), **high_sac_kwargs)
 
         self.high_agent = SB3AgentWrapper(high_sac, config.train_freq, config.gradient_steps_high, config.batch_size)
-        # self.low_agent is set above
 
         # ----- logger ----- #
-        # Always initialize high_logger so high-level metrics are recorded even in low_only mode.
         self.high_logger = configure_logger(high_sac.verbose, high_sac_kwargs.get("tensorboard_log"), "hiro_high", True)
         self.high_agent.set_logger(self.high_logger)
-        
-        # Always initialize low_logger, even in high_only mode, because callbacks might rely on it for logging evaluation metrics
         self.low_logger = configure_logger(0, low_sac_kwargs.get("tensorboard_log"), "hiro_low", True)
         if self.low_level_type == "sac":
             self.low_agent.set_logger(self.low_logger)
@@ -282,8 +290,7 @@ class HIROSAC:
         goal_rel = (np.asarray(goal_phys, dtype=np.float32) - ego_sub).astype(np.float32)
         local_kin_flat = np.asarray(kin_flat[:, :self.local_kin_flat_dim], dtype=np.float32).copy()
 
-        # Mask ego absolute position in low_obs.
-        # Controlled via cfg, but forced OFF for rule_based and safety layer (RuleBasedAgentWrapper relies on ego x/y).
+        # Mask ego absolute position in low_obs
         mask_ego_pos = bool(getattr(self.cfg, "mask_ego_position_in_low_obs", False))
         if self.low_level_type == "rule_based" or bool(getattr(self.cfg, "use_low_safety_layer", False)):
             mask_ego_pos = False

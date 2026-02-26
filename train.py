@@ -70,6 +70,8 @@ def main(
     log_root: str = "./logs",
     save_root: str = "./models",
     run_name: str | None = None,
+    hiro_high_pretrained_path: str | None = None,
+    hiro_low_pretrained_path: str | None = None,
     hiro_low_target_entropy: str | float = "auto",
     hiro_low_target_entropy_scale: float | None = 0.5,
 ) -> None:
@@ -153,7 +155,14 @@ def main(
         )
 
         hiro_cfg: HIROConfig = get_hiro_config()
+        if hiro_high_pretrained_path:
+            hiro_cfg.high_pretrained_path = hiro_high_pretrained_path
+        if hiro_low_pretrained_path:
+            hiro_cfg.low_pretrained_path = hiro_low_pretrained_path
+
         print(f"[HIRO] Train Mode: {hiro_cfg.train_mode}, Goal Sampler: {hiro_cfg.goal_sampler.type}")
+        print(f"[HIRO] High pretrained: {hiro_cfg.high_pretrained_path}")
+        print(f"[HIRO] Low pretrained: {hiro_cfg.low_pretrained_path}")
 
         # Rule-based low-level now only depends on observations (no env object access),
         # so it is compatible with SubprocVecEnv.
@@ -203,13 +212,12 @@ if __name__ == "__main__":
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,
+        # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260224_lowonly_pretrained_finetune/hiro_low_final.zip",
         hiro_low_target_entropy="auto",
         hiro_low_target_entropy_scale=1,
-        # run_name=f"hiro_test_260128_joint_noOpc_rewShaping_vmin8",
-        # run_name=f"hiro_test_260128_joint_noOpc_safetyLayer_vmin8",
-        # run_name=f"hiro_test_260128_highonly_rule_vmin8",
-        # run_name=f"hiro_test_260128_highonly_pretrained_vmin8",
-        # run_name=f"hiro_test_260129_joint_opc_blank",
-        # run_name=f"hiro_test_260129_joint_opc_vmin8",
-        run_name=f"hiro_test_260129_joint_noOpc_rewShaping_safetyLayer_vmin0",
+        # run_name=f"hiro_260226_joint_SL_RS_smallBS+lowtrainfreq",
+        # run_name=f"hiro_260226_highonly_pretrained_finetune",
+        run_name=f"hiro_260226_lowonly_uniform_SL_RS_newIDM",
+        # run_name=f"hiro_260225_lowonly_uniform_SL_oldIntParam",
     )

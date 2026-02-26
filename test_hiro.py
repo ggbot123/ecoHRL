@@ -4,6 +4,7 @@ import scenarios.multi_lane  # 触发 __init__.py 里的 register
 
 import numpy as np
 import os
+import csv
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from util.plot_result import *
@@ -16,6 +17,7 @@ def main(
     model_dir: str,
     episodes: int,
     record_episodes: Optional[Sequence[int]] = None,
+    record_trajectory_episodes: Optional[Sequence[int]] = None,
     env_overrides: Optional[Dict[str, Any]] = None,
     high_model_dir: Optional[str] = None,
     low_model_dir: Optional[str] = None,
@@ -61,6 +63,10 @@ def main(
     else:
         record_set = {int(ep_idx) - 1 for ep_idx in record_episodes}
         def trigger(ep_id: int) -> bool: return ep_id in record_set
+
+    trajectory_record_set = set()
+    if record_trajectory_episodes:
+        trajectory_record_set = {int(ep_idx) for ep_idx in record_trajectory_episodes}
 
     base_env = gym.make("multi-lane-custom-v0", render_mode="rgb_array", config=env_config)
     env = RecordVideo(base_env, video_folder=eval_dir, episode_trigger=trigger, name_prefix="hiro")
@@ -112,6 +118,8 @@ def main(
     for ep in range(1, int(episodes) + 1):
         obs, _ = env.reset(seed=seed_base + ep)
         runner.reset(env, obs, float(getattr(hiro_cfg, "intrinsic_coef", 1.0)))
+        should_record_trajectory = ep in trajectory_record_set
+        trajectory_rows: list[Dict[str, Any]] = []
 
         terminated, truncated, steps = False, False, 0
         high_ret, low_ext_ret, low_int_ret, low_total_ret = 0.0, 0.0, 0.0, 0.0
@@ -147,6 +155,7 @@ def main(
                 # k = 1: save every interval
                 save_goal_snapshot(env, runner, ep, steps, model_dir, prev_goal_phys=prev_goal_phys, intrinsic_reward=last_intrinsic_viz)
 
+            state_now = np.asarray(obs, dtype=np.float32).reshape(-1)
             obs_next, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
 
@@ -159,6 +168,31 @@ def main(
             
             if last_step:
                 last_intrinsic_viz = intrinsic
+                if ep == 4 and steps > 270:
+                    pass
+
+            if should_record_trajectory:
+                action_before_safety = np.asarray(getattr(runner, "last_action_pre_safety", action), dtype=np.float32).reshape(-1)
+                action_after_safety = np.asarray(getattr(runner, "last_action_post_safety", action), dtype=np.float32).reshape(-1)
+                row: Dict[str, Any] = {
+                    "episode": int(ep),
+                    "step": int(steps),
+                    "done": int(done),
+                    "terminated": int(terminated),
+                    "truncated": int(truncated),
+                    "reward": float(reward),
+                    "punctual_reward": float(punctual),
+                    "low_ext_reward": float(low_ext),
+                    "intrinsic_reward": float(intrinsic),
+                    "low_total_step_reward": float(low_ext + intrinsic),
+                }
+                for i, v in enumerate(state_now):
+                    row[f"state_{i}"] = float(v)
+                for i, v in enumerate(action_before_safety):
+                    row[f"action_pre_safety_{i}"] = float(v)
+                for i, v in enumerate(action_after_safety):
+                    row[f"action_post_safety_{i}"] = float(v)
+                trajectory_rows.append(row)
 
             high_ret += float(reward)
             low_ext_ret += low_ext
@@ -235,6 +269,16 @@ def main(
             log(f"  ARRIVED at t = {float(arrival_time):.3f} s")
         if base_env.config.get("show_trajectories", False):
             save_speed_acc_curves(env, ep_idx=ep, model_path=model_dir)
+        if should_record_trajectory:
+            csv_path = os.path.join(eval_dir, f"hiro_ep_{ep:04d}_trajectory.csv")
+            if trajectory_rows:
+                with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
+                    writer = csv.DictWriter(csv_file, fieldnames=list(trajectory_rows[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(trajectory_rows)
+                log(f"  saved trajectory csv    : {csv_path}")
+            else:
+                log(f"  saved trajectory csv    : skipped (episode {ep} has no trajectory rows)")
 
     n = int(episodes)
     log("=" * 80)
@@ -269,13 +313,16 @@ if __name__ == "__main__":
     # 用法示例：
     # - model_dir: 训练产物目录（默认从该目录读取 hiro_high_final.zip / hiro_low_final.zip）
     main(
-        model_dir="./models/hiro_260120_joint_safetyLayer_noOpc_rewShaping",
-        # model_dir="./models",
-        # high_model_dir="./models/hiro_0112_onlyhigh_rule_varTarV", 
-        # low_model_dir="./models/hiro_260115_onlyLow_preTrainedSampling_noTrackVx_maskEgoPos", 
+        # model_dir="./models/hiro_260120_joint_safetyLayer_noOpc_rewShaping",
+        model_dir="./models",
+        # high_model_dir="./models/hiro_test_260128_highonly_rule_vmin8", 
+        high_model_dir="./models/hiro_test_260211_highonly_pretrained_vmin0", 
+        # low_model_dir="./models/hiro_260224_lowonly_pretrained_finetune", 
+        low_model_dir="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping", 
         # model_suffix="step_6400000",
-        # use_low_safety_layer=True,
+        use_low_safety_layer=True,
         episodes=10, 
         # record_episodes=[1, 2, 3],
         record_episodes=[i for i in range(1, 11)],
+        record_trajectory_episodes=[4],
     )
