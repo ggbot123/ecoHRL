@@ -407,7 +407,6 @@ class MultiLaneEnv(AbstractEnv):
 
         # 初始化奖励相关的历史量
         self._last_speed = ego_speed
-        self._last_lane_id = lane_id
         self._last_longitudinal = longi0
         self._has_arrived = False
         self._arrival_time = None

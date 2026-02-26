@@ -34,6 +34,8 @@ class HIROPolicyRunner:
         self.idx_vx = 2
         self.idx_vy = 3
         self.safety_controller: Optional[RuleBasedController] = None
+        self.last_action_pre_safety = np.zeros(0, dtype=np.float32)
+        self.last_action_post_safety = np.zeros(0, dtype=np.float32)
 
     def init_from_env(self, env, obs0: np.ndarray, intrinsic_coef: float):
         keep = ("x", "y", "vx", "vy")
@@ -130,6 +132,8 @@ class HIROPolicyRunner:
         if self.low_model is None:
             # Some evaluation scripts call runner.act() only to update self.goal_phys.
             # In that case, allow low_model to be absent and return a dummy action.
+            self.last_action_pre_safety = np.zeros(0, dtype=np.float32)
+            self.last_action_post_safety = np.zeros(0, dtype=np.float32)
             return np.zeros(0, dtype=np.float32)
 
         ego_sub = self._ego_sub(kin)
@@ -149,6 +153,7 @@ class HIROPolicyRunner:
         
         action, _ = self.low_model.predict(low_obs, deterministic=True)
         action = np.asarray(action, dtype=np.float32)
+        self.last_action_pre_safety = action.copy()
 
         if self.use_low_safety_layer and self.safety_controller is not None:
             ego_abs, others_rel = self._extract_ego_others(kin)
@@ -161,6 +166,7 @@ class HIROPolicyRunner:
                 self.dt,
                 remaining_time=rem_time,
             )
+        self.last_action_post_safety = np.asarray(action, dtype=np.float32).copy()
         return np.asarray(action, dtype=np.float32)
 
     def intrinsic_if_last(self, obs_next: np.ndarray) -> float:

@@ -135,21 +135,52 @@ def get_ppo_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
 
 
 def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, Any]:
-    sac_kwargs = dict(
-        policy="MlpPolicy",
-        verbose=0,
-        tensorboard_log=log_dir,
-        seed=seed,
-        buffer_size=1_000_000,
-        batch_size=256,
-        gamma=0.99,
-        tau=0.005,
-        learning_rate=3e-4,
-        train_freq=(1, "step"),
-        gradient_steps=1,
-    )
-    if level == "low":
-        sac_kwargs["verbose"] = 0
+    if level == "high":
+        sac_kwargs = dict(
+            policy="MlpPolicy",
+            verbose=0,
+            tensorboard_log=log_dir,
+            seed=seed,
+            # buffer_size=100_000,
+            buffer_size=1_000_000,
+            batch_size=256,
+            gamma=0.99,
+            tau=0.005,
+            learning_rate=3e-4,
+            # learning_rate=1e-4,
+            train_freq=(1, "step"),
+            # train_freq=(4, "step"),
+            gradient_steps=1,
+        )
+    elif level == "low":
+        sac_kwargs = dict(
+            policy="MlpPolicy",
+            verbose=0,
+            tensorboard_log=log_dir,
+            seed=seed,
+            # buffer_size=100_000,
+            buffer_size=1_000_000,
+            batch_size=256,
+            gamma=0.99,
+            tau=0.005,
+            learning_rate=3e-4,
+            train_freq=(1, "step"),
+            gradient_steps=1,
+        )
+    else:
+        sac_kwargs = dict(
+            policy="MlpPolicy",
+            verbose=0,
+            tensorboard_log=log_dir,
+            seed=seed,
+            buffer_size=1_000_000,
+            batch_size=256,
+            gamma=0.99,
+            tau=0.005,
+            learning_rate=3e-4,
+            train_freq=(1, "step"),
+            gradient_steps=1,
+        )
     return sac_kwargs
 
 
@@ -204,10 +235,12 @@ def get_hiro_config():
             [-10.0, 10.0],
             [-2.0, 2.0],
         ]
-        intrinsic_weights = [1.0, 1.0, 0.0, 0.5]
+        intrinsic_weights = [1.0, 1.0, 0.0, 0.2]
+        # intrinsic_weights = [1.0, 1.0, 0.0, 0.1]
     else:
         intrinsic_type = "l2"
-        intrinsic_coef = 8.0
+        intrinsic_coef = 10.0
+        # intrinsic_coef = 8.0
         intrinsic_norm_ranges = [
             [0.0, 37.5],
             [-8.0, 8.0],
@@ -215,7 +248,8 @@ def get_hiro_config():
             [-2.0, 2.0],
         ]
         # intrinsic_weights = [1.0, 2.0, 0.0, 1.0]
-        intrinsic_weights = [1.0, 2.0, 8.0, 1.0]
+        intrinsic_weights = [1.0, 2.0, 0.0, 0.3]
+        # intrinsic_weights = [1.0, 2.0, 8.0, 1.0]
 
     return HIROConfig(
         high_interval=25,
@@ -224,33 +258,39 @@ def get_hiro_config():
         gradient_steps_low=1,
         train_freq=1,
         device="auto",
-        train_mode="joint",
+
+        # train_mode="joint",
         # train_mode="high_only",
-        # train_mode="low_only",
+        train_mode="low_only",
+
         intrinsic_coef=intrinsic_coef,
         intrinsic_norm_ranges=intrinsic_norm_ranges,
         intrinsic_weights=intrinsic_weights,
         intrinsic_type=intrinsic_type,
+
         goal_sampler=GoalSamplerConfig(
             type="uniform",
         ),
         # goal_sampler=GoalSamplerConfig(
         #     type="pretrained",
-        #     path="./models/hiro_0112_onlyhigh_rule_varTarV/hiro_high_final.zip",
+        #     path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
         #     device="auto",
-        #     deterministic=True,
+        #     deterministic=False,
         # ),
         # goal_sampler=GoalSamplerConfig(
         #     type="fixed",
         #     action=[25.0, 0.0, 10.0],
         # ),
-        low_level_type="rule_based",
-        # low_level_type="sac",
-        # low_pretrained_path="./models/hiro_260126_onlyLow_uniform_safetyLayer_rewShaping_vmin8/hiro_low_final.zip",
-        use_off_policy_correction=False,
+
+        # low_level_type="rule_based",
+        low_level_type="sac",
+
         # use_off_policy_correction=True,
-        # use_low_safety_layer=False,
+        use_off_policy_correction=False,
+
         use_low_safety_layer=True,
+        # use_low_safety_layer=False,
+
         # mask_ego_position_in_low_obs=True,
         mask_ego_position_in_low_obs=False,
     )
