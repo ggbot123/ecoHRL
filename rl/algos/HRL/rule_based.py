@@ -285,12 +285,14 @@ class RuleBasedController:
         goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
         goal_x = float(goal_phys[0])
         goal_vx = float(goal_phys[2])
-        if remaining_time is not None:
-            rt = max(float(remaining_time), float(dt))
-            target_speed = max((goal_x - ego_x) / rt, 0.0)
-        else:
-            target_speed = abs(goal_vx)
-        target_speed = float(np.clip(target_speed, 0.0, self.speed_limit))
+
+        # if remaining_time is not None:
+        #     rt = max(float(remaining_time), float(dt))
+        #     target_speed = max((goal_x - ego_x) / rt, 0.0)
+        # else:
+        #     target_speed = abs(goal_vx)
+        # target_speed = float(np.clip(target_speed, 0.0, self.speed_limit))
+        target_speed = float(self.speed_limit)
 
         # Build other vehicles in absolute frame
         others: List[VirtualVehicle] = []
