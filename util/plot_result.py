@@ -2,7 +2,361 @@ import os
 import shutil
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib.transforms as transforms
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 import numpy as np
+
+
+def save_low_step_snapshot(
+    env,
+    runner,
+    step: int,
+    out_dir: str,
+    goal_phys: np.ndarray,
+    reward_sums: dict[str, float] | None = None,
+    title_suffix: str = "",
+):
+    base_env = env.unwrapped
+    road = base_env.road
+    ego = base_env.vehicle
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    p_dist = getattr(base_env, "PERCEPTION_DISTANCE", 200.0)
+    if p_dist is None:
+        p_dist = 200.0
+    p_dist = float(p_dist)
+
+    all_draw_vehs = list(road.vehicles)
+
+    fig, ax = plt.subplots(figsize=(15, 3))
+
+    lanes = road.network.lanes_list()
+    ys = []
+    for lane in lanes:
+        x0, y0 = lane.start
+        x1, y1 = lane.end
+        w = lane.width
+        heading = lane.heading_at(0)
+        c, s = np.cos(heading), np.sin(heading)
+        normal = np.array([-s, c])
+
+        p0 = lane.start - normal * w / 2
+        p1 = lane.start + normal * w / 2
+        p2 = lane.end + normal * w / 2
+        p3 = lane.end - normal * w / 2
+        poly = patches.Polygon([p0, p1, p2, p3], closed=True, facecolor="#666666", edgecolor="none", zorder=0)
+        ax.add_patch(poly)
+
+        types = [str(t) for t in lane.line_types]
+
+        def _draw_line(pa, pb, ltype):
+            if "NONE" in ltype:
+                return
+            style = "solid" if "CONTINUOUS" in ltype else "dashed"
+            ax.plot([pa[0], pb[0]], [pa[1], pb[1]], color="white", linestyle=style, linewidth=1, zorder=1)
+
+        _draw_line(p0, p3, types[0])
+        _draw_line(p1, p2, types[1])
+
+        ys.append(y0)
+        ys.append(y1)
+
+    speed_limit = float(base_env.config.get("speed_limit", 30.0))
+    norm = mcolors.Normalize(vmin=0.0, vmax=speed_limit)
+    cmap = cm.get_cmap("jet")
+
+    for v in all_draw_vehs:
+        hist = list(reversed(getattr(v, "history", [])))
+        if len(hist) >= 2:
+            traj = np.array([h.position for h in hist], dtype=float)
+            if v is ego:
+                ax.plot(traj[:, 0], traj[:, 1], color="red", linewidth=1.2, alpha=0.9, zorder=3)
+            else:
+                ax.plot(traj[:, 0], traj[:, 1], color="#A0A0A0", linewidth=0.8, alpha=0.6, zorder=2)
+
+        edge_c = "black"
+        lw = 1
+        z = 5
+        alpha_v = 0.9
+
+        if v is ego:
+            color = cmap(norm(v.speed))
+            edge_c = "red"
+            z = 6
+        else:
+            color = cmap(norm(v.speed))
+
+        l, w = v.LENGTH, v.WIDTH
+        rect = patches.Rectangle((-l / 2, -w / 2), l, w, facecolor=color, edgecolor=edge_c, linewidth=lw, alpha=alpha_v, zorder=z)
+        t = transforms.Affine2D().rotate(v.heading).translate(v.position[0], v.position[1]) + ax.transData
+        rect.set_transform(t)
+        ax.add_patch(rect)
+
+    gx, gy, gvx, gvy = [float(x) for x in goal_phys[:4]]
+    goal_color = cmap(norm(gvx))
+    ax.scatter([gx], [gy], c=[goal_color], marker="o", s=50, linewidth=1.5, edgecolors="white", zorder=10)
+
+    dx = float(gx - ego.position[0])
+    dy = float(gy - ego.position[1])
+    ego_vx, ego_vy = [float(v) for v in ego.velocity]
+    info_text = (
+        f"Δx={dx:.2f} m, Δy={dy:.2f} m\n"
+        f"ego vx={ego_vx:.2f} m/s, vy={ego_vy:.2f} m/s"
+    )
+    if reward_sums:
+        reward_lines = ["cum rewards:"]
+        for k, v in reward_sums.items():
+            reward_lines.append(f"{k}: {v:.4f}")
+        info_text = info_text + "\n" + "\n".join(reward_lines)
+    ax.text(
+        0.01,
+        0.01,
+        info_text,
+        transform=ax.transAxes,
+        fontsize=10,
+        color="white",
+        bbox=dict(facecolor="black", alpha=0.6, pad=3, edgecolor="none"),
+        ha="left",
+        va="bottom",
+        zorder=20,
+    )
+
+    x_min = ego.position[0] - p_dist
+    x_max = ego.position[0] + p_dist
+    ax.set_xlim(x_min, x_max)
+
+    if ys:
+        mean_y = np.mean(ys)
+        ax.set_ylim(mean_y - 12, mean_y + 12)
+    else:
+        ax.set_ylim(-10, 10)
+
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, aspect=30, shrink=0.8, pad=0.02)
+    cbar.set_label("Speed [m/s]", fontsize=10)
+
+    title = f"Step {step}" + (f" | {title_suffix}" if title_suffix else "")
+    plt.title(title)
+
+    save_path = os.path.join(out_dir, f"step{step:05d}.png")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", pad_inches=0.1)
+    plt.close()
+
+
+def save_goal_candidates_snapshot(
+    env,
+    step: int,
+    out_dir: str,
+    goals_phys: np.ndarray,
+    scores: np.ndarray,
+    title_suffix: str = "goal candidates",
+):
+    base_env = env.unwrapped
+    road = base_env.road
+    ego = base_env.vehicle
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    p_dist = getattr(base_env, "PERCEPTION_DISTANCE", 200.0)
+    if p_dist is None:
+        p_dist = 200.0
+    p_dist = float(p_dist)
+
+    all_draw_vehs = list(road.vehicles)
+
+    fig, ax = plt.subplots(figsize=(15, 3))
+
+    lanes = road.network.lanes_list()
+    ys = []
+    for lane in lanes:
+        x0, y0 = lane.start
+        x1, y1 = lane.end
+        w = lane.width
+        heading = lane.heading_at(0)
+        c, s = np.cos(heading), np.sin(heading)
+        normal = np.array([-s, c])
+
+        p0 = lane.start - normal * w / 2
+        p1 = lane.start + normal * w / 2
+        p2 = lane.end + normal * w / 2
+        p3 = lane.end - normal * w / 2
+        poly = patches.Polygon([p0, p1, p2, p3], closed=True, facecolor="#666666", edgecolor="none", zorder=0)
+        ax.add_patch(poly)
+
+        types = [str(t) for t in lane.line_types]
+
+        def _draw_line(pa, pb, ltype):
+            if "NONE" in ltype:
+                return
+            style = "solid" if "CONTINUOUS" in ltype else "dashed"
+            ax.plot([pa[0], pb[0]], [pa[1], pb[1]], color="white", linestyle=style, linewidth=1, zorder=1)
+
+        _draw_line(p0, p3, types[0])
+        _draw_line(p1, p2, types[1])
+
+        ys.append(y0)
+        ys.append(y1)
+
+    speed_limit = float(base_env.config.get("speed_limit", 30.0))
+    norm = mcolors.Normalize(vmin=0.0, vmax=speed_limit)
+    cmap = cm.get_cmap("jet")
+
+    for v in all_draw_vehs:
+        edge_c = "black"
+        lw = 1
+        z = 5
+        alpha_v = 0.9
+
+        if v is ego:
+            color = cmap(norm(v.speed))
+            edge_c = "red"
+            z = 6
+        else:
+            color = cmap(norm(v.speed))
+
+        l, w = v.LENGTH, v.WIDTH
+        rect = patches.Rectangle((-l / 2, -w / 2), l, w, facecolor=color, edgecolor=edge_c, linewidth=lw, alpha=alpha_v, zorder=z)
+        t = transforms.Affine2D().rotate(v.heading).translate(v.position[0], v.position[1]) + ax.transData
+        rect.set_transform(t)
+        ax.add_patch(rect)
+
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    goals_phys = np.asarray(goals_phys, dtype=np.float32).reshape(-1, 4)
+    if goals_phys.size > 0:
+        s_min = float(np.min(scores))
+        s_max = float(np.max(scores))
+        denom = (s_max - s_min) if s_max > s_min else 1.0
+        s_norm = (scores - s_min) / denom
+        score_cmap = cm.get_cmap("viridis")
+
+        order = np.argsort(scores)
+        for idx in order:
+            gx, gy = goals_phys[idx, 0], goals_phys[idx, 1]
+            color = score_cmap(float(s_norm[idx]))
+            ax.scatter([gx], [gy], c=[color], marker="o", s=45, linewidth=0.5, edgecolors="white", zorder=9)
+
+        sm = cm.ScalarMappable(cmap=score_cmap, norm=mcolors.Normalize(vmin=s_min, vmax=s_max))
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax, aspect=30, shrink=0.8, pad=0.02)
+        cbar.set_label("Goal score", fontsize=10)
+
+    x_min = ego.position[0] - p_dist
+    x_max = ego.position[0] + p_dist
+    ax.set_xlim(x_min, x_max)
+
+    if ys:
+        mean_y = np.mean(ys)
+        ax.set_ylim(mean_y - 12, mean_y + 12)
+    else:
+        ax.set_ylim(-10, 10)
+
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    title = f"Step {step} | {title_suffix}"
+    plt.title(title)
+
+    save_path = os.path.join(out_dir, f"step{step:05d}_goal_candidates.png")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", pad_inches=0.1)
+    plt.close()
+
+
+def save_goal_metric_summary(
+    env,
+    goals_phys: list[np.ndarray],
+    metrics: list[float],
+    out_path: str,
+    metric_name: str,
+):
+    base_env = env.unwrapped
+    road = base_env.road
+
+    if not goals_phys:
+        return
+
+    fig, ax = plt.subplots(figsize=(15, 3))
+
+    lanes = road.network.lanes_list()
+    ys = []
+    for lane in lanes:
+        x0, y0 = lane.start
+        x1, y1 = lane.end
+        w = lane.width
+        heading = lane.heading_at(0)
+        c, s = np.cos(heading), np.sin(heading)
+        normal = np.array([-s, c])
+
+        p0 = lane.start - normal * w / 2
+        p1 = lane.start + normal * w / 2
+        p2 = lane.end + normal * w / 2
+        p3 = lane.end - normal * w / 2
+        poly = patches.Polygon([p0, p1, p2, p3], closed=True, facecolor="#666666", edgecolor="none", zorder=0)
+        ax.add_patch(poly)
+
+        types = [str(t) for t in lane.line_types]
+
+        def _draw_line(pa, pb, ltype):
+            if "NONE" in ltype:
+                return
+            style = "solid" if "CONTINUOUS" in ltype else "dashed"
+            ax.plot([pa[0], pb[0]], [pa[1], pb[1]], color="white", linestyle=style, linewidth=1, zorder=1)
+
+        _draw_line(p0, p3, types[0])
+        _draw_line(p1, p2, types[1])
+
+        ys.append(y0)
+        ys.append(y1)
+
+    goals_arr = np.asarray(goals_phys, dtype=np.float32).reshape(-1, 4)
+    xs = goals_arr[:, 0]
+    ys_goal = goals_arr[:, 1]
+    metrics_arr = np.asarray(metrics, dtype=np.float32).reshape(-1)
+    if metrics_arr.size == 0:
+        return
+
+    vmin = float(np.min(metrics_arr))
+    vmax = float(np.max(metrics_arr))
+    if abs(vmax - vmin) < 1e-6:
+        vmax = vmin + 1e-6
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = cm.get_cmap("viridis")
+
+    ax.scatter(xs, ys_goal, c=metrics_arr, cmap=cmap, norm=norm, s=60, edgecolors="white", linewidths=0.8, zorder=5)
+
+    x_min = 0.0
+    x_max = float(base_env.config.get("road_length", 500.0))
+    ax.set_xlim(x_min, x_max)
+
+    if ys:
+        mean_y = np.mean(ys)
+        ax.set_ylim(mean_y - 12, mean_y + 12)
+    else:
+        ax.set_ylim(-10, 10)
+
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, aspect=30, shrink=0.8, pad=0.02)
+    cbar.set_label(metric_name, fontsize=10)
+
+    plt.title(f"Goal metric summary: {metric_name}")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.1)
+    plt.close()
 
 def plot_ego_speed_history(env):
     ego = env.unwrapped.vehicle          # ego 车对象
