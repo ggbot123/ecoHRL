@@ -151,7 +151,7 @@ def intrinsic_reward_shaping_huber(
 
     Phi(s) = -sum_i w_i * Huber(e_i), e_i = delta_i / max_i
     Shaping reward (per-step): (gamma * Phi(s_{t+1}) - Phi(s_t))
-    Terminal bonus (only for terminal): |Phi(s_{t+1})| * coef
+    Terminal bonus (only for terminal): Phi(s_{t+1}) * coef
     """
     ego_now = np.asarray(ego_rel_now, dtype=np.float32)
     ego_next = np.asarray(ego_rel_next, dtype=np.float32)

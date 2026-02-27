@@ -1,4 +1,5 @@
 import os
+import csv
 from typing import Any, Dict, List, Optional, Sequence
 
 import gymnasium as gym
@@ -135,6 +136,8 @@ def main(
     uniform_out_dir: Optional[str] = None,
     uniform_metric_name: str = "intrinsic_reward",
     uniform_metric_fn=None,
+    record_interval_csv: bool = False,
+    record_interval_index: int = 1,
 ):
     if batch_cases_csv:
         cases = load_test_cases_from_csv(batch_cases_csv)
@@ -226,6 +229,12 @@ def main(
         save_low_step_snapshot(env, runner, 0, out_dir, goal_phys_arr, title_suffix="init")
 
     obs = obs0
+    trajectory_rows: List[Dict[str, Any]] = []
+    interval_len = max(int(runner.hi), 1)
+    selected_interval_idx = max(int(record_interval_index), 1)
+    selected_start_step = (selected_interval_idx - 1) * interval_len + 1
+    selected_end_step = selected_interval_idx * interval_len
+
     reward_keys_low = [
         "collision_reward",
         "progress_reward",
@@ -239,10 +248,13 @@ def main(
         runner.goal_phys = goal_phys_arr.copy()
         runner.need_high = False
 
+        state_now = np.asarray(obs, dtype=np.float32).reshape(-1)
         action = runner.act(env, obs)
-        obs_next, _, terminated, truncated, info = env.step(action)
+        obs_next, reward, terminated, truncated, info = env.step(action)
 
         rc = info.get("reward_components", {}) if isinstance(info, dict) else {}
+        punctual = float(rc.get("punctual_reward", 0.0))
+        low_ext = float(reward) - punctual
         for k in reward_keys_low:
             if k == "intrinsic_reward":
                 continue
@@ -251,6 +263,30 @@ def main(
         last_step = bool(runner.c == runner.hi - 1)
         intrinsic = runner.intrinsic_if_last(obs_next) if last_step else 0.0
         reward_sums["intrinsic_reward"] += float(intrinsic)
+
+        if record_interval_csv and selected_start_step <= int(step) <= selected_end_step:
+            action_before_safety = np.asarray(getattr(runner, "last_action_pre_safety", action), dtype=np.float32).reshape(-1)
+            action_after_safety = np.asarray(getattr(runner, "last_action_post_safety", action), dtype=np.float32).reshape(-1)
+            row: Dict[str, Any] = {
+                "step": int(step),
+                "interval_index": int(selected_interval_idx),
+                "step_in_interval": int(((step - 1) % interval_len) + 1),
+                "done": int(bool(terminated or truncated)),
+                "terminated": int(terminated),
+                "truncated": int(truncated),
+                "reward": float(reward),
+                "punctual_reward": float(punctual),
+                "low_ext_reward": float(low_ext),
+                "intrinsic_reward": float(intrinsic),
+                "low_total_step_reward": float(low_ext + intrinsic),
+            }
+            for i, v in enumerate(state_now):
+                row[f"state_{i}"] = float(v)
+            for i, v in enumerate(action_before_safety):
+                row[f"action_pre_safety_{i}"] = float(v)
+            for i, v in enumerate(action_after_safety):
+                row[f"action_post_safety_{i}"] = float(v)
+            trajectory_rows.append(row)
 
         save_low_step_snapshot(env, runner, step, out_dir, goal_phys_arr, reward_sums=reward_sums)
 
@@ -276,6 +312,20 @@ def main(
             metric_name=uniform_metric_name,
         )
 
+    if record_interval_csv:
+        csv_path = os.path.join(out_dir, f"low_interval_{selected_interval_idx:03d}_trajectory.csv")
+        if trajectory_rows:
+            with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=list(trajectory_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(trajectory_rows)
+            print(f"Saved interval trajectory csv: {csv_path}")
+        else:
+            print(
+                "Saved interval trajectory csv: skipped "
+                f"(interval={selected_interval_idx}, steps={steps}, hi={interval_len})"
+            )
+
     env.close()
     print(f"Saved {steps + (1 if save_initial else 0)} frames to: {out_dir}")
 
@@ -291,8 +341,8 @@ if __name__ == "__main__":
     #    - 可选 case_id 列作为输出目录名）
 
     main(
-        low_model_path="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping/hiro_low_final.zip",
-        # low_model_path="./models/hiro_260224_lowonly_pretrained_finetune/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping/hiro_low_final.zip",
+        low_model_path="./models/hiro_260226_lowonly_uniform_SL_RS_newIDM/hiro_low_final.zip",
         steps=25,
         ego_state=[0.0, 4.0, 10.0, 0.0],
         neighbors_state=[
@@ -306,6 +356,8 @@ if __name__ == "__main__":
         use_low_safety_layer=True,
         out_dir="./models/debug/low_level_rollout",
         uniform_trials=0,
+        record_interval_csv=True,
+        record_interval_index=1,
         # uniform_trials=1000,
         # uniform_out_dir="./models/debug/low_level_rollout/0225/uniform_goal_trials",
         # uniform_metric_name="abs_dy",

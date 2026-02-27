@@ -68,6 +68,8 @@ def train_hiro(
     # Set seed for high-level replay buffer if it exists (for OPC noise reproducibility)
     if hasattr(model.high_agent.replay_buffer, "set_seed"):
         model.high_agent.replay_buffer.set_seed(seed)
+    if hasattr(model.low_agent, "replay_buffer") and hasattr(model.low_agent.replay_buffer, "set_seed"):
+        model.low_agent.replay_buffer.set_seed(seed)
 
     n_envs = int(env.num_envs)
 

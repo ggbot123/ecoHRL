@@ -9,9 +9,11 @@ import gymnasium as gym
 import numpy as np
 
 from rl.algos.sac.sac import SAC
+from rl.algos.sac.safety_sac import SafetyLayerSAC
 from rl.utils import utils
 from rl.algos.HRL.rule_based import RuleBasedAgentWrapper
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig
+from rl.algos.HRL.low_her_buffer import HiROLowHERReplayBuffer
 from stable_baselines3.common.utils import get_device, configure_logger
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -119,6 +121,10 @@ class HIROConfig:
     train_mode: str  # "joint", "low_only", "high_only"
     goal_sampler: GoalSamplerConfig
     low_level_type: str = "sac" # "sac" or "rule_based" or "mpc"
+    low_sac_impl: str = "auto" # "auto" | "sac" | "safety_sac"
+    low_use_her: bool = False
+    low_her_ratio: float = 0.8
+    low_her_strategy: str = "future"  # "future" | "final"
     high_pretrained_path: Optional[str] = None
     low_pretrained_path: Optional[str] = None
     mask_ego_position_in_low_obs: bool = False
@@ -172,13 +178,49 @@ class HIROSAC:
         # ----- Build low-level agent ----- #
         self.train_mode = str(getattr(config, "train_mode", "joint")).lower()
         self.low_level_type = str(getattr(config, "low_level_type", "sac")).lower()
+        self.low_sac_impl = str(getattr(config, "low_sac_impl", "auto")).lower()
+        self.low_use_her = bool(getattr(self.cfg, "low_use_her", False))
         self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", False))
         self.low_gamma = float(low_sac_kwargs.get("gamma", 0.99))
         if self.low_level_type == "rule_based":
             self.low_agent = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
         elif self.low_level_type == "sac":
+            if self.low_sac_impl not in {"auto", "sac", "safety_sac"}:
+                raise ValueError(f"Unknown low_sac_impl: {self.low_sac_impl}")
+
+            use_low_safety_layer = bool(getattr(self.cfg, "use_low_safety_layer", False))
+            use_safety_sac = use_low_safety_layer if self.low_sac_impl == "auto" else (self.low_sac_impl == "safety_sac")
+            if use_safety_sac and not use_low_safety_layer:
+                raise ValueError("low_sac_impl='safety_sac' requires use_low_safety_layer=True")
+
+            low_sac_cls = SafetyLayerSAC if use_safety_sac else SAC
+
             # Resolve scaled auto target entropy for low-level SAC: -scale * action_dim.
             low_sac_kwargs = dict(low_sac_kwargs)
+
+            use_low_her = bool(self.low_use_her)
+            if use_low_her:
+                rb_kwargs_low = dict(low_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
+                rb_kwargs_low.update(
+                    dict(
+                        feat_dim=int(self.feat_dim),
+                        kin_flat_dim=int(self.local_kin_flat_dim),
+                        ego_feature_idx=list(self.ego_feature_idx),
+                        intrinsic_coef=float(self.cfg.intrinsic_coef),
+                        intrinsic_norm_ranges=np.asarray(self.cfg.intrinsic_norm_ranges, dtype=np.float32),
+                        intrinsic_weights=None
+                        if getattr(self.cfg, "intrinsic_weights", None) is None
+                        else np.asarray(self.cfg.intrinsic_weights, dtype=np.float32),
+                        intrinsic_type=str(getattr(self.cfg, "intrinsic_type", "l2")),
+                        low_gamma=float(self.low_gamma),
+                        her_ratio=float(getattr(self.cfg, "low_her_ratio", 0.8)),
+                        her_strategy=str(getattr(self.cfg, "low_her_strategy", "future")),
+                        enable_her=True,
+                    )
+                )
+                low_sac_kwargs["replay_buffer_class"] = HiROLowHERReplayBuffer
+                low_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs_low
+
             target_entropy = low_sac_kwargs.get("target_entropy", "auto")
             target_entropy_scale = low_sac_kwargs.pop("target_entropy_scale", None)
             if isinstance(target_entropy, str) and target_entropy == "auto" and target_entropy_scale is not None:
@@ -189,17 +231,19 @@ class HIROSAC:
                 if not os.path.isfile(low_pretrained_path):
                     raise FileNotFoundError(f"Low-level pretrained model not found: {low_pretrained_path}")
                 print(f"[HIRO] Load low-level pretrained model from: {low_pretrained_path}")
-                low_sac = SAC.load(
+                low_sac = low_sac_cls.load(
                     low_pretrained_path,
                     env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs),
                     device=self.device,
                     **low_sac_kwargs,
                 )
             else:
-                low_sac = SAC(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
+                low_sac = low_sac_cls(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
             self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
-            if bool(getattr(self.cfg, "use_low_safety_layer", False)):
+            if use_low_safety_layer:
                 self.low_safety = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
+                if use_safety_sac:
+                    low_sac.target_action_filter = self._low_target_action_filter
         else:
             raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
@@ -301,6 +345,28 @@ class HIROSAC:
             local_kin_flat[:, idx_y] = 0.0
         return np.concatenate([t_norm, np.asarray(local_kin_flat, dtype=np.float32), goal_rel], axis=1)
 
+    def _low_target_action_filter(self, low_obs: np.ndarray, action: np.ndarray) -> np.ndarray:
+        """
+        Safety-filter next actions for low-level SAC target-Q.
+
+        low_obs format: [t_norm, local_kin_flat, goal_rel].
+        Reconstruct goal_phys = ego_sub + goal_rel, then apply safety layer.
+        """
+        if not bool(getattr(self.cfg, "use_low_safety_layer", False)) or self.low_level_type != "sac":
+            return np.asarray(action, dtype=np.float32)
+
+        low_obs = np.asarray(low_obs, dtype=np.float32)
+        action = np.asarray(action, dtype=np.float32)
+
+        kin_slice = low_obs[:, : 1 + self.local_kin_flat_dim]
+        _, kin, _ = utils.split_time_kinematics(kin_slice, self.n_veh_local, self.feat_dim)
+        ego_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
+
+        goal_rel = low_obs[:, 1 + self.local_kin_flat_dim : 1 + self.local_kin_flat_dim + self.ego_dim]
+        goal_phys = (ego_sub + goal_rel).astype(np.float32)
+
+        return self.low_safety.apply_safety_layer(low_obs, goal_phys, action)
+
     def _compute_intrinsic(self, kin: np.ndarray, kin_next: np.ndarray, goal_phys: np.ndarray, ego_start: np.ndarray, is_last_step: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         n_envs = int(kin.shape[0])
         intrinsic = np.zeros(n_envs, dtype=np.float32)
@@ -377,6 +443,8 @@ class HIROSAC:
 
         need_high = np.ones(n_envs, dtype=bool)
         c = np.zeros(n_envs, dtype=np.int32)
+        seg_id = np.zeros(n_envs, dtype=np.int64)
+        seg_counter = 0
 
         high_obs_start = np.zeros_like(obs, dtype=np.float32)
         goal_action = np.zeros((n_envs, int(self.high_agent.action_space.shape[0])), dtype=np.float32)
@@ -445,6 +513,8 @@ class HIROSAC:
                     opc_low_act_seq[idx] = 0.0
 
                 c[idx] = 0
+                seg_id[idx] = np.arange(seg_counter, seg_counter + int(idx.size), dtype=np.int64)
+                seg_counter += int(idx.size)
                 need_high[idx] = False
 
             # === 1.2 Low Level Decision ===
@@ -457,7 +527,8 @@ class HIROSAC:
                 low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
                 if bool(getattr(self.cfg, "use_low_safety_layer", False)):
                     low_action = self.low_safety.apply_safety_layer(low_obs, goal_phys, low_action)
-                    # low_buffer_action = low_action.copy()
+                    if self.low_sac_impl == "safety_sac" or self.low_sac_impl == "auto":
+                        low_buffer_action = low_action.copy()
             else:
                 raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
@@ -516,11 +587,20 @@ class HIROSAC:
                     low_infos[i]["terminal_observation"] = next_low_obs[i]
 
             if train_low and self.low_level_type == "sac":
+                if low_infos is infos:
+                    low_infos = [dict(info) for info in infos]
+                for i in range(n_envs):
+                    low_infos[i]["low_seg_id"] = int(seg_id[i])
+                    low_infos[i]["low_t_in_seg"] = int(c[i])
+                    low_infos[i]["low_ego_start"] = np.asarray(ego_start[i], dtype=np.float32)
+                    low_infos[i]["low_r_ext"] = float(low_reward_ext[i])
+
+            if train_low and self.low_level_type == "sac":
                 self.low_agent.store_transition(
                     low_obs,
                     low_buffer_action,
                     next_low_obs,
-                    low_reward_total.astype(np.float32),
+                    (low_reward_ext if self.low_use_her else low_reward_total).astype(np.float32),
                     done_low,
                     low_infos,
                 )

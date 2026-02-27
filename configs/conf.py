@@ -285,6 +285,14 @@ def get_hiro_config():
         # low_level_type="rule_based",
         low_level_type="sac",
 
+        # low_sac_impl="sac",
+        # low_sac_impl="safety_sac",
+        low_sac_impl="auto",
+
+        low_use_her=False,
+        low_her_ratio=0.8,
+        low_her_strategy="future",
+
         # use_off_policy_correction=True,
         use_off_policy_correction=False,
 

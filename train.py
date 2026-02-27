@@ -74,6 +74,7 @@ def main(
     hiro_low_pretrained_path: str | None = None,
     hiro_low_target_entropy: str | float = "auto",
     hiro_low_target_entropy_scale: float | None = 0.5,
+    hiro_low_sac_impl: str | None = None,
 ) -> None:
     global master_rng
     set_global_seed(MASTER_SEED)
@@ -159,8 +160,11 @@ def main(
             hiro_cfg.high_pretrained_path = hiro_high_pretrained_path
         if hiro_low_pretrained_path:
             hiro_cfg.low_pretrained_path = hiro_low_pretrained_path
+        if hiro_low_sac_impl is not None:
+            hiro_cfg.low_sac_impl = str(hiro_low_sac_impl)
 
         print(f"[HIRO] Train Mode: {hiro_cfg.train_mode}, Goal Sampler: {hiro_cfg.goal_sampler.type}")
+        print(f"[HIRO] Low SAC Impl: {hiro_cfg.low_sac_impl}")
         print(f"[HIRO] High pretrained: {hiro_cfg.high_pretrained_path}")
         print(f"[HIRO] Low pretrained: {hiro_cfg.low_pretrained_path}")
 
@@ -213,11 +217,10 @@ if __name__ == "__main__":
         save_freq=50_000,
         n_envs=8,
         # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
-        # hiro_low_pretrained_path="./models/hiro_260224_lowonly_pretrained_finetune/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260226_lowonly_uniform_SL_RS_newIDM/hiro_low_final.zip",
         hiro_low_target_entropy="auto",
         hiro_low_target_entropy_scale=1,
-        # run_name=f"hiro_260226_joint_SL_RS_smallBS+lowtrainfreq",
-        # run_name=f"hiro_260226_highonly_pretrained_finetune",
-        run_name=f"hiro_260226_lowonly_uniform_SL_RS_newIDM",
-        # run_name=f"hiro_260225_lowonly_uniform_SL_oldIntParam",
+        # run_name=f"hiro_260227_joint_SL_RS_smallBS+lowtrainfreq",
+        # run_name=f"hiro_260227_highonly_pretrained_newIDM",
+        run_name=f"hiro_260227_lowonly_uniform_SL_RS_newIDM_newLoss",
     )
