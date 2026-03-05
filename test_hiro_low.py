@@ -1,8 +1,11 @@
 import os
 import csv
+import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 import gymnasium as gym
+import matplotlib.pyplot as plt
 import numpy as np
 
 import scenarios.multi_lane  # 触发 __init__.py 里的 register
@@ -12,6 +15,7 @@ from rl.algos.sac.sac import SAC
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.HRL.goal_samplers import UniformGoalSampler
 from rl.utils import utils as hiro_utils
+from util.mpc import MPCController
 from util.plot_result import save_speed_acc_curves, save_low_step_snapshot, save_goal_metric_summary
 from util.hiro_low_test_utils import (
     setup_env_with_state,
@@ -33,6 +37,188 @@ class _DummyHigh:
 
 _abs_dx_metric_fn = abs_dx_metric_fn
 _abs_dy_metric_fn = abs_dy_metric_fn
+
+
+def run_mpc_theoretical_optimal(
+    env,
+    ego_state: Sequence[float],
+    neighbors_state: Sequence[Sequence[float]],
+    goal_phys: Sequence[float],
+    out_dir: str,
+    horizon: int,
+    steps_to_goal: int,
+    mpc_mode: str = "qp",
+    mpc_global_maxiter: int = 250,
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    base_env, _, _ = setup_env_with_state(env, ego_state, neighbors_state)
+    hiro_cfg = get_hiro_config()
+    mpc = MPCController(
+        base_env,
+        horizon=int(max(1, horizon)),
+        dt=1.0 / float(base_env.config.get("policy_frequency", 10.0)),
+        intrinsic_coef=float(getattr(hiro_cfg, "intrinsic_coef", 1.0)),
+        intrinsic_type=str(getattr(hiro_cfg, "intrinsic_type", "l2")),
+        intrinsic_norm_ranges=getattr(hiro_cfg, "intrinsic_norm_ranges", None),
+        intrinsic_weights=getattr(hiro_cfg, "intrinsic_weights", None),
+    )
+
+    mode = str(mpc_mode).lower().strip()
+    if mode == "joint_global":
+        result = mpc.plan_joint_optimal(
+            goal_phys=goal_phys,
+            steps_to_goal=int(max(1, steps_to_goal)),
+            maxiter=int(max(1, mpc_global_maxiter)),
+        )
+    else:
+        result = mpc.plan(goal_phys=goal_phys, steps_to_goal=int(max(1, steps_to_goal)))
+
+    summary = {
+        "success": bool(result.get("success", False)),
+        "message": str(result.get("message", "")),
+        "iterations": int(result.get("iterations", -1)),
+        "horizon": int(result.get("horizon", horizon)),
+        "steps_to_goal": int(result.get("steps_to_goal", steps_to_goal)),
+        "mpc_mode": mode,
+        "intrinsic_type": str(getattr(hiro_cfg, "intrinsic_type", "l2")),
+        "progress_objective_enabled": bool(result.get("progress_objective_enabled", True)),
+        "approximation_notes": list(result.get("approximation_notes", [])),
+        "sum_low_ext": float(result.get("sum_low_ext", 0.0)),
+        "sum_intrinsic": float(result.get("sum_intrinsic", 0.0)),
+        "sum_low_total": float(result.get("sum_low_total", 0.0)),
+        "reward_components": dict(result.get("reward_components", {})),
+        "solver": dict(result.get("solver", {})),
+        "start_state": np.asarray(result.get("start_state", []), dtype=np.float32).reshape(-1).tolist(),
+        "goal_phys": np.asarray(result.get("goal_phys", []), dtype=np.float32).reshape(-1).tolist(),
+    }
+
+    summary_path = os.path.join(out_dir, "mpc_low_theoretical_optimal_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    actions = np.asarray(result.get("best_actions_cont", []), dtype=np.float32)
+    states = np.asarray(result.get("states", []), dtype=np.float32)
+    acc_norm = np.asarray(result.get("acc_norm", []), dtype=np.float32).reshape(-1)
+    acc_phys = np.asarray(result.get("acc_phys", []), dtype=np.float32).reshape(-1)
+    intrinsic_step = np.asarray(result.get("intrinsic_step", []), dtype=np.float32).reshape(-1)
+    low_ext_step = np.asarray(result.get("low_ext_step", []), dtype=np.float32).reshape(-1)
+    low_total_step = np.asarray(result.get("low_total_step", []), dtype=np.float32).reshape(-1)
+
+    trajectory_rows: List[Dict[str, Any]] = []
+    n_rows = int(min(actions.shape[0], states.shape[0] - 1)) if states.ndim == 2 else int(actions.shape[0])
+    for i in range(n_rows):
+        s = states[i + 1] if states.ndim == 2 and i + 1 < states.shape[0] else np.zeros(4, dtype=np.float32)
+        a = actions[i] if actions.ndim == 2 and i < actions.shape[0] else np.zeros(2, dtype=np.float32)
+        trajectory_rows.append(
+            {
+                "step": int(i + 1),
+                "lane_scalar": float(a[0]),
+                "acc_norm": float(a[1]) if a.shape[0] > 1 else (float(acc_norm[i]) if i < acc_norm.shape[0] else 0.0),
+                "acc_phys": float(acc_phys[i]) if i < acc_phys.shape[0] else 0.0,
+                "pred_x": float(s[0]) if s.shape[0] > 0 else 0.0,
+                "pred_y": float(s[1]) if s.shape[0] > 1 else 0.0,
+                "pred_vx": float(s[2]) if s.shape[0] > 2 else 0.0,
+                "pred_vy": float(s[3]) if s.shape[0] > 3 else 0.0,
+                "low_ext_step": float(low_ext_step[i]) if i < low_ext_step.shape[0] else 0.0,
+                "intrinsic_step": float(intrinsic_step[i]) if i < intrinsic_step.shape[0] else 0.0,
+                "low_total_step": float(low_total_step[i]) if i < low_total_step.shape[0] else 0.0,
+            }
+        )
+
+    traj_csv = os.path.join(out_dir, "mpc_low_theoretical_optimal_trajectory.csv")
+    if trajectory_rows:
+        with open(traj_csv, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=list(trajectory_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(trajectory_rows)
+
+    # 保存 MPC 理论最优对应的速度/加速度/换道曲线
+    lane_width = float(base_env.config.get("lane_width", 4.0))
+    n_steps = int(acc_phys.shape[0])
+    t = np.arange(1, n_steps + 1, dtype=np.int32)
+    pred_vx = states[1 : n_steps + 1, 2] if states.ndim == 2 and states.shape[0] >= n_steps + 1 else np.zeros((n_steps,), dtype=np.float32)
+    lane_scalar = actions[:n_steps, 0] if actions.ndim == 2 and actions.shape[0] >= n_steps else np.zeros((n_steps,), dtype=np.float32)
+    lane_id = np.rint(states[1 : n_steps + 1, 1] / max(lane_width, 1e-6)).astype(np.int32) if states.ndim == 2 and states.shape[0] >= n_steps + 1 else np.zeros((n_steps,), dtype=np.int32)
+
+    # 1) 速度曲线
+    speed_fig = os.path.join(out_dir, "mpc_speed_curve.png")
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(t, pred_vx, linewidth=1.6, label="pred_vx")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Speed (m/s)")
+    ax.set_title("MPC Theoretical Optimal - Speed")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(speed_fig, dpi=150)
+    plt.close(fig)
+
+    # 2) 加速度曲线（物理 + 归一化）
+    acc_fig = os.path.join(out_dir, "mpc_acc_curve.png")
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(t, acc_phys[:n_steps], linewidth=1.6, label="acc_phys (m/s^2)")
+    ax.plot(t, acc_norm[:n_steps], linewidth=1.2, linestyle="--", label="acc_norm")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Acceleration")
+    ax.set_title("MPC Theoretical Optimal - Acceleration")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(acc_fig, dpi=150)
+    plt.close(fig)
+
+    # 3) 换道曲线（lane_scalar + lane_id）
+    lane_fig = os.path.join(out_dir, "mpc_lane_change_curve.png")
+    fig, ax1 = plt.subplots(figsize=(8, 3))
+    ax1.plot(t, lane_scalar, color="tab:blue", linewidth=1.6, label="lane_scalar")
+    ax1.set_xlabel("Step")
+    ax1.set_ylabel("lane_scalar", color="tab:blue")
+    ax1.tick_params(axis="y", labelcolor="tab:blue")
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    ax2.step(t, lane_id, where="mid", color="tab:orange", linewidth=1.4, label="lane_id")
+    ax2.set_ylabel("lane_id", color="tab:orange")
+    ax2.tick_params(axis="y", labelcolor="tab:orange")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+    ax1.set_title("MPC Theoretical Optimal - Lane Change")
+    fig.tight_layout()
+    fig.savefig(lane_fig, dpi=150)
+    plt.close(fig)
+
+    print("MPC low-level 理论最优解结果：")
+    print(f"  success         : {summary['success']}")
+    print(f"  message         : {summary['message']}")
+    print(f"  horizon         : {summary['horizon']}")
+    print(f"  steps_to_goal   : {summary['steps_to_goal']}")
+    print(f"  low_ext_sum     : {summary['sum_low_ext']:.6f}")
+    print(f"  intrinsic_sum   : {summary['sum_intrinsic']:.6f}")
+    print(f"  low_total_sum   : {summary['sum_low_total']:.6f}")
+    print(f"  summary_path    : {summary_path}")
+    if trajectory_rows:
+        print(f"  trajectory_csv  : {traj_csv}")
+    print(f"  speed_curve     : {speed_fig}")
+    print(f"  acc_curve       : {acc_fig}")
+    print(f"  lane_curve      : {lane_fig}")
+
+    mpc_speed = states[:, 2] if states.ndim == 2 and states.shape[1] > 2 else np.asarray([], dtype=np.float32)
+    mpc_acc = acc_phys.copy()
+    mpc_lane = lane_scalar.copy()
+    neighbors_state = np.asarray(result.get("neighbors_state", []), dtype=np.float32).reshape(-1, 4)
+    mpc_actions_cont = np.asarray(result.get("best_actions_cont", []), dtype=np.float32).reshape(-1, 2)
+    return {
+        "speed": np.asarray(mpc_speed, dtype=np.float32).reshape(-1),
+        "acc": np.asarray(mpc_acc, dtype=np.float32).reshape(-1),
+        "lane": np.asarray(mpc_lane, dtype=np.float32).reshape(-1),
+        "states": np.asarray(states, dtype=np.float32),
+        "actions_cont": np.asarray(mpc_actions_cont, dtype=np.float32),
+        "neighbors_state": neighbors_state,
+        "dt": float(1.0 / float(base_env.config.get("policy_frequency", 10.0))),
+    }
 
 
 def run_uniform_goal_trials(
@@ -118,6 +304,105 @@ def run_uniform_goal_trials(
     print(f"  total: {total}")
 
 
+def run_mpc_action_sequence_evaluation(
+    env,
+    ego_state: Sequence[float],
+    neighbors_state: Sequence[Sequence[float]],
+    goal_phys: Sequence[float],
+    action_sequence: Sequence[Sequence[float]],
+    out_dir: str,
+    steps_to_goal: int,
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    base_env, _, _ = setup_env_with_state(env, ego_state, neighbors_state)
+    hiro_cfg = get_hiro_config()
+    mpc = MPCController(
+        base_env,
+        horizon=max(1, len(action_sequence)),
+        dt=1.0 / float(base_env.config.get("policy_frequency", 10.0)),
+        intrinsic_coef=float(getattr(hiro_cfg, "intrinsic_coef", 1.0)),
+        intrinsic_type=str(getattr(hiro_cfg, "intrinsic_type", "l2")),
+        intrinsic_norm_ranges=getattr(hiro_cfg, "intrinsic_norm_ranges", None),
+        intrinsic_weights=getattr(hiro_cfg, "intrinsic_weights", None),
+    )
+
+    result = mpc.evaluate_action_sequence(
+        actions_cont=action_sequence,
+        goal_phys=goal_phys,
+        steps_to_goal=int(max(1, steps_to_goal)),
+    )
+
+    summary = {
+        "success": bool(result.get("success", False)),
+        "message": str(result.get("message", "")),
+        "horizon": int(result.get("horizon", len(action_sequence))),
+        "steps_to_goal": int(result.get("steps_to_goal", steps_to_goal)),
+        "intrinsic_type": str(getattr(hiro_cfg, "intrinsic_type", "l2")),
+        "progress_objective_enabled": bool(result.get("progress_objective_enabled", True)),
+        "approximation_notes": list(result.get("approximation_notes", [])),
+        "sequence_check": dict(result.get("sequence_check", {})),
+        "sum_low_ext": float(result.get("sum_low_ext", 0.0)),
+        "sum_intrinsic": float(result.get("sum_intrinsic", 0.0)),
+        "sum_low_total": float(result.get("sum_low_total", 0.0)),
+        "reward_components": dict(result.get("reward_components", {})),
+        "start_state": np.asarray(result.get("start_state", []), dtype=np.float32).reshape(-1).tolist(),
+        "goal_phys": np.asarray(result.get("goal_phys", []), dtype=np.float32).reshape(-1).tolist(),
+    }
+
+    summary_path = os.path.join(out_dir, "mpc_action_sequence_eval_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    actions = np.asarray(result.get("best_actions_cont", []), dtype=np.float32)
+    states = np.asarray(result.get("states", []), dtype=np.float32)
+    acc_norm = np.asarray(result.get("acc_norm", []), dtype=np.float32).reshape(-1)
+    acc_phys = np.asarray(result.get("acc_phys", []), dtype=np.float32).reshape(-1)
+    intrinsic_step = np.asarray(result.get("intrinsic_step", []), dtype=np.float32).reshape(-1)
+    low_ext_step = np.asarray(result.get("low_ext_step", []), dtype=np.float32).reshape(-1)
+    low_total_step = np.asarray(result.get("low_total_step", []), dtype=np.float32).reshape(-1)
+
+    trajectory_rows: List[Dict[str, Any]] = []
+    n_rows = int(min(actions.shape[0], states.shape[0] - 1)) if states.ndim == 2 else int(actions.shape[0])
+    for i in range(n_rows):
+        s = states[i + 1] if states.ndim == 2 and i + 1 < states.shape[0] else np.zeros(4, dtype=np.float32)
+        a = actions[i] if actions.ndim == 2 and i < actions.shape[0] else np.zeros(2, dtype=np.float32)
+        trajectory_rows.append(
+            {
+                "step": int(i + 1),
+                "lane_scalar": float(a[0]),
+                "acc_norm": float(a[1]) if a.shape[0] > 1 else (float(acc_norm[i]) if i < acc_norm.shape[0] else 0.0),
+                "acc_phys": float(acc_phys[i]) if i < acc_phys.shape[0] else 0.0,
+                "pred_x": float(s[0]) if s.shape[0] > 0 else 0.0,
+                "pred_y": float(s[1]) if s.shape[0] > 1 else 0.0,
+                "pred_vx": float(s[2]) if s.shape[0] > 2 else 0.0,
+                "pred_vy": float(s[3]) if s.shape[0] > 3 else 0.0,
+                "low_ext_step": float(low_ext_step[i]) if i < low_ext_step.shape[0] else 0.0,
+                "intrinsic_step": float(intrinsic_step[i]) if i < intrinsic_step.shape[0] else 0.0,
+                "low_total_step": float(low_total_step[i]) if i < low_total_step.shape[0] else 0.0,
+            }
+        )
+
+    traj_csv = os.path.join(out_dir, "mpc_action_sequence_eval_trajectory.csv")
+    if trajectory_rows:
+        with open(traj_csv, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=list(trajectory_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(trajectory_rows)
+
+    print("MPC 动作序列评估结果：")
+    print(f"  success         : {summary['success']}")
+    print(f"  message         : {summary['message']}")
+    print(f"  horizon         : {summary['horizon']}")
+    print(f"  steps_to_goal   : {summary['steps_to_goal']}")
+    print(f"  low_ext_sum     : {summary['sum_low_ext']:.6f}")
+    print(f"  intrinsic_sum   : {summary['sum_intrinsic']:.6f}")
+    print(f"  low_total_sum   : {summary['sum_low_total']:.6f}")
+    print(f"  summary_path    : {summary_path}")
+    if trajectory_rows:
+        print(f"  trajectory_csv  : {traj_csv}")
+
+
 def main(
     low_model_path: str,
     steps: int,
@@ -127,21 +412,37 @@ def main(
     batch_cases_csv: Optional[str] = None,
     env_overrides: Optional[Dict[str, Any]] = None,
     out_dir: str = "./debug/low_level_rollout",
-    batch_out_dir: Optional[str] = None,
     use_low_safety_layer: Optional[bool] = None,
     seed: int = 0,
     save_initial: bool = True,
     uniform_trials: int = 0,
     uniform_steps: Optional[int] = None,
-    uniform_out_dir: Optional[str] = None,
     uniform_metric_name: str = "intrinsic_reward",
     uniform_metric_fn=None,
     record_interval_csv: bool = False,
     record_interval_index: int = 1,
+    run_mpc_optimal: bool = False,
+    mpc_horizon: Optional[int] = None,
+    mpc_steps_to_goal: Optional[int] = None,
+    mpc_mode: str = "qp",
+    mpc_global_maxiter: int = 250,
+    mpc_eval_actions_cont: Optional[Sequence[Sequence[float]]] = None,
+    lane_change_min_front_gap: float = 10.0,
+    lane_change_min_rear_gap: float = 8.0,
+    lane_change_min_front_ttc: float = 3.0,
+    lane_change_min_rear_ttc: float = 2.0,
+    _is_subrun: bool = False,
 ):
+    run_out_dir = out_dir
+    if not bool(_is_subrun):
+        run_tag = datetime.now().strftime("run_%Y%m%d-%H%M%S")
+        run_out_dir = os.path.join(out_dir, run_tag)
+        os.makedirs(run_out_dir, exist_ok=True)
+        print(f"[RUN] output dir: {run_out_dir}")
+
     if batch_cases_csv:
         cases = load_test_cases_from_csv(batch_cases_csv)
-        base_out_dir = batch_out_dir or os.path.join(out_dir, "batch_cases")
+        base_out_dir = os.path.join(run_out_dir, "batch_cases")
         os.makedirs(base_out_dir, exist_ok=True)
 
         print(f"Loaded {len(cases)} cases from CSV: {batch_cases_csv}")
@@ -160,15 +461,24 @@ def main(
                 batch_cases_csv=None,
                 env_overrides=env_overrides,
                 out_dir=case_out_dir,
-                batch_out_dir=None,
                 use_low_safety_layer=use_low_safety_layer,
                 seed=seed,
                 save_initial=save_initial,
                 uniform_trials=uniform_trials,
                 uniform_steps=uniform_steps,
-                uniform_out_dir=None,
                 uniform_metric_name=uniform_metric_name,
                 uniform_metric_fn=uniform_metric_fn,
+                run_mpc_optimal=run_mpc_optimal,
+                mpc_horizon=mpc_horizon,
+                mpc_steps_to_goal=mpc_steps_to_goal,
+                mpc_mode=mpc_mode,
+                mpc_global_maxiter=mpc_global_maxiter,
+                mpc_eval_actions_cont=mpc_eval_actions_cont,
+                lane_change_min_front_gap=lane_change_min_front_gap,
+                lane_change_min_rear_gap=lane_change_min_rear_gap,
+                lane_change_min_front_ttc=lane_change_min_front_ttc,
+                lane_change_min_rear_ttc=lane_change_min_rear_ttc,
+                _is_subrun=True,
             )
         return
 
@@ -184,6 +494,10 @@ def main(
         "centering_position": [0.5, 0.5],
         "show_trajectories": True,
         "initial_lane_id": 1,
+        "lane_change_min_front_gap": float(lane_change_min_front_gap),
+        "lane_change_min_rear_gap": float(lane_change_min_rear_gap),
+        "lane_change_min_front_ttc": float(lane_change_min_front_ttc),
+        "lane_change_min_rear_ttc": float(lane_change_min_rear_ttc),
     }
     if env_overrides:
         test_overrides.update(env_overrides)
@@ -226,7 +540,54 @@ def main(
         env.unwrapped.set_hiro_goal(runner.goal_phys)
 
     if save_initial:
-        save_low_step_snapshot(env, runner, 0, out_dir, goal_phys_arr, title_suffix="init")
+        save_low_step_snapshot(env, runner, 0, run_out_dir, goal_phys_arr, title_suffix="init")
+
+    if bool(run_mpc_optimal):
+        mpc_dir = os.path.join(run_out_dir, "mpc_theoretical_optimal")
+        mpc_hi = int(mpc_horizon) if mpc_horizon is not None else int(runner.hi)
+        mpc_goal_steps = int(mpc_steps_to_goal) if mpc_steps_to_goal is not None else int(runner.hi)
+        mpc_curve_data = run_mpc_theoretical_optimal(
+            env=env,
+            ego_state=ego_state,
+            neighbors_state=neighbors_state,
+            goal_phys=goal_phys_arr,
+            out_dir=mpc_dir,
+            horizon=mpc_hi,
+            steps_to_goal=mpc_goal_steps,
+            mpc_mode=mpc_mode,
+            mpc_global_maxiter=mpc_global_maxiter,
+        )
+    else:
+        mpc_curve_data = None
+
+    if mpc_eval_actions_cont is not None:
+        mpc_dir = os.path.join(run_out_dir, "mpc_theoretical_optimal")
+        mpc_goal_steps = int(mpc_steps_to_goal) if mpc_steps_to_goal is not None else int(runner.hi)
+        run_mpc_action_sequence_evaluation(
+            env=env,
+            ego_state=ego_state,
+            neighbors_state=neighbors_state,
+            goal_phys=goal_phys_arr,
+            action_sequence=mpc_eval_actions_cont,
+            out_dir=mpc_dir,
+            steps_to_goal=mpc_goal_steps,
+        )
+
+    if bool(run_mpc_optimal) or (mpc_eval_actions_cont is not None):
+
+        # 重新设置一次环境状态，确保后续 RL rollout 从同一起点开始
+        base_env, ego, neighbors = setup_env_with_state(env, ego_state, neighbors_state)
+        obs0 = base_env.observation_type.observe()
+        runner.init_from_env(env, obs0, float(getattr(get_hiro_config(), "intrinsic_coef", 1.0)))
+        runner.goal_phys = goal_phys_arr.copy()
+        _, kin0, _ = runner._split(obs0)
+        runner.ego_start = runner._ego_sub(kin0).copy()
+        runner.need_high = False
+        runner.c = 0
+        if hasattr(env.unwrapped, "set_hiro_goal"):
+            env.unwrapped.set_hiro_goal(runner.goal_phys)
+        if save_initial:
+            save_low_step_snapshot(env, runner, 0, run_out_dir, goal_phys_arr, title_suffix="init")
 
     obs = obs0
     trajectory_rows: List[Dict[str, Any]] = []
@@ -244,13 +605,87 @@ def main(
         "intrinsic_reward",
     ]
     reward_sums = {k: 0.0 for k in reward_keys_low}
+
+    def _acc_norm_to_phys(acc_norm_val: float) -> float:
+        if getattr(runner, "safety_controller", None) is not None:
+            return float(runner.safety_controller._acc_norm_to_phys(float(acc_norm_val)))
+        acc_min = float(env.unwrapped.config.get("acceleration_range", [-5.0, 5.0])[0])
+        acc_max = float(env.unwrapped.config.get("acceleration_range", [-5.0, 5.0])[1])
+        if abs(acc_max - acc_min) < 1e-8:
+            return float(acc_min)
+        return float(acc_min + 0.5 * (float(acc_norm_val) + 1.0) * (acc_max - acc_min))
+
+    rl_speed_curve: List[float] = []
+    rl_acc_curve: List[float] = []
+    rl_lane_curve: List[float] = []
+    rl_safety_speed_curve: List[float] = []
+    rl_safety_acc_curve: List[float] = []
+    rl_safety_lane_curve: List[float] = []
+    safety_speed_upper_curve: List[float] = []
+    safety_acc_upper_curve: List[float] = []
+    safety_lane_upper_curve: List[float] = []
+
+    _, kin_init, _ = runner._split(obs)
+    ego_init = runner._ego_sub(kin_init)
+    init_speed = float(ego_init[2]) if ego_init.shape[0] > 2 else 0.0
+    rl_speed_curve.append(init_speed)
+    rl_safety_speed_curve.append(init_speed)
+
     for step in range(1, int(steps) + 1):
         runner.goal_phys = goal_phys_arr.copy()
         runner.need_high = False
 
         state_now = np.asarray(obs, dtype=np.float32).reshape(-1)
+        _, kin_now, _ = runner._split(obs)
+        ego_abs_now, others_rel_now = runner._extract_ego_others(kin_now)
         action = runner.act(env, obs)
+
+        action_pre = np.asarray(getattr(runner, "last_action_pre_safety", action), dtype=np.float32).reshape(-1)
+        action_post = np.asarray(getattr(runner, "last_action_post_safety", action), dtype=np.float32).reshape(-1)
+        lane_rl = float(action_pre[0]) if action_pre.shape[0] > 0 else 0.0
+        acc_norm_rl = float(action_pre[1]) if action_pre.shape[0] > 1 else 0.0
+        rl_lane_curve.append(lane_rl)
+        acc_phys_rl = _acc_norm_to_phys(acc_norm_rl)
+        rl_acc_curve.append(acc_phys_rl)
+
+        lane_rl_safety = float(action_post[0]) if action_post.shape[0] > 0 else lane_rl
+        acc_norm_rl_safety = float(action_post[1]) if action_post.shape[0] > 1 else acc_norm_rl
+        acc_phys_rl_safety = _acc_norm_to_phys(acc_norm_rl_safety)
+        rl_safety_lane_curve.append(lane_rl_safety)
+        rl_safety_acc_curve.append(acc_phys_rl_safety)
+
+        if getattr(runner, "safety_controller", None) is not None:
+            safety_upper_in = np.array([lane_rl, 1.0], dtype=np.float32)
+            safety_upper = np.asarray(
+                runner.safety_controller.safety_filter_action(
+                    ego_abs_now,
+                    others_rel_now,
+                    runner.goal_phys,
+                    safety_upper_in,
+                    runner.dt,
+                    remaining_time=float(runner.hi - runner.c) * float(runner.dt),
+                ),
+                dtype=np.float32,
+            ).reshape(-1)
+            lane_safety_upper = float(safety_upper[0]) if safety_upper.shape[0] > 0 else 0.0
+            acc_norm_safety_upper = float(safety_upper[1]) if safety_upper.shape[0] > 1 else 0.0
+        else:
+            lane_safety_upper = lane_rl
+            acc_norm_safety_upper = 1.0
+
+        safety_lane_upper_curve.append(lane_safety_upper)
+        acc_phys_safety_upper = _acc_norm_to_phys(acc_norm_safety_upper)
+        safety_acc_upper_curve.append(acc_phys_safety_upper)
+
+        vx_now = float(ego_abs_now[2]) if ego_abs_now.shape[0] > 2 else 0.0
+        rl_speed_curve.append(vx_now + acc_phys_rl * float(runner.dt))
+        safety_speed_upper_curve.append(vx_now + acc_phys_safety_upper * float(runner.dt))
+
         obs_next, reward, terminated, truncated, info = env.step(action)
+
+        _, kin_next, _ = runner._split(obs_next)
+        ego_next = runner._ego_sub(kin_next)
+        rl_safety_speed_curve.append(float(ego_next[2]) if ego_next.shape[0] > 2 else 0.0)
 
         rc = info.get("reward_components", {}) if isinstance(info, dict) else {}
         punctual = float(rc.get("punctual_reward", 0.0))
@@ -288,18 +723,110 @@ def main(
                 row[f"action_post_safety_{i}"] = float(v)
             trajectory_rows.append(row)
 
-        save_low_step_snapshot(env, runner, step, out_dir, goal_phys_arr, reward_sums=reward_sums)
+        save_low_step_snapshot(env, runner, step, run_out_dir, goal_phys_arr, reward_sums=reward_sums)
 
         runner.c = int((runner.c + 1) % max(runner.hi, 1))
         runner.need_high = False
 
         obs = obs_next
 
-    # 保存速度曲线/加速度曲线
-    save_speed_acc_curves(env, ep_idx=1, model_path=out_dir)
+    # 保存三组对比曲线：RL 输出 / Safety Layer 上界 / MPC 最优
+    mpc_speed_curve = np.asarray([], dtype=np.float32)
+    mpc_acc_curve = np.asarray([], dtype=np.float32)
+    mpc_lane_curve = np.asarray([], dtype=np.float32)
+    mpc_speed_safety_upper_curve = np.asarray([], dtype=np.float32)
+    mpc_acc_safety_upper_curve = np.asarray([], dtype=np.float32)
+    mpc_lane_safety_upper_curve = np.asarray([], dtype=np.float32)
+    if isinstance(mpc_curve_data, dict):
+        mpc_speed_curve = np.asarray(mpc_curve_data.get("speed", []), dtype=np.float32).reshape(-1)
+        mpc_acc_curve = np.asarray(mpc_curve_data.get("acc", []), dtype=np.float32).reshape(-1)
+        mpc_lane_curve = np.asarray(mpc_curve_data.get("lane", []), dtype=np.float32).reshape(-1)
+
+        mpc_states = np.asarray(mpc_curve_data.get("states", []), dtype=np.float32)
+        mpc_actions = np.asarray(mpc_curve_data.get("actions_cont", []), dtype=np.float32)
+        mpc_neighbors0 = np.asarray(mpc_curve_data.get("neighbors_state", []), dtype=np.float32).reshape(-1, 4)
+        mpc_dt = float(mpc_curve_data.get("dt", runner.dt))
+
+        if (
+            getattr(runner, "safety_controller", None) is not None
+            and mpc_states.ndim == 2
+            and mpc_states.shape[0] >= 2
+            and mpc_actions.ndim == 2
+            and mpc_actions.shape[0] >= 1
+        ):
+            mpc_acc_upper_list: List[float] = []
+            mpc_lane_upper_list: List[float] = []
+            mpc_speed_upper_list: List[float] = []
+
+            n_mpc = int(min(mpc_actions.shape[0], mpc_states.shape[0] - 1))
+            for t in range(n_mpc):
+                ego_abs_t = np.asarray(mpc_states[t, :4], dtype=np.float32)
+
+                others_rel_rows: List[List[float]] = []
+                for j in range(int(mpc_neighbors0.shape[0])):
+                    nx0, ny0, nvx0, nvy0 = [float(v) for v in mpc_neighbors0[j]]
+                    nx_t = nx0 + nvx0 * mpc_dt * float(t)
+                    ny_t = ny0 + nvy0 * mpc_dt * float(t)
+                    rel_dx = nx_t - float(ego_abs_t[0])
+                    rel_dy = ny_t - float(ego_abs_t[1])
+                    rel_dvx = nvx0 - float(ego_abs_t[2])
+                    rel_dvy = nvy0 - float(ego_abs_t[3])
+                    others_rel_rows.append([rel_dx, rel_dy, rel_dvx, rel_dvy])
+                others_rel_t = np.asarray(others_rel_rows, dtype=np.float32).reshape(-1, 4)
+
+                lane_mpc_t = float(mpc_actions[t, 0]) if mpc_actions.shape[1] > 0 else 0.0
+                safety_upper_in_mpc = np.array([lane_mpc_t, 1.0], dtype=np.float32)
+                safety_upper_mpc = np.asarray(
+                    runner.safety_controller.safety_filter_action(
+                        ego_abs_t,
+                        others_rel_t,
+                        goal_phys_arr,
+                        safety_upper_in_mpc,
+                        mpc_dt,
+                        remaining_time=max(float(n_mpc - t), 1.0) * mpc_dt,
+                    ),
+                    dtype=np.float32,
+                ).reshape(-1)
+
+                lane_upper_t = float(safety_upper_mpc[0]) if safety_upper_mpc.shape[0] > 0 else 0.0
+                acc_norm_upper_t = float(safety_upper_mpc[1]) if safety_upper_mpc.shape[0] > 1 else 0.0
+                acc_phys_upper_t = _acc_norm_to_phys(acc_norm_upper_t)
+
+                mpc_lane_upper_list.append(lane_upper_t)
+                mpc_acc_upper_list.append(acc_phys_upper_t)
+                mpc_speed_upper_list.append(float(ego_abs_t[2]) + acc_phys_upper_t * mpc_dt)
+
+            mpc_acc_safety_upper_curve = np.asarray(mpc_acc_upper_list, dtype=np.float32)
+            mpc_lane_safety_upper_curve = np.asarray(mpc_lane_upper_list, dtype=np.float32)
+            if mpc_states.shape[0] > 0:
+                mpc_speed0 = float(mpc_states[0, 2])
+                mpc_speed_safety_upper_curve = np.asarray([mpc_speed0] + mpc_speed_upper_list, dtype=np.float32)
+
+    save_speed_acc_curves(
+        env,
+        ep_idx=1,
+        model_path=run_out_dir,
+        comparison_data={
+            "speed_rl": np.asarray(rl_speed_curve, dtype=np.float32),
+            "speed_rl_safety_output": np.asarray(rl_safety_speed_curve, dtype=np.float32),
+            "speed_safety_upper_rl": np.asarray([rl_speed_curve[0]] + safety_speed_upper_curve, dtype=np.float32) if rl_speed_curve else np.asarray([], dtype=np.float32),
+            "speed_mpc": mpc_speed_curve,
+            "speed_safety_upper_mpc": mpc_speed_safety_upper_curve,
+            "acc_rl": np.asarray(rl_acc_curve, dtype=np.float32),
+            "acc_rl_safety_output": np.asarray(rl_safety_acc_curve, dtype=np.float32),
+            "acc_safety_upper_rl": np.asarray(safety_acc_upper_curve, dtype=np.float32),
+            "acc_mpc": mpc_acc_curve,
+            "acc_safety_upper_mpc": mpc_acc_safety_upper_curve,
+            "lane_rl": np.asarray(rl_lane_curve, dtype=np.float32),
+            "lane_rl_safety_output": np.asarray(rl_safety_lane_curve, dtype=np.float32),
+            "lane_safety_upper_rl": np.asarray(safety_lane_upper_curve, dtype=np.float32),
+            "lane_mpc": mpc_lane_curve,
+            "lane_safety_upper_mpc": mpc_lane_safety_upper_curve,
+        },
+    )
 
     if int(uniform_trials) > 0:
-        trials_dir = uniform_out_dir or os.path.join(out_dir, "uniform_goal_trials")
+        trials_dir = os.path.join(run_out_dir, "uniform_goal_trials")
         run_uniform_goal_trials(
             env,
             runner,
@@ -313,7 +840,7 @@ def main(
         )
 
     if record_interval_csv:
-        csv_path = os.path.join(out_dir, f"low_interval_{selected_interval_idx:03d}_trajectory.csv")
+        csv_path = os.path.join(run_out_dir, f"low_interval_{selected_interval_idx:03d}_trajectory.csv")
         if trajectory_rows:
             with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
                 writer = csv.DictWriter(csv_file, fieldnames=list(trajectory_rows[0].keys()))
@@ -327,7 +854,7 @@ def main(
             )
 
     env.close()
-    print(f"Saved {steps + (1 if save_initial else 0)} frames to: {out_dir}")
+    print(f"Saved {steps + (1 if save_initial else 0)} frames to: {run_out_dir}")
 
 
 if __name__ == "__main__":
@@ -358,8 +885,45 @@ if __name__ == "__main__":
         uniform_trials=0,
         record_interval_csv=True,
         record_interval_index=1,
+        run_mpc_optimal=True,
+        # run_mpc_optimal=False,
+        # mpc_mode="qp",
+        mpc_mode="joint_global",
+        mpc_horizon=25,
+        mpc_steps_to_goal=25,
+        mpc_global_maxiter=200,  # joint_global 模式才会使用
+        mpc_eval_actions_cont=[
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0]
+        ],
+        lane_change_min_front_gap=10.0,
+        lane_change_min_rear_gap=8.0,
+        lane_change_min_front_ttc=3.0,
+        lane_change_min_rear_ttc=2.0,
         # uniform_trials=1000,
-        # uniform_out_dir="./models/debug/low_level_rollout/0225/uniform_goal_trials",
         # uniform_metric_name="abs_dy",
         # uniform_metric_fn=_abs_dy_metric_fn,
     )
