@@ -62,7 +62,10 @@ class HIROPolicyRunner:
         self.idx_vy = _idx("vy", 3)
 
         if self.use_low_safety_layer and self.safety_controller is None:
-            self.safety_controller = RuleBasedController(cfg)
+            self.safety_controller = RuleBasedController(
+                cfg,
+                low_safety_filter=getattr(self.cfg, "low_safety_filter", None),
+            )
 
         intrinsic_norm = getattr(self.cfg, "intrinsic_norm_ranges", None)
         self.norm_ranges = np.asarray(intrinsic_norm, dtype=np.float32)

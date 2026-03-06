@@ -869,7 +869,7 @@ if __name__ == "__main__":
 
     main(
         # low_model_path="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping/hiro_low_final.zip",
-        low_model_path="./models/hiro_260226_lowonly_uniform_SL_RS_newIDM/hiro_low_final.zip",
+        low_model_path="./models/hiro_260305_lowonly_uniform_SL_RS_newSL_oldLoss/hiro_low_final.zip",
         steps=25,
         ego_state=[0.0, 4.0, 10.0, 0.0],
         neighbors_state=[
@@ -919,8 +919,8 @@ if __name__ == "__main__":
             [0.0, 0.0],
             [0.0, 0.0]
         ],
-        lane_change_min_front_gap=10.0,
-        lane_change_min_rear_gap=8.0,
+        lane_change_min_front_gap=15.0,
+        lane_change_min_rear_gap=10.0,
         lane_change_min_front_ttc=3.0,
         lane_change_min_rear_ttc=2.0,
         # uniform_trials=1000,

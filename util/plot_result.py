@@ -408,7 +408,7 @@ def plot_warmup_avg_speed(env, show=True, save_path=None):
     plt.close()
 
 
-def save_speed_acc_curves(env, ep_idx: int, model_path: str):
+def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: dict | None = None):
     """
     在 show_trajectories 打开的情况下，将当前 episode 的
     车速曲线、加速度曲线和所在车道随时间变化曲线保存到：
@@ -442,6 +442,105 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str):
 
     # 时间步长按 simulation_frequency 计算（与 history 记录频率一致）
     dt = 1.0 / float(base_env.config["simulation_frequency"])
+
+    # 对比模式：RL / RL+safety / RL safety upper / MPC / MPC safety upper
+    if isinstance(comparison_data, dict) and comparison_data:
+        speed_rl = np.asarray(comparison_data.get("speed_rl", []), dtype=float).reshape(-1)
+        speed_rl_safety_output = np.asarray(comparison_data.get("speed_rl_safety_output", []), dtype=float).reshape(-1)
+        speed_safety_upper_rl = np.asarray(comparison_data.get("speed_safety_upper_rl", []), dtype=float).reshape(-1)
+        speed_mpc = np.asarray(comparison_data.get("speed_mpc", []), dtype=float).reshape(-1)
+        speed_safety_upper_mpc = np.asarray(comparison_data.get("speed_safety_upper_mpc", []), dtype=float).reshape(-1)
+
+        acc_rl = np.asarray(comparison_data.get("acc_rl", []), dtype=float).reshape(-1)
+        acc_rl_safety_output = np.asarray(comparison_data.get("acc_rl_safety_output", []), dtype=float).reshape(-1)
+        acc_safety_upper_rl = np.asarray(comparison_data.get("acc_safety_upper_rl", []), dtype=float).reshape(-1)
+        acc_mpc = np.asarray(comparison_data.get("acc_mpc", []), dtype=float).reshape(-1)
+        acc_safety_upper_mpc = np.asarray(comparison_data.get("acc_safety_upper_mpc", []), dtype=float).reshape(-1)
+
+        lane_rl = np.asarray(comparison_data.get("lane_rl", []), dtype=float).reshape(-1)
+        lane_rl_safety_output = np.asarray(comparison_data.get("lane_rl_safety_output", []), dtype=float).reshape(-1)
+        lane_safety_upper_rl = np.asarray(comparison_data.get("lane_safety_upper_rl", []), dtype=float).reshape(-1)
+        lane_mpc = np.asarray(comparison_data.get("lane_mpc", []), dtype=float).reshape(-1)
+        lane_safety_upper_mpc = np.asarray(comparison_data.get("lane_safety_upper_mpc", []), dtype=float).reshape(-1)
+
+        # --------- 速度曲线（五组） --------- #
+        plt.figure()
+        if speed_rl.size > 0:
+            t_rl = np.arange(speed_rl.size, dtype=float) * dt
+            plt.plot(t_rl, speed_rl, color="tab:blue", linewidth=1.6, label="RL output")
+        if speed_rl_safety_output.size > 0:
+            t_rl_sf = np.arange(speed_rl_safety_output.size, dtype=float) * dt
+            plt.plot(t_rl_sf, speed_rl_safety_output, color="tab:purple", linewidth=1.6, label="RL+safety output")
+        if speed_safety_upper_rl.size > 0:
+            t_su_rl = np.arange(speed_safety_upper_rl.size, dtype=float) * dt
+            plt.plot(t_su_rl, speed_safety_upper_rl, color="tab:orange", linewidth=1.4, linestyle="--", label="RL safety upper")
+        if speed_mpc.size > 0:
+            t_mpc = np.arange(speed_mpc.size, dtype=float) * dt
+            plt.plot(t_mpc, speed_mpc, color="tab:green", linewidth=1.6, label="MPC optimal")
+        if speed_safety_upper_mpc.size > 0:
+            t_su_mpc = np.arange(speed_safety_upper_mpc.size, dtype=float) * dt
+            plt.plot(t_su_mpc, speed_safety_upper_mpc, color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
+        plt.xlabel("Time [s]")
+        plt.ylabel("Speed [m/s]")
+        plt.title(f"Ego Speed Comparison (ep {ep_idx})")
+        plt.grid(True)
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.savefig(speed_path)
+        plt.close()
+
+        # --------- 加速度曲线（五组） --------- #
+        plt.figure()
+        if acc_rl.size > 0:
+            t_rl = np.arange(acc_rl.size, dtype=float) * dt
+            plt.plot(t_rl, acc_rl, color="tab:blue", linewidth=1.6, label="RL output")
+        if acc_rl_safety_output.size > 0:
+            t_rl_sf = np.arange(acc_rl_safety_output.size, dtype=float) * dt
+            plt.plot(t_rl_sf, acc_rl_safety_output, color="tab:purple", linewidth=1.6, label="RL+safety output")
+        if acc_safety_upper_rl.size > 0:
+            t_su_rl = np.arange(acc_safety_upper_rl.size, dtype=float) * dt
+            plt.plot(t_su_rl, acc_safety_upper_rl, color="tab:orange", linewidth=1.4, linestyle="--", label="RL safety upper")
+        if acc_mpc.size > 0:
+            t_mpc = np.arange(acc_mpc.size, dtype=float) * dt
+            plt.plot(t_mpc, acc_mpc, color="tab:green", linewidth=1.6, label="MPC optimal")
+        if acc_safety_upper_mpc.size > 0:
+            t_su_mpc = np.arange(acc_safety_upper_mpc.size, dtype=float) * dt
+            plt.plot(t_su_mpc, acc_safety_upper_mpc, color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
+        plt.xlabel("Time [s]")
+        plt.ylabel("Acceleration [m/s²]")
+        plt.title(f"Ego Acceleration Comparison (ep {ep_idx})")
+        plt.grid(True)
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.savefig(acc_path)
+        plt.close()
+
+        # --------- 换道曲线（五组） --------- #
+        plt.figure()
+        if lane_rl.size > 0:
+            t_rl = np.arange(lane_rl.size, dtype=float) * dt
+            plt.step(t_rl, lane_rl, where="post", color="tab:blue", linewidth=1.6, label="RL output")
+        if lane_rl_safety_output.size > 0:
+            t_rl_sf = np.arange(lane_rl_safety_output.size, dtype=float) * dt
+            plt.step(t_rl_sf, lane_rl_safety_output, where="post", color="tab:purple", linewidth=1.6, label="RL+safety output")
+        if lane_safety_upper_rl.size > 0:
+            t_su_rl = np.arange(lane_safety_upper_rl.size, dtype=float) * dt
+            plt.step(t_su_rl, lane_safety_upper_rl, where="post", color="tab:orange", linewidth=1.4, linestyle="--", label="RL safety upper")
+        if lane_mpc.size > 0:
+            t_mpc = np.arange(lane_mpc.size, dtype=float) * dt
+            plt.step(t_mpc, lane_mpc, where="post", color="tab:green", linewidth=1.6, label="MPC optimal")
+        if lane_safety_upper_mpc.size > 0:
+            t_su_mpc = np.arange(lane_safety_upper_mpc.size, dtype=float) * dt
+            plt.step(t_su_mpc, lane_safety_upper_mpc, where="post", color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
+        plt.xlabel("Time [s]")
+        plt.ylabel("Lane scalar")
+        plt.title(f"Ego Lane-Change Comparison (ep {ep_idx})")
+        plt.grid(True)
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.savefig(lane_path)
+        plt.close()
+        return
 
     # 根据 show_trajectories 的取值决定绘制哪些车辆
     if show_mode == "all":

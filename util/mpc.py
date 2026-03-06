@@ -255,12 +255,14 @@ class MPCController:
             A_rows.append((-mvt).copy())
             b_rows.append(float(cvt))
 
-        # 2) Hard collision + front-gap constraints with same-lane ahead vehicles.
-        #    Non-overlap and front gap merged as:
-        #    x_ego_t + d_req <= x_nei_t  ->  mxt @ u <= x_nei_t - d_req - cxt
-        #    d_req = 0.5*(L_e + L_n) + min_front_gap
+        # 2) Hard collision + front-gap + front-TTC constraints with same-lane ahead vehicles.
+        #    Distance: x_ego_t + d_req <= x_nei_t  ->  mxt @ u <= x_nei_t - d_req - cxt
+        #    TTC: x_nei_t - x_ego_t >= ttc_min * (vx_ego_t - vx_nei_t)
+        #         -> (mxt + ttc_min*mvt) @ u <= x_nei_t - cxt - ttc_min*(cvt - vx_nei_t)
+        #    d_req uses the same front-gap threshold as lane-change safety gate.
         neighbors_pred = self._predict_neighbors_all(neighbors_state, Hn)
-        d_req = 0.5 * (self.ego_length + self.neighbor_length) + float(self.min_front_gap)
+        d_req = float(self.lc_front_gap_min)
+        ttc_min = float(self.lc_front_ttc_min)
 
         for j in range(neighbors_pred.shape[1]):
             yj0 = float(neighbors_state[j, 1])
@@ -271,10 +273,15 @@ class MPCController:
 
             for t in range(Hn):
                 xj_t = float(neighbors_pred[t, j, 0])
+                vxj_t = float(neighbors_pred[t, j, 2])
                 mxt = Mx[t]
+                mvt = Mv[t]
                 cxt = float(cx[t])
+                cvt = float(cv[t])
                 A_rows.append(mxt.copy())
                 b_rows.append(float(xj_t - d_req - cxt))
+                A_rows.append((mxt + ttc_min * mvt).copy())
+                b_rows.append(float(xj_t - cxt - ttc_min * (cvt - vxj_t)))
 
         if A_rows:
             A = np.vstack(A_rows).astype(np.float32)
@@ -531,8 +538,7 @@ class MPCController:
                     rear_info[ti][lane_i] = (float(best_rear_x), float(best_rear_v))
 
         collision_step = self._collision_step_flags(states, lane_idx_seq, neighbors_state)
-        d_non_overlap = 0.5 * (self.ego_length + self.neighbor_length)
-        d_req_front = d_non_overlap + float(self.min_front_gap)
+        d_req_front = float(self.lc_front_gap_min)
 
         keys = [
             "speed_limit",
@@ -540,6 +546,7 @@ class MPCController:
             "lane_scalar_discrete",
             "collision",
             "front_gap_same_lane",
+            "front_ttc_same_lane",
             "lc_front_gap_origin",
             "lc_front_gap_target",
             "lc_front_ttc_origin",
@@ -573,14 +580,18 @@ class MPCController:
 
             # Same-lane hard front-gap used in MPC constraints.
             front_gap_v = 0.0
+            front_ttc_v = 0.0
             for j in range(neighbors_pred.shape[1]):
                 if j < ahead_now_mask.shape[0] and not bool(ahead_now_mask[j]):
                     continue
                 if int(neighbors_lane_idx[t, j]) != lane_now:
                     continue
                 xj = float(neighbors_pred[t, j, 0])
+                vj = float(neighbors_pred[t, j, 2])
                 gap = xj - ego_x
                 front_gap_v = max(front_gap_v, max(d_req_front - gap, 0.0))
+                rel_front_same = max(ego_vx - vj, 0.0)
+                front_ttc_v = max(front_ttc_v, max(float(self.lc_front_ttc_min) * rel_front_same - gap, 0.0))
 
             lc_front_gap_origin_v = 0.0
             lc_front_gap_target_v = 0.0
@@ -634,6 +645,7 @@ class MPCController:
                 "lane_scalar_discrete": float(lane_disc_v),
                 "collision": float(collision_v),
                 "front_gap_same_lane": float(front_gap_v),
+                "front_ttc_same_lane": float(front_ttc_v),
                 "lc_front_gap_origin": float(lc_front_gap_origin_v),
                 "lc_front_gap_target": float(lc_front_gap_target_v),
                 "lc_front_ttc_origin": float(lc_front_ttc_origin_v),
@@ -817,7 +829,8 @@ class MPCController:
 
         # Hard collision constraints (same lane + ahead vehicle)
         neighbors_pred = self._predict_neighbors_all(neighbors_state, Hn)
-        d_req = 0.5 * (self.ego_length + self.neighbor_length) + float(self.min_front_gap)
+        d_req = float(self.lc_front_gap_min)
+        ttc_min = float(self.lc_front_ttc_min)
         M = float(self.goal_longitudinal + 2.0 * self.speed_limit * Hn * self.dt + 1000.0)
 
         for j in range(neighbors_pred.shape[1]):
@@ -830,6 +843,12 @@ class MPCController:
                 xj_t = float(neighbors_pred[t - 1, j, 0])
                 # If ego in same lane (y_lane[t, lane_j_t]==1), enforce front-gap hard constraint.
                 constraints += [x[t] + d_req <= xj_t + M * (1.0 - y_lane[t, lane_j_t])]
+                # If ego in same lane, also enforce front TTC hard constraint.
+                vj_t = float(neighbors_pred[t - 1, j, 2])
+                rel_front_same = cp.Variable(nonneg=True)
+                constraints += [rel_front_same >= vx[t] - vj_t]
+                d_front_same = xj_t - x[t]
+                constraints += [d_front_same >= ttc_min * rel_front_same - M * (1.0 - y_lane[t, lane_j_t])]
 
         # Lane-change safety constraints:
         # when changing lane at step t, origin lane (t) and target lane (t+1) must satisfy

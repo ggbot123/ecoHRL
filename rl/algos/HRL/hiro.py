@@ -106,6 +106,15 @@ class SB3AgentWrapper:
 
 
 @dataclass
+class LowSafetyFilterConfig:
+    type: str = "mpc_constraints"  # "legacy" | "mpc_constraints"
+    lane_change_min_front_gap: float = 15.0
+    lane_change_min_rear_gap: float = 10.0
+    lane_change_min_front_ttc: float = 3.0
+    lane_change_min_rear_ttc: float = 2.0
+
+
+@dataclass
 class HIROConfig:
     high_interval: int         # 高层每 high_interval 个 env.step 决策一次
     batch_size: int
@@ -129,6 +138,7 @@ class HIROConfig:
     low_pretrained_path: Optional[str] = None
     mask_ego_position_in_low_obs: bool = False
     use_low_safety_layer: bool = False
+    low_safety_filter: Optional[LowSafetyFilterConfig] = None
 
 
 class HIROSAC:
@@ -183,7 +193,12 @@ class HIROSAC:
         self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", False))
         self.low_gamma = float(low_sac_kwargs.get("gamma", 0.99))
         if self.low_level_type == "rule_based":
-            self.low_agent = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
+            self.low_agent = RuleBasedAgentWrapper(
+                env,
+                self.n_envs,
+                high_interval=int(config.high_interval),
+                low_safety_filter=getattr(config, "low_safety_filter", None),
+            )
         elif self.low_level_type == "sac":
             if self.low_sac_impl not in {"auto", "sac", "safety_sac"}:
                 raise ValueError(f"Unknown low_sac_impl: {self.low_sac_impl}")
@@ -241,7 +256,12 @@ class HIROSAC:
                 low_sac = low_sac_cls(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
             self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
             if use_low_safety_layer:
-                self.low_safety = RuleBasedAgentWrapper(env, self.n_envs, high_interval=int(config.high_interval))
+                self.low_safety = RuleBasedAgentWrapper(
+                    env,
+                    self.n_envs,
+                    high_interval=int(config.high_interval),
+                    low_safety_filter=getattr(config, "low_safety_filter", None),
+                )
                 if use_safety_sac:
                     low_sac.target_action_filter = self._low_target_action_filter
         else:
@@ -456,6 +476,7 @@ class HIROSAC:
         high_ret = np.zeros(n_envs, dtype=np.float32)
         low_ret = np.zeros(n_envs, dtype=np.float32)
         low_len = np.zeros(n_envs, dtype=np.int32)
+        low_safety_clip_count = np.zeros(n_envs, dtype=np.int32)
         low_comp_sums: dict[str, np.ndarray] = {}
         goal_err_all = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
         intrinsic_unweighted = np.zeros(n_envs, dtype=np.float32)
@@ -505,6 +526,7 @@ class HIROSAC:
                 high_ret[idx] = 0.0
                 low_ret[idx] = 0.0
                 low_len[idx] = 0
+                low_safety_clip_count[idx] = 0
                 for v in low_comp_sums.values():
                     v[idx] = 0.0
 
@@ -526,7 +548,10 @@ class HIROSAC:
             elif self.low_level_type == "sac":
                 low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
                 if bool(getattr(self.cfg, "use_low_safety_layer", False)):
+                    low_action_raw = low_action.copy()
                     low_action = self.low_safety.apply_safety_layer(low_obs, goal_phys, low_action)
+                    low_safety_clipped = np.any(np.abs(low_action - low_action_raw) > 1e-6, axis=1)
+                    low_safety_clip_count += low_safety_clipped.astype(np.int32)
                     if self.low_sac_impl == "safety_sac" or self.low_sac_impl == "auto":
                         low_buffer_action = low_action.copy()
             else:
@@ -619,6 +644,10 @@ class HIROSAC:
                 idx_end = np.flatnonzero(done_low)
                 low_ret_end = low_ret[idx_end].copy()
                 low_len_end = low_len[idx_end].copy()
+                low_safety_clip_ratio_end = (
+                    low_safety_clip_count[idx_end].astype(np.float32)
+                    / np.maximum(low_len_end.astype(np.float32), 1.0)
+                )
                 low_comp_end = {k: v[idx_end].copy() for k, v in low_comp_sums.items()}
 
                 # goal tracking diagnostics for these finished low-episodes
@@ -626,7 +655,7 @@ class HIROSAC:
                 intrinsic_unweighted_end = intrinsic_unweighted[idx_end].copy()
                 goal_dist_start_end = goal_dist_start[idx_end].copy()
 
-                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end, "goal_dist_start": goal_dist_start_end})
+                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_safety_clip_ratio": low_safety_clip_ratio_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end, "goal_dist_start": goal_dist_start_end})
                 callback.on_rollout_end()
 
                 if train_high:
@@ -653,6 +682,7 @@ class HIROSAC:
                 high_ret[idx_end] = 0.0
                 low_ret[idx_end] = 0.0
                 low_len[idx_end] = 0
+                low_safety_clip_count[idx_end] = 0
                 for v in low_comp_sums.values():
                     v[idx_end] = 0.0
 

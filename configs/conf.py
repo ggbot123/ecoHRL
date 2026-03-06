@@ -30,6 +30,12 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "road_length": 500.0,
     "speed_limit": 15.0,
 
+    # Safety thresholds (shared by safety layer / MPC constraints)
+    "lane_change_min_front_gap": 15.0,
+    "lane_change_min_rear_gap": 10.0,
+    "lane_change_min_front_ttc": 3.0,
+    "lane_change_min_rear_ttc": 2.0,
+
     # Traffic flow
     "spawn_probability": 0.07,
     "flow_speed_range": [10.0, 10.0],
@@ -220,7 +226,7 @@ def get_hiro_low_sac_kwargs(
 
 def get_hiro_config():
     """Centralized HiRO algorithm config."""
-    from rl.algos.HRL.hiro import HIROConfig
+    from rl.algos.HRL.hiro import HIROConfig, LowSafetyFilterConfig
     from rl.algos.HRL.goal_samplers import GoalSamplerConfig
 
     # Intrinsic reward presets. (ego feature order in HIRO: x, y, vx, vy)
@@ -285,9 +291,9 @@ def get_hiro_config():
         # low_level_type="rule_based",
         low_level_type="sac",
 
-        # low_sac_impl="sac",
+        low_sac_impl="sac",
         # low_sac_impl="safety_sac",
-        low_sac_impl="auto",
+        # low_sac_impl="auto",
 
         low_use_her=False,
         low_her_ratio=0.8,
@@ -298,6 +304,17 @@ def get_hiro_config():
 
         use_low_safety_layer=True,
         # use_low_safety_layer=False,
+
+        low_safety_filter=LowSafetyFilterConfig(
+            type="mpc_constraints",
+            lane_change_min_front_gap=15.0,
+            lane_change_min_rear_gap=10.0,
+            lane_change_min_front_ttc=3.0,
+            lane_change_min_rear_ttc=2.0,
+        ),
+        # low_safety_filter=LowSafetyFilterConfig(
+        #     type="legacy",
+        # ),
 
         # mask_ego_position_in_low_obs=True,
         mask_ego_position_in_low_obs=False,

@@ -100,12 +100,20 @@ class HIROLoggingCallback(BaseCallback):
             return
 
         low_len = np.asarray(loc.get("low_len", []), dtype=np.float32).reshape(-1)
+        low_safety_clip_ratio = np.asarray(loc.get("low_safety_clip_ratio", []), dtype=np.float32).reshape(-1)
         low_comp_sums = loc.get("low_comp_sums", {})
 
         # --- TensorBoard Logging ---
         self._rollout_counter += int(low_ret.size)
         self._record_smooth(self.model.low_logger, self._low_buffers, "rollout/ep_rew", float(low_ret.mean()))
         self._record_smooth(self.model.low_logger, self._low_buffers, "rollout/ep_len", float(low_len.mean()) if low_len.size else 0.0)
+        if low_safety_clip_ratio.size:
+            self._record_smooth(
+                self.model.low_logger,
+                self._low_buffers,
+                "rollout/safety_clip_ratio",
+                float(low_safety_clip_ratio.mean()),
+            )
         for k, v in low_comp_sums.items():
             arr = np.asarray(v, dtype=np.float32).reshape(-1)
             if arr.size:

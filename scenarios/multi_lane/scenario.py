@@ -203,7 +203,8 @@ class MultiLaneEnv(AbstractEnv):
         acc = (cur_speed - last_speed) / dt
 
         a_max = float(self.config["comfort_max_accel"])
-        comfort = - (min(abs(acc) / a_max, 1.0) ** 2) * dt
+        comfort = - ((abs(acc) / a_max) ** 2) * dt
+        # comfort = - (min(abs(acc) / a_max, 1.0) ** 2) * dt
 
         # ---------- 3) 换道惩罚 ----------
         curr_lane_id = self.vehicle.lane_index[2]
