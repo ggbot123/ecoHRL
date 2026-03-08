@@ -61,7 +61,11 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "initial_lane_id": "random",
     "warmup_time": 100.0,
     "warmup_each_episode": False,
-    "ego_clear_radius": 10.0,
+    # Ego spawn clearing policy:
+    # - "auto": derive minimal required front distance from safety-layer constraints
+    # - numeric: keep legacy fixed-radius clearing behavior
+    "ego_clear_radius": "auto",
+    "ego_clear_margin": 0.5,
 
     # Observation / Action
     "PERCEPTION_DISTANCE": None,

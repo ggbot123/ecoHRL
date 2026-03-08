@@ -7,6 +7,7 @@ from custom_env import utils
 from custom_env.vehicle.objects import Obstacle, Landmark
 
 from configs.conf import get_env_config
+from util.safety_utils import compute_ego_clear_distance_for_front_vehicle
 
 Observation = np.ndarray
 
@@ -383,15 +384,29 @@ class MultiLaneEnv(AbstractEnv):
         lane_index = ("0", "1", int(lane_id))
         lane = self.road.network.get_lane(lane_index)
 
-        # 先把入口附近的一段距离清空，为 ego 腾位置
-        clear_radius = cfg["ego_clear_radius"]
+        # 清理入口前方车辆：
+        # - ego_clear_radius 为数值时，使用固定半径（兼容旧配置）
+        # - ego_clear_radius="auto" 时，按 safety-layer 约束与前车速度动态计算
+        clear_radius_cfg = cfg.get("ego_clear_radius", "auto")
+        use_fixed_radius = isinstance(clear_radius_cfg, (int, float, np.floating))
         cleaned = []
         for v in self.road.vehicles:
             lane_v = getattr(v, "lane", None)
             if lane_v is lane:
                 longi, _ = lane.local_coordinates(v.position)
-                if 0.0 <= longi < clear_radius: # 清除入口附近的车辆
-                    continue
+                if 0.0 <= longi:
+                    if use_fixed_radius:
+                        if longi < float(clear_radius_cfg):
+                            continue
+                    else:
+                        front_speed = float(getattr(v, "speed", np.linalg.norm(getattr(v, "velocity", np.zeros(2)))))
+                        required_clear_dist = compute_ego_clear_distance_for_front_vehicle(
+                            cfg,
+                            ego_speed=float(cfg["ego_speed"]),
+                            front_speed=front_speed,
+                        )
+                        if longi < required_clear_dist:
+                            continue
             cleaned.append(v)
         self.road.vehicles = cleaned
 
