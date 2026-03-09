@@ -17,6 +17,7 @@ class HIROLoggingCallback(BaseCallback):
         - Low-level: logs low-episode (high_interval) stats.
     - CSV (optional):
         - Logs high-level and low-level trajectories for env 0 periodically.
+        - Logs low_obs at each high-interval start (configurable interval sampling).
     """
 
     def __init__(
@@ -27,6 +28,9 @@ class HIROLoggingCallback(BaseCallback):
         # CSV Logging args
         csv_log_freq_episodes: int = 0,  # 0 to disable
         csv_save_dir: str | None = None,
+        # Low-obs snapshot CSV (high-interval starts)
+        low_obs_csv_interval_hi: int = 1,
+        low_obs_csv_env0_only: bool = True,
     ):
         super().__init__(verbose)
         self.high_log_interval_episodes = int(high_log_interval_episodes)
@@ -34,8 +38,16 @@ class HIROLoggingCallback(BaseCallback):
         
         self.csv_log_freq = int(csv_log_freq_episodes)
         self.csv_save_dir = csv_save_dir
+        self.low_obs_csv_interval_hi = max(1, int(low_obs_csv_interval_hi))
+        self.low_obs_csv_env0_only = bool(low_obs_csv_env0_only)
+
+        self._traj_csv_enabled = self.csv_log_freq > 0 and bool(self.csv_save_dir)
+        self._low_obs_csv_enabled = bool(self.csv_save_dir)
+
         self.csv_active = False  # Whether current episode is being logged to CSV (env 0)
         self.csv_low_traj_recorded = False # Only record first interval's low traj per logged episode
+        self._hi_start_seen = 0
+        self._hi_start_saved = 0
         
         self._episode_counter = 0     # Counts finished episodes (across all envs)
         self._env0_ep_count = 0
@@ -49,8 +61,10 @@ class HIROLoggingCallback(BaseCallback):
         self.comp_keys = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "punctual_reward"]
         self.ego_keys = ["ego_x", "ego_y", "ego_vx", "ego_vy"]
 
-        if self.csv_log_freq > 0 and self.csv_save_dir:
+        if self._traj_csv_enabled or self._low_obs_csv_enabled:
             os.makedirs(self.csv_save_dir, exist_ok=True)
+
+        if self._traj_csv_enabled:
             self.high_csv_path = os.path.join(self.csv_save_dir, "high_traj.csv")
             self.low_csv_path = os.path.join(self.csv_save_dir, "low_traj.csv")
             
@@ -58,6 +72,11 @@ class HIROLoggingCallback(BaseCallback):
             comp_headers = [f"comp_{k}" for k in self.comp_keys]
             self._init_csv(self.high_csv_path, base_header + comp_headers)
             self._init_csv(self.low_csv_path, base_header + comp_headers)
+
+        if self._low_obs_csv_enabled:
+            self.low_obs_start_csv_path = os.path.join(self.csv_save_dir, "low_obs_hi_start.csv")
+            low_obs_header = ["hi_start_seen", "hi_start_saved", "env_id", "step", "episode_env0", "low_obs"]
+            self._init_csv(self.low_obs_start_csv_path, low_obs_header)
 
     def _init_csv(self, path, header):
         if not os.path.exists(path):
@@ -212,6 +231,31 @@ class HIROLoggingCallback(BaseCallback):
                     self._ep_comp_sums.setdefault(name, np.zeros_like(self._ep_ret))[i] += float(val)
                 if i == 0 and self.csv_active:
                     rc_env0 = rc
+
+        # --- CSV Logs (low_obs snapshot at high-interval start) ---
+        if self._low_obs_csv_enabled and hasattr(self, "low_obs_start_csv_path"):
+            c = np.asarray(loc.get("c", []), dtype=np.int32).reshape(-1)
+            low_obs = np.asarray(loc.get("low_obs", []), dtype=np.float32)
+            if c.size and low_obs.size and low_obs.ndim == 2 and low_obs.shape[0] == c.size:
+                start_idx = np.flatnonzero(c == 0)
+                if self.low_obs_csv_env0_only:
+                    start_idx = start_idx[start_idx == 0]
+
+                for env_i in start_idx:
+                    self._hi_start_seen += 1
+                    if ((self._hi_start_seen - 1) % self.low_obs_csv_interval_hi) != 0:
+                        continue
+
+                    self._hi_start_saved += 1
+                    row = [
+                        self._hi_start_seen,
+                        self._hi_start_saved,
+                        int(env_i),
+                        int(self.model.num_timesteps),
+                        int(self._env0_ep_count),
+                        self._fmt_arr(low_obs[env_i]),
+                    ]
+                    self._append_csv(self.low_obs_start_csv_path, row)
 
         # --- CSV Logs (Low Level Step) ---
         # Record only if active and not yet done with first interval

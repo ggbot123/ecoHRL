@@ -78,6 +78,8 @@ def train_hiro(
         low_log_interval_hi=n_envs * 4,
         csv_log_freq_episodes=20,
         csv_save_dir=log_dir,
+        low_obs_csv_interval_hi=10,
+        low_obs_csv_env0_only=True,
         verbose=1,
     )
     checkpoint_cb = HIROCheckpointCallback(
