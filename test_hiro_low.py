@@ -102,6 +102,7 @@ def run_mpc_theoretical_optimal(
     acc_norm = np.asarray(result.get("acc_norm", []), dtype=np.float32).reshape(-1)
     acc_phys = np.asarray(result.get("acc_phys", []), dtype=np.float32).reshape(-1)
     intrinsic_step = np.asarray(result.get("intrinsic_step", []), dtype=np.float32).reshape(-1)
+    comfort_step = np.asarray(result.get("comfort_step", []), dtype=np.float32).reshape(-1)
     low_ext_step = np.asarray(result.get("low_ext_step", []), dtype=np.float32).reshape(-1)
     low_total_step = np.asarray(result.get("low_total_step", []), dtype=np.float32).reshape(-1)
 
@@ -121,6 +122,7 @@ def run_mpc_theoretical_optimal(
                 "pred_vx": float(s[2]) if s.shape[0] > 2 else 0.0,
                 "pred_vy": float(s[3]) if s.shape[0] > 3 else 0.0,
                 "low_ext_step": float(low_ext_step[i]) if i < low_ext_step.shape[0] else 0.0,
+                "comfort_step": float(comfort_step[i]) if i < comfort_step.shape[0] else 0.0,
                 "intrinsic_step": float(intrinsic_step[i]) if i < intrinsic_step.shape[0] else 0.0,
                 "low_total_step": float(low_total_step[i]) if i < low_total_step.shape[0] else 0.0,
             }
@@ -214,6 +216,8 @@ def run_mpc_theoretical_optimal(
         "speed": np.asarray(mpc_speed, dtype=np.float32).reshape(-1),
         "acc": np.asarray(mpc_acc, dtype=np.float32).reshape(-1),
         "lane": np.asarray(mpc_lane, dtype=np.float32).reshape(-1),
+        "intrinsic_step": np.asarray(intrinsic_step, dtype=np.float32).reshape(-1),
+        "comfort_step": np.asarray(comfort_step, dtype=np.float32).reshape(-1),
         "states": np.asarray(states, dtype=np.float32),
         "actions_cont": np.asarray(mpc_actions_cont, dtype=np.float32),
         "neighbors_state": neighbors_state,
@@ -621,9 +625,18 @@ def main(
     rl_safety_speed_curve: List[float] = []
     rl_safety_acc_curve: List[float] = []
     rl_safety_lane_curve: List[float] = []
+    rl_safety_intrinsic_curve: List[float] = []
+    rl_safety_comfort_curve: List[float] = []
     safety_speed_upper_curve: List[float] = []
     safety_acc_upper_curve: List[float] = []
     safety_lane_upper_curve: List[float] = []
+
+    comfort_weight = float(env.unwrapped.config.get("comfort_reward", 0.0))
+    comfort_max_accel = max(float(env.unwrapped.config.get("comfort_max_accel", 3.0)), 1e-6)
+
+    def _comfort_reward_from_acc(acc_phys_val: float) -> float:
+        comfort_base = -(min(abs(float(acc_phys_val)) / comfort_max_accel, 1.0) ** 2) * float(runner.dt)
+        return float(comfort_base * comfort_weight)
 
     _, kin_init, _ = runner._split(obs)
     ego_init = runner._ego_sub(kin_init)
@@ -697,6 +710,8 @@ def main(
 
         last_step = bool(runner.c == runner.hi - 1)
         intrinsic = runner.intrinsic_if_last(obs_next) if last_step else 0.0
+        rl_safety_intrinsic_curve.append(float(intrinsic))
+        rl_safety_comfort_curve.append(_comfort_reward_from_acc(acc_phys_rl_safety))
         reward_sums["intrinsic_reward"] += float(intrinsic)
 
         if record_interval_csv and selected_start_step <= int(step) <= selected_end_step:
@@ -737,10 +752,14 @@ def main(
     mpc_speed_safety_upper_curve = np.asarray([], dtype=np.float32)
     mpc_acc_safety_upper_curve = np.asarray([], dtype=np.float32)
     mpc_lane_safety_upper_curve = np.asarray([], dtype=np.float32)
+    mpc_intrinsic_curve = np.asarray([], dtype=np.float32)
+    mpc_comfort_curve = np.asarray([], dtype=np.float32)
     if isinstance(mpc_curve_data, dict):
         mpc_speed_curve = np.asarray(mpc_curve_data.get("speed", []), dtype=np.float32).reshape(-1)
         mpc_acc_curve = np.asarray(mpc_curve_data.get("acc", []), dtype=np.float32).reshape(-1)
         mpc_lane_curve = np.asarray(mpc_curve_data.get("lane", []), dtype=np.float32).reshape(-1)
+        mpc_intrinsic_curve = np.asarray(mpc_curve_data.get("intrinsic_step", []), dtype=np.float32).reshape(-1)
+        mpc_comfort_curve = np.asarray(mpc_curve_data.get("comfort_step", []), dtype=np.float32).reshape(-1)
 
         mpc_states = np.asarray(mpc_curve_data.get("states", []), dtype=np.float32)
         mpc_actions = np.asarray(mpc_curve_data.get("actions_cont", []), dtype=np.float32)
@@ -822,6 +841,10 @@ def main(
             "lane_safety_upper_rl": np.asarray(safety_lane_upper_curve, dtype=np.float32),
             "lane_mpc": mpc_lane_curve,
             "lane_safety_upper_mpc": mpc_lane_safety_upper_curve,
+            "intrinsic_rl_safety_output": np.asarray(rl_safety_intrinsic_curve, dtype=np.float32),
+            "comfort_rl_safety_output": np.asarray(rl_safety_comfort_curve, dtype=np.float32),
+            "intrinsic_mpc": mpc_intrinsic_curve,
+            "comfort_mpc": mpc_comfort_curve,
         },
     )
 
@@ -869,17 +892,28 @@ if __name__ == "__main__":
 
     main(
         # low_model_path="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping/hiro_low_final.zip",
-        low_model_path="./models/hiro_260305_lowonly_uniform_SL_RS_newSL_oldLoss/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260308_lowonly_uniform_SL_RS_newSLv2_newIni/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260309_lowonly_uniform_SL_RS_newSLv3/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260310_lowonly_uniform_RS_newSLv3_vioPenalty01/hiro_low_final.zip",
+        low_model_path="./models/hiro_260310_lowonly_uniform_RS_newSLv3_vioPenalty05/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260310_lowonly_uniform_RS_newSLv3_vioPenalty10/hiro_low_final.zip",
         steps=25,
         ego_state=[0.0, 4.0, 10.0, 0.0],
         neighbors_state=[
             [30.0, 4.0, 10.0, 0.0],
             [60.0, 8.0, 12.0, 0.0],
             [30.0, 0.0, 10.0, 0.0],
-            [10.0, 8.0, 15.0, 0.0],
+            [5.0, 8.0, 15.0, 0.0],
         ],
-        goal_phys=[25, 8.0, 12.0, 0.0],
-        # batch_cases_csv="./configs/low_test_cases.csv",
+        # neighbors_state=[
+        #     [21.3, 8.0, 7.6, 0.0],
+        #     [25.1, 0.0, 11.0, 0.0],
+        #     [47.3, 4.0, 12.6, 0.0],
+        #     [55.1, 0.0, 12.4, 0.0],
+        # ],
+        goal_phys=[30, 4.0, 12.0, 0.0],
+        # batch_cases_csv="low_test_cases.csv",
+        # batch_cases_csv="low_test_cases_debug.csv",
         use_low_safety_layer=True,
         out_dir="./models/debug/low_level_rollout",
         uniform_trials=0,

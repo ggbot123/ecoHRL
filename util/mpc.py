@@ -760,6 +760,7 @@ class MPCController:
 
         return {
             "intrinsic_step": intrinsic_step,
+            "comfort_step": np.asarray(comfort_step * float(self.w.get("comfort_reward", 0.0)), dtype=np.float32),
             "low_ext_step": low_ext_step,
             "low_total_step": low_total_step,
             "sum_low_ext": float(np.sum(low_ext_step)),
@@ -1109,6 +1110,7 @@ class MPCController:
 
         return {
             "intrinsic_step": intrinsic_step,
+            "comfort_step": np.asarray(comfort_step * float(self.w.get("comfort_reward", 0.0)), dtype=np.float32),
             "low_ext_step": low_ext_step,
             "low_total_step": low_total_step,
             "sum_low_ext": float(np.sum(low_ext_step)),

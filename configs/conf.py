@@ -61,11 +61,9 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "initial_lane_id": "random",
     "warmup_time": 100.0,
     "warmup_each_episode": False,
-    # Ego spawn clearing policy:
-    # - "auto": derive minimal required front distance from safety-layer constraints
-    # - numeric: keep legacy fixed-radius clearing behavior
-    "ego_clear_radius": "auto",
-    "ego_clear_margin": 0.5,
+    "ego_clear_radius": 10.0,
+    # "ego_clear_radius": "auto",
+    # "ego_clear_margin": 0.5,
 
     # Observation / Action
     "PERCEPTION_DISTANCE": None,
@@ -105,6 +103,8 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "comfort_reward": 0.7,
     "comfort_max_accel": 3.0,
     "lane_change_reward": -0.5,
+    "lane_change_penalty_mode": "actual_lane_change",
+    # "lane_change_penalty_mode": "target_lane_switch",
 
     # Termination
     "offroad_terminal": False,
@@ -308,11 +308,12 @@ def get_hiro_config():
 
         use_low_safety_layer=True,
         # use_low_safety_layer=False,
+        low_safety_violation_penalty=1,
 
         low_safety_filter=LowSafetyFilterConfig(
             type="mpc_constraints",
-            lane_change_min_front_gap=15.0,
-            lane_change_min_rear_gap=10.0,
+            lane_change_min_front_gap=10.0,
+            lane_change_min_rear_gap=8.0,
             lane_change_min_front_ttc=3.0,
             lane_change_min_rear_ttc=2.0,
         ),

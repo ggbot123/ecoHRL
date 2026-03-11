@@ -457,11 +457,29 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         acc_mpc = np.asarray(comparison_data.get("acc_mpc", []), dtype=float).reshape(-1)
         acc_safety_upper_mpc = np.asarray(comparison_data.get("acc_safety_upper_mpc", []), dtype=float).reshape(-1)
 
+        intrinsic_rl_safety_output = np.asarray(comparison_data.get("intrinsic_rl_safety_output", []), dtype=float).reshape(-1)
+        comfort_rl_safety_output = np.asarray(comparison_data.get("comfort_rl_safety_output", []), dtype=float).reshape(-1)
+        intrinsic_mpc = np.asarray(comparison_data.get("intrinsic_mpc", []), dtype=float).reshape(-1)
+        comfort_mpc = np.asarray(comparison_data.get("comfort_mpc", []), dtype=float).reshape(-1)
+
         lane_rl = np.asarray(comparison_data.get("lane_rl", []), dtype=float).reshape(-1)
         lane_rl_safety_output = np.asarray(comparison_data.get("lane_rl_safety_output", []), dtype=float).reshape(-1)
         lane_safety_upper_rl = np.asarray(comparison_data.get("lane_safety_upper_rl", []), dtype=float).reshape(-1)
         lane_mpc = np.asarray(comparison_data.get("lane_mpc", []), dtype=float).reshape(-1)
         lane_safety_upper_mpc = np.asarray(comparison_data.get("lane_safety_upper_mpc", []), dtype=float).reshape(-1)
+
+        def _to_lane_target_code(arr: np.ndarray) -> np.ndarray:
+            if arr.size == 0:
+                return arr
+            bins = np.array([-1.0, 0.0, 1.0], dtype=float)
+            idx = np.argmin(np.abs(arr.reshape(-1, 1) - bins.reshape(1, -1)), axis=1)
+            return bins[idx]
+
+        lane_rl = _to_lane_target_code(lane_rl)
+        lane_rl_safety_output = _to_lane_target_code(lane_rl_safety_output)
+        lane_safety_upper_rl = _to_lane_target_code(lane_safety_upper_rl)
+        lane_mpc = _to_lane_target_code(lane_mpc)
+        lane_safety_upper_mpc = _to_lane_target_code(lane_safety_upper_mpc)
 
         # --------- 速度曲线（五组） --------- #
         plt.figure()
@@ -490,30 +508,60 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         plt.close()
 
         # --------- 加速度曲线（五组） --------- #
-        plt.figure()
+        fig, ax = plt.subplots()
         if acc_rl.size > 0:
             t_rl = np.arange(acc_rl.size, dtype=float) * dt
-            plt.plot(t_rl, acc_rl, color="tab:blue", linewidth=1.6, label="RL output")
+            ax.plot(t_rl, acc_rl, color="tab:blue", linewidth=1.6, label="RL output")
         if acc_rl_safety_output.size > 0:
             t_rl_sf = np.arange(acc_rl_safety_output.size, dtype=float) * dt
-            plt.plot(t_rl_sf, acc_rl_safety_output, color="tab:purple", linewidth=1.6, label="RL+safety output")
+            ax.plot(t_rl_sf, acc_rl_safety_output, color="tab:purple", linewidth=1.6, label="RL+safety output")
         if acc_safety_upper_rl.size > 0:
             t_su_rl = np.arange(acc_safety_upper_rl.size, dtype=float) * dt
-            plt.plot(t_su_rl, acc_safety_upper_rl, color="tab:orange", linewidth=1.4, linestyle="--", label="RL safety upper")
+            ax.plot(t_su_rl, acc_safety_upper_rl, color="tab:orange", linewidth=1.4, linestyle="--", label="RL safety upper")
         if acc_mpc.size > 0:
             t_mpc = np.arange(acc_mpc.size, dtype=float) * dt
-            plt.plot(t_mpc, acc_mpc, color="tab:green", linewidth=1.6, label="MPC optimal")
+            ax.plot(t_mpc, acc_mpc, color="tab:green", linewidth=1.6, label="MPC optimal")
         if acc_safety_upper_mpc.size > 0:
             t_su_mpc = np.arange(acc_safety_upper_mpc.size, dtype=float) * dt
-            plt.plot(t_su_mpc, acc_safety_upper_mpc, color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
-        plt.xlabel("Time [s]")
-        plt.ylabel("Acceleration [m/s²]")
-        plt.title(f"Ego Acceleration Comparison (ep {ep_idx})")
-        plt.grid(True)
-        plt.legend(loc="best")
-        plt.tight_layout()
-        plt.savefig(acc_path)
-        plt.close()
+            ax.plot(t_su_mpc, acc_safety_upper_mpc, color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
+
+        def _fmt_reward_sum(arr: np.ndarray) -> str:
+            if arr.size == 0:
+                return "N/A"
+            return f"{float(np.sum(arr)):.4f}"
+
+        reward_text = (
+            "Reward summary\n"
+            f"intrinsic (RL+safety): {_fmt_reward_sum(intrinsic_rl_safety_output)}\n"
+            f"comfort   (RL+safety): {_fmt_reward_sum(comfort_rl_safety_output)}\n"
+            f"intrinsic (MPC): {_fmt_reward_sum(intrinsic_mpc)}\n"
+            f"comfort   (MPC): {_fmt_reward_sum(comfort_mpc)}"
+        )
+
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("Acceleration [m/s²]")
+        ax.set_title(f"Ego Acceleration Comparison (ep {ep_idx})")
+        ax.grid(True)
+
+        lines_l, labels_l = ax.get_legend_handles_labels()
+        if lines_l:
+            ax.legend(lines_l, labels_l, loc="best")
+
+        fig.subplots_adjust(right=0.77)
+        ax.text(
+            1.02,
+            0.98,
+            reward_text,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=9,
+            bbox=dict(facecolor="white", alpha=0.85, edgecolor="0.7"),
+        )
+
+        fig.tight_layout(rect=[0.0, 0.0, 0.77, 1.0])
+        fig.savefig(acc_path)
+        plt.close(fig)
 
         # --------- 换道曲线（五组） --------- #
         plt.figure()
@@ -533,9 +581,10 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
             t_su_mpc = np.arange(lane_safety_upper_mpc.size, dtype=float) * dt
             plt.step(t_su_mpc, lane_safety_upper_mpc, where="post", color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
         plt.xlabel("Time [s]")
-        plt.ylabel("Lane scalar")
+        plt.ylabel("Target lane cmd (-1/0/1)")
         plt.title(f"Ego Lane-Change Comparison (ep {ep_idx})")
         plt.grid(True)
+        plt.yticks([-1, 0, 1])
         plt.legend(loc="best")
         plt.tight_layout()
         plt.savefig(lane_path)

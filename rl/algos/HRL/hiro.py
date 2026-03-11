@@ -87,6 +87,21 @@ class SB3AgentWrapper:
             n_envs=n,
         )
 
+    def predict_action(self, obs: np.ndarray, deterministic: bool = True) -> np.ndarray:
+        obs = np.asarray(obs, dtype=np.float32)
+        n = int(obs.shape[0])
+
+        if int(getattr(self.agent, "n_envs", n)) == 1 and n > 1:
+            act_dim = int(self.agent.action_space.shape[0])
+            action = np.empty((n, act_dim), dtype=np.float32)
+            for i in range(n):
+                a, _ = self.agent.predict(obs[i:i + 1], deterministic=deterministic)
+                action[i] = np.asarray(a, dtype=np.float32).reshape(-1)
+            return action
+
+        a, _ = self.agent.predict(obs, deterministic=deterministic)
+        return np.asarray(a, dtype=np.float32)
+
     def store_transition(self, obs: np.ndarray, action: np.ndarray, next_obs: np.ndarray, reward: np.ndarray, done: np.ndarray, infos: List[Dict[str, Any]]):
         self.agent._last_obs = obs
         self.agent._store_transition(self.replay_buffer, action, next_obs, reward, done, infos)
@@ -139,6 +154,7 @@ class HIROConfig:
     mask_ego_position_in_low_obs: bool = False
     use_low_safety_layer: bool = False
     low_safety_filter: Optional[LowSafetyFilterConfig] = None
+    low_safety_violation_penalty: float = 0.0
 
 
 class HIROSAC:
@@ -169,6 +185,8 @@ class HIROSAC:
         self.dt = 1.0 / float(env_cfg["policy_frequency"])
         lanes = int(env_cfg["lanes_count"])
         lane_w = float(env_cfg.get("lane_width", 4.0))
+        self.n_lanes = int(lanes)
+        self.max_lane_id = int(max(self.n_lanes - 1, 1))
         self.lane_center_ys = (np.arange(lanes, dtype=np.float32) * lane_w).astype(np.float32)
 
         # ----- 定义 Spaces -----  #
@@ -278,6 +296,7 @@ class HIROSAC:
                     low_action_dim=int(np.prod(low_act_space.shape)),
                     feat_dim=int(self.feat_dim),
                     ego_feature_idx=list(self.ego_feature_idx),
+                    low_obs_extra_dim=0,
                     lane_center_ys=self.lane_center_ys,
                     high_interval=int(self.cfg.high_interval),
                     low_policy=self.low_agent.policy,
@@ -541,12 +560,20 @@ class HIROSAC:
 
             # === 1.2 Low Level Decision ===
             low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys)
+            low_safety_clipped = np.zeros(n_envs, dtype=bool)
             
             if self.low_level_type == "rule_based":
-                low_action = self.low_agent.act(low_obs, goal_phys)
+                low_action_raw = self.low_agent.act(low_obs, goal_phys)
+                low_action = self.low_agent.apply_safety_layer(low_obs, goal_phys, low_action_raw)
+                low_safety_clipped = np.any(np.abs(low_action - low_action_raw) > 1e-6, axis=1)
+                low_safety_clip_count += low_safety_clipped.astype(np.int32)
                 low_buffer_action = low_action.copy()
             elif self.low_level_type == "sac":
-                low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
+                if train_low:
+                    low_action, low_buffer_action = self.low_agent.sample_action(low_obs)
+                else:
+                    low_action = self.low_agent.predict_action(low_obs, deterministic=True)
+                    low_buffer_action = low_action.copy()
                 if bool(getattr(self.cfg, "use_low_safety_layer", False)):
                     low_action_raw = low_action.copy()
                     low_action = self.low_safety.apply_safety_layer(low_obs, goal_phys, low_action)
@@ -562,8 +589,8 @@ class HIROSAC:
                 opc_low_obs_seq[np.arange(n_envs), c] = low_obs
                 opc_low_act_seq[np.arange(n_envs), c] = low_buffer_action
 
-            next_obs, reward, done, infos = env.step(low_action)
-            reward = np.asarray(reward, dtype=np.float32)
+            next_obs, reward_env, done, infos = env.step(low_action)
+            reward_env = np.asarray(reward_env, dtype=np.float32)
             done = np.asarray(done, dtype=bool)
 
             next_obs_tr = self._terminal_obs(next_obs, done, infos)
@@ -571,14 +598,19 @@ class HIROSAC:
             _, kin_next, kin_flat_next = utils.split_time_kinematics(next_high_obs, self.n_veh, self.feat_dim)
 
             # === 1.3 Calculate Rewards ===
-            high_ret += reward
+            # High-level reward strictly uses environment extrinsic reward.
+            high_ret += reward_env
 
             r_components = [info.get("reward_components", {}) for info in infos]
             punctual = np.asarray([rc.get("punctual_reward", 0.0) for rc in r_components], dtype=np.float32)
-            low_reward_ext = reward - punctual
+            low_reward_ext = reward_env - punctual
             if str(getattr(self.cfg, "intrinsic_type", "l2")).lower() == "huber_shaping":
                 progress = np.asarray([rc.get("progress_reward", 0.0) for rc in r_components], dtype=np.float32)
                 low_reward_ext = low_reward_ext - progress
+
+            safety_penalty_coef = float(getattr(self.cfg, "low_safety_violation_penalty", 0.0))
+            safety_penalty = np.where(low_safety_clipped, safety_penalty_coef, 0.0).astype(np.float32)
+            low_reward_ext = low_reward_ext - safety_penalty
 
             # calculate intrinsic reward
             is_last_step = (c == hi - 1) | done
@@ -600,6 +632,8 @@ class HIROSAC:
                     low_comp_sums.setdefault(name, np.zeros(n_envs, dtype=np.float32))[i] += float(val)
             if is_last_step.any():
                 low_comp_sums.setdefault("intrinsic_reward", np.zeros(n_envs, dtype=np.float32))[is_last_step] += intrinsic[is_last_step]
+            if np.any(safety_penalty > 0.0):
+                low_comp_sums.setdefault("safety_violation_penalty", np.zeros(n_envs, dtype=np.float32))[:] += (-safety_penalty)
 
             # === 1.4 Low Level Store & Train ===
             next_low_obs = self._build_low_obs(c + 1, kin_flat_next, kin_next, goal_phys)
@@ -634,7 +668,6 @@ class HIROSAC:
 
             self.total_timesteps += n_envs
 
-            reward_env = reward
             callback.update_locals(locals())
             if callback.on_step() is False:
                 break
