@@ -155,6 +155,7 @@ class HIROConfig:
     use_low_safety_layer: bool = False
     low_safety_filter: Optional[LowSafetyFilterConfig] = None
     low_safety_violation_penalty: float = 0.0
+    fixed_goal_vx: Optional[float] = None
 
 
 class HIROSAC:
@@ -197,6 +198,11 @@ class HIROSAC:
         # 目标空间：[rel_x, rel_y, vx]，rel_y从[-1, 1]映射到左右车道中心线
         goal_low = np.array([self.v_min * t_h, -1, self.v_min], dtype=np.float32)
         goal_high = np.array([self.v_max * t_h, 1, self.v_max], dtype=np.float32)
+        fixed_goal_vx = getattr(self.cfg, "fixed_goal_vx", None)
+        if fixed_goal_vx is not None:
+            fixed_goal_vx = float(np.clip(float(fixed_goal_vx), self.v_min, self.v_max))
+            goal_low[2] = fixed_goal_vx
+            goal_high[2] = fixed_goal_vx
         high_act_space = gym.spaces.Box(goal_low, goal_high, dtype=np.float32)
 
         low_obs_dim = self.local_kin_flat_dim + self.ego_dim + 1
@@ -296,7 +302,6 @@ class HIROSAC:
                     low_action_dim=int(np.prod(low_act_space.shape)),
                     feat_dim=int(self.feat_dim),
                     ego_feature_idx=list(self.ego_feature_idx),
-                    low_obs_extra_dim=0,
                     lane_center_ys=self.lane_center_ys,
                     high_interval=int(self.cfg.high_interval),
                     low_policy=self.low_agent.policy,
@@ -375,7 +380,7 @@ class HIROSAC:
 
         # Mask ego absolute position in low_obs
         mask_ego_pos = bool(getattr(self.cfg, "mask_ego_position_in_low_obs", False))
-        if self.low_level_type == "rule_based" or bool(getattr(self.cfg, "use_low_safety_layer", False)):
+        if self.low_level_type == "rule_based":
             mask_ego_pos = False
         if mask_ego_pos:
             idx_x = int(self.feature_names.index("x"))

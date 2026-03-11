@@ -163,6 +163,17 @@ def main(
         if hiro_low_sac_impl is not None:
             hiro_cfg.low_sac_impl = str(hiro_low_sac_impl)
 
+        if hiro_cfg.low_safety_filter is not None:
+            env_overrides = dict(env_overrides)
+            env_overrides.update(
+                {
+                    "lane_change_min_front_gap": float(hiro_cfg.low_safety_filter.lane_change_min_front_gap),
+                    "lane_change_min_rear_gap": float(hiro_cfg.low_safety_filter.lane_change_min_rear_gap),
+                    "lane_change_min_front_ttc": float(hiro_cfg.low_safety_filter.lane_change_min_front_ttc),
+                    "lane_change_min_rear_ttc": float(hiro_cfg.low_safety_filter.lane_change_min_rear_ttc),
+                }
+            )
+
         print(f"[HIRO] Train Mode: {hiro_cfg.train_mode}, Goal Sampler: {hiro_cfg.goal_sampler.type}")
         print(f"[HIRO] Low SAC Impl: {hiro_cfg.low_sac_impl}")
         print(f"[HIRO] High pretrained: {hiro_cfg.high_pretrained_path}")
@@ -217,12 +228,14 @@ if __name__ == "__main__":
         save_freq=50_000,
         n_envs=8,
         # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
-        # hiro_low_pretrained_path="./models/hiro_260305_lowonly_uniform_SL_RS_newSL_oldLoss/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260310_lowonly_uniform_RS_newSLv3_vioPenalty05/hiro_low_final.zip",
         hiro_low_target_entropy="auto",
         hiro_low_target_entropy_scale=1,
-        # run_name=f"hiro_260227_joint_SL_RS_smallBS+lowtrainfreq",
-        # run_name=f"hiro_260306_highonly_pretrained_newSL_oldLoss",
-        # run_name=f"hiro_260305_lowonly_uniform_SL_RS_newSL_newLoss",
-        # run_name=f"hiro_260305_lowonly_uniform_SL_RS_oldSL_oldLoss",
-        run_name=f"hiro_260307_lowonly_uniform_SL_RS_newSLv2_oldLoss",
+        # run_name=f"hiro_260310_highonly_pretrained_newSLv3_lowDet",
+        # run_name=f"hiro_260310_highonly_pretrained_newSLv3_lowDet_vioPenalty05",
+        # run_name=f"hiro_260310_lowonly_uniform_RS_newSLv3_vioPenalty10",
+        # run_name=f"hiro_260309_lowonly_uniform_SL_RS_newSLv3",
+        # run_name=f"hiro_260309_highonly_rule_withSL",
+        # run_name=f"hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03",
+        run_name=f"hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03_reducedDim",
     )

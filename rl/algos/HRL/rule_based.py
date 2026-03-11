@@ -289,6 +289,14 @@ class RuleBasedController:
             return int(np.clip(ego_lane + 1, 0, self.lanes_count - 1))
         return int(np.clip(ego_lane, 0, self.lanes_count - 1))
 
+    def _as_ego_abs4(self, ego_abs: np.ndarray) -> np.ndarray:
+        ego = np.asarray(ego_abs, dtype=np.float32).reshape(-1)
+        if ego.size != 4:
+            raise ValueError(
+                f"ego_abs must be exactly 4 elements [x, y, vx, vy], got shape {ego.shape}"
+            )
+        return ego.astype(np.float32, copy=False)
+
     def safety_filter_action(
         self,
         ego_abs: np.ndarray,
@@ -298,8 +306,8 @@ class RuleBasedController:
         dt: float,
         remaining_time: Optional[float] = None,
     ) -> np.ndarray:
-        if self.low_safety_filter_type == "mpc_constraints":
-            return self._safety_filter_action_mpc_constraints(
+        if self.low_safety_filter_type == "legacy":
+            return self._safety_filter_action_legacy(
                 ego_abs=ego_abs,
                 others_rel=others_rel,
                 goal_phys=goal_phys,
@@ -308,14 +316,225 @@ class RuleBasedController:
                 remaining_time=remaining_time,
             )
 
-        return self._safety_filter_action_legacy(
-            ego_abs=ego_abs,
+        ego_abs = self._as_ego_abs4(ego_abs)
+        goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
+        ego_vel = np.asarray([float(ego_abs[2]), float(ego_abs[3])], dtype=np.float32)
+        goal_rel = (goal_phys - ego_abs).astype(np.float32)
+        ego_y = float(ego_abs[1])
+        ego_lane = int(self.get_lane_index(ego_y))
+        return self.safety_filter_action_relative(
+            ego_vel=ego_vel,
             others_rel=others_rel,
-            goal_phys=goal_phys,
+            goal_rel=goal_rel,
             action=action,
             dt=dt,
             remaining_time=remaining_time,
+            ego_lane=ego_lane,
+            ego_y=ego_y,
         )
+
+    def _collect_lane_rel_neighbors(
+        self,
+        others_rel: np.ndarray,
+        lane_offset: int,
+        ego_lane: int,
+        ego_y: float,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        front: Optional[np.ndarray] = None
+        rear: Optional[np.ndarray] = None
+        front_dx = float("inf")
+        rear_dx = float("inf")
+        for row in np.asarray(others_rel, dtype=np.float32).reshape(-1, 4):
+            dx, dy, dvx, dvy = [float(v) for v in row]
+            lane_idx = int(self.get_lane_index(float(ego_y) + dy))
+            row_lane_offset = int(lane_idx - int(ego_lane))
+
+            if row_lane_offset != int(lane_offset):
+                continue
+            if dx >= 0.0:
+                if dx < front_dx:
+                    front_dx = dx
+                    front = np.array([dx, dy, dvx, dvy], dtype=np.float32)
+            else:
+                if -dx < rear_dx:
+                    rear_dx = -dx
+                    rear = np.array([dx, dy, dvx, dvy], dtype=np.float32)
+        return front, rear
+
+    def _lane_constraints_ok_relative(
+        self,
+        ego_x_next: float,
+        ego_vx_next: float,
+        lane_offset: int,
+        ego_vx_now: float,
+        others_rel: np.ndarray,
+        dt: float,
+        ego_lane: int,
+        ego_y: float,
+    ) -> bool:
+        front, rear = self._collect_lane_rel_neighbors(
+            others_rel,
+            lane_offset,
+            ego_lane=ego_lane,
+            ego_y=ego_y,
+        )
+
+        if front is not None:
+            dx, _dy, dvx, _dvy = [float(v) for v in front]
+            d_front = float(dx + dvx * dt - ego_x_next)
+            rel_front = max(float(ego_vx_next) - float(ego_vx_now + dvx), 0.0)
+            if d_front < float(self.config.get("lane_change_min_front_gap", 10.0)):
+                return False
+            if d_front < float(self.config.get("lane_change_min_front_ttc", 3.0)) * rel_front:
+                return False
+
+        if rear is not None:
+            dx, _dy, dvx, _dvy = [float(v) for v in rear]
+            d_rear = float(ego_x_next - (dx + dvx * dt))
+            rel_rear = max(float(ego_vx_now + dvx) - float(ego_vx_next), 0.0)
+            if d_rear < float(self.config.get("lane_change_min_rear_gap", 8.0)):
+                return False
+            if d_rear < float(self.config.get("lane_change_min_rear_ttc", 2.0)) * rel_rear:
+                return False
+
+        return True
+
+    def safety_filter_action_relative(
+        self,
+        ego_vel: np.ndarray,
+        others_rel: np.ndarray,
+        goal_rel: np.ndarray,
+        action: np.ndarray,
+        dt: float,
+        remaining_time: Optional[float] = None,
+        ego_lane: int = 0,
+        ego_y: float = 0.0,
+    ) -> np.ndarray:
+        """Safety layer using only ego velocity, relative neighbors and goal_rel.
+
+        This path avoids dependency on ego absolute x/y in low_obs.
+        """
+        _ = goal_rel
+        _ = remaining_time
+
+        act = np.asarray(action, dtype=np.float32).reshape(-1)
+        if self.action_type != "ParamLaneAccelAction":
+            return act.astype(np.float32)
+
+        ego_vel = np.asarray(ego_vel, dtype=np.float32).reshape(-1)
+        ego_vx = float(ego_vel[0])
+
+        lane_scalar = float(act[0])
+        acc_norm = float(act[1])
+        acc_phys_req = self._acc_norm_to_phys(acc_norm)
+
+        dt_safe = max(float(dt), 1e-6)
+        acc_for_gate = float(np.clip(acc_phys_req, self.acc_min, self.acc_max))
+        ego_x_next = float(ego_vx * dt_safe + 0.5 * acc_for_gate * (dt_safe ** 2))
+        ego_vx_next = float(ego_vx + acc_for_gate * dt_safe)
+
+        ego_lane_clip = int(np.clip(int(ego_lane), 0, self.lanes_count - 1))
+        target_lane = self._scalar_to_lane(ego_lane_clip, lane_scalar)
+        lane_step = int(target_lane - ego_lane_clip)
+
+        if lane_step != 0:
+            ok_origin = self._lane_constraints_ok_relative(
+                ego_x_next,
+                ego_vx_next,
+                0,
+                ego_vx,
+                others_rel,
+                dt_safe,
+                ego_lane=ego_lane,
+                ego_y=ego_y,
+            )
+            ok_target = self._lane_constraints_ok_relative(
+                ego_x_next,
+                ego_vx_next,
+                lane_step,
+                ego_vx,
+                others_rel,
+                dt_safe,
+                ego_lane=ego_lane,
+                ego_y=ego_y,
+            )
+            if not (ok_origin and ok_target):
+                lane_scalar = 0.0
+                lane_step = 0
+
+        lane_front_gap_min = float(self.config.get("lane_change_min_front_gap", 10.0))
+        lane_front_ttc_min = float(self.config.get("lane_change_min_front_ttc", 3.0))
+
+        a_upper = float(self.acc_max)
+        a_upper = min(a_upper, float((self.speed_limit - ego_vx) / dt_safe))
+
+        den_gap = 0.5 * (dt_safe ** 2)
+        den_ttc = den_gap + lane_front_ttc_min * dt_safe
+
+        for row in np.asarray(others_rel, dtype=np.float32).reshape(-1, 4):
+            dx, dy, dvx, _dvy = [float(v) for v in row]
+            lane_idx = int(self.get_lane_index(float(ego_y) + dy))
+            row_lane_offset = int(lane_idx - int(ego_lane))
+
+            if row_lane_offset != int(lane_step):
+                continue
+            if dx <= 0.0:
+                continue
+
+            xj1_rel = float(dx + dvx * dt_safe)
+
+            if den_gap > 1e-9:
+                a_gap = (xj1_rel - lane_front_gap_min - ego_vx * dt_safe) / den_gap
+                a_upper = min(a_upper, float(a_gap))
+
+            if den_ttc > 1e-9:
+                a_ttc = (xj1_rel - ego_vx * dt_safe + lane_front_ttc_min * dvx) / den_ttc
+                a_upper = min(a_upper, float(a_ttc))
+
+        acc_phys = min(float(acc_phys_req), float(a_upper))
+        acc_phys = float(np.clip(acc_phys, self.acc_min, self.acc_max))
+        acc_norm = self._acc_phys_to_norm(acc_phys)
+        return np.array([lane_scalar, acc_norm], dtype=np.float32)
+
+    @staticmethod
+    def _ttc_ok(distance: float, rel_speed_closing: float, min_ttc: float) -> bool:
+        return bool(float(distance) >= float(min_ttc) * max(float(rel_speed_closing), 0.0))
+
+    def _lane_change_constraints_ok(
+        self,
+        ego: VirtualVehicle,
+        front_origin: Optional[VirtualVehicle],
+        front_target: Optional[VirtualVehicle],
+        rear_target: Optional[VirtualVehicle],
+    ) -> bool:
+        ex = float(ego.position[0])
+        evx = float(ego.velocity[0])
+
+        if front_origin is not None:
+            d_front_origin = float(front_origin.position[0]) - ex
+            rel_front_origin = max(evx - float(front_origin.velocity[0]), 0.0)
+            if d_front_origin < float(self.config.get("lane_change_min_front_gap", 10.0)):
+                return False
+            if not self._ttc_ok(d_front_origin, rel_front_origin, float(self.config.get("lane_change_min_front_ttc", 3.0))):
+                return False
+
+        if front_target is not None:
+            d_front_target = float(front_target.position[0]) - ex
+            rel_front_target = max(evx - float(front_target.velocity[0]), 0.0)
+            if d_front_target < float(self.config.get("lane_change_min_front_gap", 10.0)):
+                return False
+            if not self._ttc_ok(d_front_target, rel_front_target, float(self.config.get("lane_change_min_front_ttc", 3.0))):
+                return False
+
+        if rear_target is not None:
+            d_rear_target = ex - float(rear_target.position[0])
+            rel_rear_target = max(float(rear_target.velocity[0]) - evx, 0.0)
+            if d_rear_target < float(self.config.get("lane_change_min_rear_gap", 8.0)):
+                return False
+            if not self._ttc_ok(d_rear_target, rel_rear_target, float(self.config.get("lane_change_min_rear_ttc", 2.0))):
+                return False
+
+        return True
 
     def _safety_filter_action_legacy(
         self,
@@ -331,25 +550,22 @@ class RuleBasedController:
         For ParamLaneAccelAction: adjust lane_scalar if MOBIL disallows, and
         clamp acc by IDM safety for current/target lane.
         """
-        ego_x, ego_y, ego_vx, ego_vy = [float(v) for v in np.asarray(ego_abs).reshape(-1)]
+        ego = self._as_ego_abs4(ego_abs)
+        ego_x, ego_y, ego_vx, ego_vy = [float(v) for v in ego]
         ego_speed = float(math.sqrt(ego_vx * ego_vx + ego_vy * ego_vy))
         ego_heading = float(math.atan2(ego_vy, ego_vx)) if ego_speed > 0.1 else 0.0
         ego_lane = self.get_lane_index(ego_y)
 
-        # Align target_speed with compute_action (use goal and remaining_time if provided)
         goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
         goal_x = float(goal_phys[0])
         goal_vx = float(goal_phys[2])
 
-        # if remaining_time is not None:
-        #     rt = max(float(remaining_time), float(dt))
-        #     target_speed = max((goal_x - ego_x) / rt, 0.0)
-        # else:
-        #     target_speed = abs(goal_vx)
-        # target_speed = float(np.clip(target_speed, 0.0, self.speed_limit))
+        _ = goal_x
+        _ = goal_vx
+        _ = remaining_time
+        _ = dt
         target_speed = float(self.speed_limit)
 
-        # Build other vehicles in absolute frame
         others: List[VirtualVehicle] = []
         for row in np.asarray(others_rel, dtype=np.float32).reshape(-1, 4):
             dx, dy, dvx, dvy = [float(v) for v in row]
@@ -408,206 +624,6 @@ class RuleBasedController:
 
         return act.astype(np.float32)
 
-    @staticmethod
-    def _ttc_ok(distance: float, rel_speed_closing: float, min_ttc: float) -> bool:
-        return bool(float(distance) >= float(min_ttc) * max(float(rel_speed_closing), 0.0))
-
-    def _lane_change_constraints_ok(
-        self,
-        ego: VirtualVehicle,
-        front_origin: Optional[VirtualVehicle],
-        front_target: Optional[VirtualVehicle],
-        rear_target: Optional[VirtualVehicle],
-    ) -> bool:
-        ex = float(ego.position[0])
-        evx = float(ego.velocity[0])
-
-        if front_origin is not None:
-            d_front_origin = float(front_origin.position[0]) - ex
-            rel_front_origin = max(evx - float(front_origin.velocity[0]), 0.0)
-            if d_front_origin < float(self.config.get("lane_change_min_front_gap", 10.0)):
-                return False
-            if not self._ttc_ok(d_front_origin, rel_front_origin, float(self.config.get("lane_change_min_front_ttc", 3.0))):
-                return False
-
-        if front_target is not None:
-            d_front_target = float(front_target.position[0]) - ex
-            rel_front_target = max(evx - float(front_target.velocity[0]), 0.0)
-            if d_front_target < float(self.config.get("lane_change_min_front_gap", 10.0)):
-                return False
-            if not self._ttc_ok(d_front_target, rel_front_target, float(self.config.get("lane_change_min_front_ttc", 3.0))):
-                return False
-
-        if rear_target is not None:
-            d_rear_target = ex - float(rear_target.position[0])
-            rel_rear_target = max(float(rear_target.velocity[0]) - evx, 0.0)
-            if d_rear_target < float(self.config.get("lane_change_min_rear_gap", 8.0)):
-                return False
-            if not self._ttc_ok(d_rear_target, rel_rear_target, float(self.config.get("lane_change_min_rear_ttc", 2.0))):
-                return False
-
-        return True
-
-    def _safety_filter_action_mpc_constraints(
-        self,
-        ego_abs: np.ndarray,
-        others_rel: np.ndarray,
-        goal_phys: np.ndarray,
-        action: np.ndarray,
-        dt: float,
-        remaining_time: Optional[float] = None,
-    ) -> np.ndarray:
-        ego_x, ego_y, ego_vx, ego_vy = [float(v) for v in np.asarray(ego_abs).reshape(-1)]
-        ego_speed = float(math.sqrt(ego_vx * ego_vx + ego_vy * ego_vy))
-        ego_heading = float(math.atan2(ego_vy, ego_vx)) if ego_speed > 0.1 else 0.0
-        ego_lane = self.get_lane_index(ego_y)
-
-        _ = goal_phys
-        _ = remaining_time
-
-        others: List[VirtualVehicle] = []
-        for row in np.asarray(others_rel, dtype=np.float32).reshape(-1, 4):
-            dx, dy, dvx, dvy = [float(v) for v in row]
-            ox = ego_x + dx
-            oy = ego_y + dy
-            ovx = ego_vx + dvx
-            ovy = ego_vy + dvy
-            ospeed = float(math.sqrt(ovx * ovx + ovy * ovy))
-            oheading = float(math.atan2(ovy, ovx)) if ospeed > 0.1 else 0.0
-            olane = self.get_lane_index(oy)
-            others.append(
-                VirtualVehicle(
-                    position=np.array([ox, oy], dtype=np.float32),
-                    velocity=np.array([ovx, ovy], dtype=np.float32),
-                    heading=oheading,
-                    speed=ospeed,
-                    lane_index=olane,
-                    target_speed=max(ospeed, 0.1),
-                    length=self.LENGTH,
-                )
-            )
-
-        act = np.asarray(action, dtype=np.float32).reshape(-1)
-        if self.action_type != "ParamLaneAccelAction":
-            return act.astype(np.float32)
-
-        lane_scalar = float(act[0])
-        acc_norm = float(act[1])
-        acc_phys_req = self._acc_norm_to_phys(acc_norm)
-
-        lane_front_gap_min = float(self.config.get("lane_change_min_front_gap", 10.0))
-        lane_rear_gap_min = float(self.config.get("lane_change_min_rear_gap", 8.0))
-        lane_front_ttc_min = float(self.config.get("lane_change_min_front_ttc", 3.0))
-        lane_rear_ttc_min = float(self.config.get("lane_change_min_rear_ttc", 2.0))
-
-        # Keep longitudinal front-vehicle constraints consistent with lane-change gate.
-        # Use the same front-gap/TTC requirements as _lane_constraints_ok.
-        d_req = lane_front_gap_min
-
-        dt_safe = max(float(dt), 1e-6)
-        x_ref = ego_x + ego_vx * dt_safe
-
-        def _neighbors_t1() -> List[VirtualVehicle]:
-            out: List[VirtualVehicle] = []
-            for v in others:
-                vxj = float(v.velocity[0])
-                vyj = float(v.velocity[1])
-                out.append(
-                    VirtualVehicle(
-                        position=np.array([float(v.position[0]) + vxj * dt_safe, float(v.position[1]) + vyj * dt_safe], dtype=np.float32),
-                        velocity=v.velocity.copy(),
-                        heading=v.heading,
-                        speed=v.speed,
-                        lane_index=int(v.lane_index),
-                        target_speed=v.target_speed,
-                        length=v.length,
-                    )
-                )
-            return out
-
-        others_t1 = _neighbors_t1()
-
-        def _select_front_rear(lane_idx: int) -> Tuple[Optional[VirtualVehicle], Optional[VirtualVehicle]]:
-            front_v: Optional[VirtualVehicle] = None
-            rear_v: Optional[VirtualVehicle] = None
-            front_dx = float("inf")
-            rear_dx = float("inf")
-            for v in others_t1:
-                if int(v.lane_index) != int(lane_idx):
-                    continue
-                dx = float(v.position[0]) - x_ref
-                if dx >= 0.0:
-                    if dx < front_dx:
-                        front_dx = dx
-                        front_v = v
-                else:
-                    if -dx < rear_dx:
-                        rear_dx = -dx
-                        rear_v = v
-            return front_v, rear_v
-
-        def _lane_constraints_ok(lane_idx: int, ego_x_next: float, ego_vx_next: float) -> bool:
-            front_v, rear_v = _select_front_rear(lane_idx)
-            if front_v is not None:
-                d_front = float(front_v.position[0]) - float(ego_x_next)
-                rel_front = max(float(ego_vx_next) - float(front_v.velocity[0]), 0.0)
-                if d_front < lane_front_gap_min:
-                    return False
-                if d_front < lane_front_ttc_min * rel_front:
-                    return False
-            if rear_v is not None:
-                d_rear = float(ego_x_next) - float(rear_v.position[0])
-                rel_rear = max(float(rear_v.velocity[0]) - float(ego_vx_next), 0.0)
-                if d_rear < lane_rear_gap_min:
-                    return False
-                if d_rear < lane_rear_ttc_min * rel_rear:
-                    return False
-            return True
-
-        target_lane = self._scalar_to_lane(ego_lane, lane_scalar)
-        if target_lane != ego_lane:
-            acc_for_gate = float(np.clip(acc_phys_req, self.acc_min, self.acc_max))
-            ego_x_next = float(ego_x + ego_vx * dt_safe + 0.5 * acc_for_gate * (dt_safe ** 2))
-            ego_vx_next = float(ego_vx + acc_for_gate * dt_safe)
-            ok_origin = _lane_constraints_ok(ego_lane, ego_x_next, ego_vx_next)
-            ok_target = _lane_constraints_ok(target_lane, ego_x_next, ego_vx_next)
-            if not (ok_origin and ok_target):
-                lane_scalar = 0.0
-                target_lane = ego_lane
-
-        # Longitudinal constraints aligned with lane-change gate constraints:
-        # 1) front distance: x_j(t+1) - x_ego(t+1) >= lane_front_gap_min
-        # 2) front TTC: x_j(t+1) - x_ego(t+1) >= lane_front_ttc_min * max(v_ego(t+1)-v_j(t+1), 0)
-        # 3) speed bound: v_ego(t+1) <= speed_limit
-        a_upper = float(self.acc_max)
-        a_upper = min(a_upper, float((self.speed_limit - ego_vx) / dt_safe))
-
-        den_gap = 0.5 * (dt_safe ** 2)
-        den_ttc = den_gap + lane_front_ttc_min * dt_safe
-
-        for v0, v1 in zip(others, others_t1):
-            if int(v1.lane_index) != int(target_lane):
-                continue
-            # MPC uses ahead-now mask for same-lane front constraints.
-            if float(v0.position[0]) <= float(ego_x):
-                continue
-
-            xj1 = float(v1.position[0])
-            vj1 = float(v1.velocity[0])
-
-            if den_gap > 1e-9:
-                a_gap = (xj1 - d_req - ego_x - ego_vx * dt_safe) / den_gap
-                a_upper = min(a_upper, float(a_gap))
-
-            if den_ttc > 1e-9:
-                a_ttc = (xj1 - ego_x - ego_vx * dt_safe - lane_front_ttc_min * (ego_vx - vj1)) / den_ttc
-                a_upper = min(a_upper, float(a_ttc))
-
-        acc_phys = min(float(acc_phys_req), float(a_upper))
-        acc_phys = float(np.clip(acc_phys, self.acc_min, self.acc_max))
-        acc_norm = self._acc_phys_to_norm(acc_phys)
-        return np.array([lane_scalar, acc_norm], dtype=np.float32)
-
     def compute_action(
         self,
         ego_abs: np.ndarray,
@@ -623,7 +639,8 @@ class RuleBasedController:
         goal_phys: [x*, y*, vx*, vy*] (绝对目标)
         """
 
-        ego_x, ego_y, ego_vx, ego_vy = [float(v) for v in ego_abs]
+        ego = self._as_ego_abs4(ego_abs)
+        ego_x, ego_y, ego_vx, ego_vy = [float(v) for v in ego]
         ego_speed = float(math.sqrt(ego_vx * ego_vx + ego_vy * ego_vy))
         ego_heading = float(math.atan2(ego_vy, ego_vx)) if ego_speed > 0.1 else 0.0
         ego_lane = self.get_lane_index(ego_y)
@@ -812,10 +829,8 @@ class RuleBasedAgentWrapper:
             rem_time = float(self.high_interval) * (1.0 - t_norm) * float(self.dt)
 
             ego_feat = kin[i, 0]
-            ego_abs = np.array(
+            ego_vel = np.array(
                 [
-                    ego_feat[self.idx_x],
-                    ego_feat[self.idx_y],
                     ego_feat[self.idx_vx],
                     ego_feat[self.idx_vy],
                 ],
@@ -831,12 +846,14 @@ class RuleBasedAgentWrapper:
                 others_rel.append([float(d[self.idx_x]), float(d[self.idx_y]), float(d[self.idx_vx]), float(d[self.idx_vy])])
 
             others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
+            goal_rel = low_obs[i, 1 + self.n_veh_local * self.feat_dim :]
+            ego_abs = (np.asarray(goal_phys[i], dtype=np.float32) - np.asarray(goal_rel, dtype=np.float32)).astype(np.float32)
             safe_a = self.controller.safety_filter_action(
-                ego_abs,
-                others_rel_arr,
-                goal_phys[i],
-                action[i],
-                self.dt,
+                ego_abs=ego_abs,
+                others_rel=others_rel_arr,
+                goal_phys=goal_phys[i],
+                action=action[i],
+                dt=self.dt,
                 remaining_time=rem_time,
             )
             safe_actions.append(safe_a)

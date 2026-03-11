@@ -30,12 +30,6 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "road_length": 500.0,
     "speed_limit": 15.0,
 
-    # Safety thresholds (shared by safety layer / MPC constraints)
-    "lane_change_min_front_gap": 15.0,
-    "lane_change_min_rear_gap": 10.0,
-    "lane_change_min_front_ttc": 3.0,
-    "lane_change_min_rear_ttc": 2.0,
-
     # Traffic flow
     "spawn_probability": 0.07,
     "flow_speed_range": [10.0, 10.0],
@@ -103,8 +97,6 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "comfort_reward": 0.7,
     "comfort_max_accel": 3.0,
     "lane_change_reward": -0.5,
-    "lane_change_penalty_mode": "actual_lane_change",
-    # "lane_change_penalty_mode": "target_lane_switch",
 
     # Termination
     "offroad_terminal": False,
@@ -308,19 +300,28 @@ def get_hiro_config():
 
         use_low_safety_layer=True,
         # use_low_safety_layer=False,
-        low_safety_violation_penalty=1,
+        low_safety_violation_penalty=0.5,
+        
+        fixed_goal_vx=0.0,
 
         low_safety_filter=LowSafetyFilterConfig(
             type="mpc_constraints",
-            lane_change_min_front_gap=10.0,
-            lane_change_min_rear_gap=8.0,
+            lane_change_min_front_gap=15.0,
+            lane_change_min_rear_gap=10.0,
             lane_change_min_front_ttc=3.0,
             lane_change_min_rear_ttc=2.0,
         ),
         # low_safety_filter=LowSafetyFilterConfig(
+        #     type="mpc_constraints",
+        #     lane_change_min_front_gap=10.0,
+        #     lane_change_min_rear_gap=8.0,
+        #     lane_change_min_front_ttc=3.0,
+        #     lane_change_min_rear_ttc=2.0,
+        # ),
+        # low_safety_filter=LowSafetyFilterConfig(
         #     type="legacy",
         # ),
 
-        # mask_ego_position_in_low_obs=True,
-        mask_ego_position_in_low_obs=False,
+        mask_ego_position_in_low_obs=True,
+        # mask_ego_position_in_low_obs=False,
     )
