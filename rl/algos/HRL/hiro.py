@@ -201,8 +201,8 @@ class HIROSAC:
         fixed_goal_vx = getattr(self.cfg, "fixed_goal_vx", None)
         if fixed_goal_vx is not None:
             fixed_goal_vx = float(np.clip(float(fixed_goal_vx), self.v_min, self.v_max))
-            goal_low[2] = fixed_goal_vx
-            goal_high[2] = fixed_goal_vx
+            goal_low[2] = fixed_goal_vx - 0.01
+            goal_high[2] = fixed_goal_vx + 0.01
         high_act_space = gym.spaces.Box(goal_low, goal_high, dtype=np.float32)
 
         low_obs_dim = self.local_kin_flat_dim + self.ego_dim + 1
@@ -643,6 +643,8 @@ class HIROSAC:
             # === 1.4 Low Level Store & Train ===
             next_low_obs = self._build_low_obs(c + 1, kin_flat_next, kin_next, goal_phys)
             done_low = is_last_step.astype(np.bool_)
+            ego_now_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
+            ego_next_sub = utils.extract_ego_substate(kin_next, self.ego_feature_idx)
 
             low_infos = infos
             if done_low.any():
@@ -657,6 +659,8 @@ class HIROSAC:
                     low_infos[i]["low_seg_id"] = int(seg_id[i])
                     low_infos[i]["low_t_in_seg"] = int(c[i])
                     low_infos[i]["low_ego_start"] = np.asarray(ego_start[i], dtype=np.float32)
+                    low_infos[i]["low_ego_now"] = np.asarray(ego_now_sub[i], dtype=np.float32)
+                    low_infos[i]["low_ego_next"] = np.asarray(ego_next_sub[i], dtype=np.float32)
                     low_infos[i]["low_r_ext"] = float(low_reward_ext[i])
 
             if train_low and self.low_level_type == "sac":

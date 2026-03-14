@@ -96,6 +96,7 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "progress_reward": 10.0,
     "comfort_reward": 0.7,
     "comfort_max_accel": 3.0,
+    # "lane_change_reward": -1.5,
     "lane_change_reward": -0.5,
 
     # Termination
@@ -262,8 +263,8 @@ def get_hiro_config():
         device="auto",
 
         # train_mode="joint",
-        # train_mode="high_only",
-        train_mode="low_only",
+        train_mode="high_only",
+        # train_mode="low_only",
 
         intrinsic_coef=intrinsic_coef,
         intrinsic_norm_ranges=intrinsic_norm_ranges,
@@ -292,6 +293,7 @@ def get_hiro_config():
         # low_sac_impl="auto",
 
         low_use_her=False,
+        # low_use_her=True,
         low_her_ratio=0.8,
         low_her_strategy="future",
 
@@ -300,28 +302,30 @@ def get_hiro_config():
 
         use_low_safety_layer=True,
         # use_low_safety_layer=False,
-        low_safety_violation_penalty=0.5,
-        
-        fixed_goal_vx=0.0,
 
+        low_safety_violation_penalty=0.1,
+
+        # fixed_goal_vx=0.0,
+        fixed_goal_vx=None,
+
+        # low_safety_filter=LowSafetyFilterConfig(
+        #     type="mpc_constraints",
+        #     lane_change_min_front_gap=15.0,
+        #     lane_change_min_rear_gap=10.0,
+        #     lane_change_min_front_ttc=3.0,
+        #     lane_change_min_rear_ttc=2.0,
+        # ),
         low_safety_filter=LowSafetyFilterConfig(
             type="mpc_constraints",
-            lane_change_min_front_gap=15.0,
-            lane_change_min_rear_gap=10.0,
+            lane_change_min_front_gap=10.0,
+            lane_change_min_rear_gap=8.0,
             lane_change_min_front_ttc=3.0,
             lane_change_min_rear_ttc=2.0,
         ),
         # low_safety_filter=LowSafetyFilterConfig(
-        #     type="mpc_constraints",
-        #     lane_change_min_front_gap=10.0,
-        #     lane_change_min_rear_gap=8.0,
-        #     lane_change_min_front_ttc=3.0,
-        #     lane_change_min_rear_ttc=2.0,
-        # ),
-        # low_safety_filter=LowSafetyFilterConfig(
         #     type="legacy",
         # ),
 
-        mask_ego_position_in_low_obs=True,
-        # mask_ego_position_in_low_obs=False,
+        # mask_ego_position_in_low_obs=True,
+        mask_ego_position_in_low_obs=False,
     )

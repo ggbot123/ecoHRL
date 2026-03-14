@@ -30,6 +30,8 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
     _INFO_KEY_SEG_ID = "low_seg_id"
     _INFO_KEY_T_IN_SEG = "low_t_in_seg"
     _INFO_KEY_EGO_START = "low_ego_start"
+    _INFO_KEY_EGO_NOW = "low_ego_now"
+    _INFO_KEY_EGO_NEXT = "low_ego_next"
     _INFO_KEY_R_EXT = "low_r_ext"
 
     def __init__(
@@ -87,6 +89,8 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         self._seg_id = np.full((self.buffer_size, self.n_envs), -1, dtype=np.int64)
         self._t_in_seg = np.zeros((self.buffer_size, self.n_envs), dtype=np.int32)
         self._ego_start = np.zeros((self.buffer_size, self.n_envs, self.ego_dim), dtype=np.float32)
+        self._ego_now = np.zeros((self.buffer_size, self.n_envs, self.ego_dim), dtype=np.float32)
+        self._ego_next = np.zeros((self.buffer_size, self.n_envs, self.ego_dim), dtype=np.float32)
         self._r_ext = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self._seg_index: dict[int, dict[tuple[int, int], int]] = defaultdict(dict)
 
@@ -131,6 +135,18 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             else:
                 self._ego_start[pos, env_i] = 0.0
 
+            ego_now = np.asarray(info.get(self._INFO_KEY_EGO_NOW, self._extract_ego_sub_from_low_obs(obs[env_i : env_i + 1])[0]), dtype=np.float32).reshape(-1)
+            if ego_now.size >= self.ego_dim:
+                self._ego_now[pos, env_i] = ego_now[: self.ego_dim]
+            else:
+                self._ego_now[pos, env_i] = 0.0
+
+            ego_next = np.asarray(info.get(self._INFO_KEY_EGO_NEXT, self._extract_ego_sub_from_low_obs(next_obs[env_i : env_i + 1])[0]), dtype=np.float32).reshape(-1)
+            if ego_next.size >= self.ego_dim:
+                self._ego_next[pos, env_i] = ego_next[: self.ego_dim]
+            else:
+                self._ego_next[pos, env_i] = 0.0
+
             self._r_ext[pos, env_i] = float(info.get(self._INFO_KEY_R_EXT, reward[env_i]))
 
             new_seg = int(self._seg_id[pos, env_i])
@@ -169,12 +185,10 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             if len(future_entries) > 0:
                 pick = int(self.rng.integers(0, len(future_entries)))
                 _, r, c = future_entries[pick]
-                next_obs = self._get_next_obs_at(r, c)
-                return self._extract_ego_sub_from_low_obs(next_obs[None])[0]
+                return self._ego_next[int(r), int(c)].astype(np.float32, copy=True)
 
         _, r, c = max(entries, key=lambda x: x[0])
-        next_obs = self._get_next_obs_at(r, c)
-        return self._extract_ego_sub_from_low_obs(next_obs[None])[0]
+        return self._ego_next[int(r), int(c)].astype(np.float32, copy=True)
 
     def sample(self, batch_size: int, env=None) -> ReplayBufferSamples:
         batch_inds, env_indices = self._sample_batch_indices(batch_size)
@@ -207,6 +221,9 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         upper_bound = self.buffer_size if self.full else self.pos
 
         her_mask = (self.rng.random(batch_size) < self.her_ratio) & (seg_ids >= 0)
+        ego_now_all = self._ego_now[batch_inds, env_indices].astype(np.float32, copy=False)
+        ego_next_all = self._ego_next[batch_inds, env_indices].astype(np.float32, copy=False)
+
         for i in np.flatnonzero(her_mask):
             g_new_abs = self._get_future_goal(int(seg_ids[i]), int(t_in_seg[i]), int(upper_bound))
             if g_new_abs is None:
@@ -218,14 +235,9 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                 g_new_abs = np.array(g_new_abs, copy=True)
                 g_new_abs[3] = 0.0
 
-            ego_now = self._extract_ego_sub_from_low_obs(obs_relabeled[i : i + 1])[0]
-            ego_next = self._extract_ego_sub_from_low_obs(next_obs_relabeled[i : i + 1])[0]
+            obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_now_all[i]).astype(np.float32)
+            next_obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_next_all[i]).astype(np.float32)
 
-            obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_now).astype(np.float32)
-            next_obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_next).astype(np.float32)
-
-        ego_now_all = self._extract_ego_sub_from_low_obs(obs_relabeled)
-        ego_next_all = self._extract_ego_sub_from_low_obs(next_obs_relabeled)
         goal_rel_all = obs_relabeled[:, self.goal_start : self.goal_end]
         goal_abs_all = ego_now_all + goal_rel_all
 
