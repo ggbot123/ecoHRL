@@ -179,6 +179,12 @@ class MultiLaneEnv(AbstractEnv):
             weighted[name] = w * float(val) * on_road
         total = sum(weighted.values())
 
+        # Auxiliary metric for HIRO high-level reward shaping:
+        # keep env reward unchanged, but expose acc-only comfort contribution in info.
+        comfort_w = float(self.config.get("comfort_reward", 0.0))
+        comfort_acc_only = float(raw.get("comfort_reward_acc_only", raw.get("comfort_reward", 0.0)))
+        weighted["comfort_reward_acc_only_for_high"] = comfort_w * comfort_acc_only * on_road
+
         # 特殊记录 on_road_reward
         weighted["on_road_reward"] = on_road
         self._last_raw_rewards = raw
@@ -197,14 +203,29 @@ class MultiLaneEnv(AbstractEnv):
         goal_long = float(self.config.get("goal_longitudinal", self.config["road_length"]))
         progress = np.clip(delta_s / goal_long, 0.0, 1.0)
 
-        # ---------- 2) 舒适性奖励（加速度） ----------
+        # ---------- 2) 舒适性奖励（加速度 / 加速度+jerk） ----------
         dt = 1.0 / float(self.config["policy_frequency"])
         cur_speed = self.vehicle.speed
         last_speed = getattr(self, "_last_speed", cur_speed)
         acc = (cur_speed - last_speed) / dt
 
         a_max = float(self.config["comfort_max_accel"])
-        comfort = - ((abs(acc) / a_max) ** 2) * dt
+        acc_term = (abs(acc) / max(a_max, 1e-6)) ** 2
+
+        use_jerk = bool(self.config.get("comfort_use_jerk", False))
+        comfort_acc_only = -(acc_term) * dt
+        if use_jerk:
+            last_acc = float(getattr(self, "_last_acc", acc))
+            jerk = (acc - last_acc) / dt
+            j_max = float(self.config.get("comfort_max_jerk", 5.0))
+            jerk_term = (abs(jerk) / max(j_max, 1e-6)) ** 2
+
+            w_acc = float(self.config.get("comfort_acc_weight", 1.0))
+            w_jerk = float(self.config.get("comfort_jerk_weight", 1.0))
+            w_sum = max(w_acc + w_jerk, 1e-6)
+            comfort = -((w_acc * acc_term + w_jerk * jerk_term) / w_sum) * dt
+        else:
+            comfort = -(acc_term) * dt
         # comfort = - (min(abs(acc) / a_max, 1.0) ** 2) * dt
 
         # ---------- 3) 换道惩罚 ----------
@@ -220,12 +241,14 @@ class MultiLaneEnv(AbstractEnv):
             punctual = self._punctual_factor(self._arrival_time)
 
         self._last_speed = cur_speed
+        self._last_acc = acc
         self._last_lane_id = curr_lane_id
         self._last_longitudinal = longi
         return {
             "collision_reward": float(self.vehicle.crashed),
             "progress_reward": progress,
             "comfort_reward": comfort,
+            "comfort_reward_acc_only": comfort_acc_only,
             "lane_change_reward": lane_changed,
             "punctual_reward": punctual,
             "on_road_reward": float(self.vehicle.on_road),
@@ -423,6 +446,7 @@ class MultiLaneEnv(AbstractEnv):
 
         # 初始化奖励相关的历史量
         self._last_speed = ego_speed
+        self._last_acc = 0.0
         self._last_longitudinal = longi0
         self._has_arrived = False
         self._arrival_time = None

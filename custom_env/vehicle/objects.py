@@ -144,6 +144,7 @@ class RoadObject(ABC):
             "y": self.position[1],
             "vx": 0.0,
             "vy": 0.0,
+            "acceleration": 0.0,
             "cos_h": np.cos(self.heading),
             "sin_h": np.sin(self.heading),
             "cos_d": 0.0,

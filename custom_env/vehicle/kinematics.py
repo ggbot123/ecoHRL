@@ -243,6 +243,7 @@ class Vehicle(RoadObject):
             "y": self.position[1],
             "vx": self.velocity[0],
             "vy": self.velocity[1],
+            "acceleration": float(self.action.get("acceleration", 0.0)),
             "heading": self.heading,
             "cos_h": self.direction[0],
             "sin_h": self.direction[1],

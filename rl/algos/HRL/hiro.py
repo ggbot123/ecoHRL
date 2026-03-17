@@ -181,6 +181,7 @@ class HIROSAC:
 
         # ---- 从env中获取的必要变量 --- #
         env_cfg = env.get_attr("config", indices=0)[0]
+        self.high_use_acc_only_comfort = bool(env_cfg.get("high_use_acc_only_comfort", True))
         # self.v_min, self.v_max = 8.0, float(env_cfg["speed_limit"])
         self.v_min, self.v_max = 0.0, float(env_cfg["speed_limit"])
         self.dt = 1.0 / float(env_cfg["policy_frequency"])
@@ -603,10 +604,21 @@ class HIROSAC:
             _, kin_next, kin_flat_next = utils.split_time_kinematics(next_high_obs, self.n_veh, self.feat_dim)
 
             # === 1.3 Calculate Rewards ===
-            # High-level reward strictly uses environment extrinsic reward.
-            high_ret += reward_env
-
             r_components = [info.get("reward_components", {}) for info in infos]
+
+            # High-level reward policy switch:
+            # True  -> replace mixed comfort (acc+jerk) with acc-only comfort contribution
+            # False -> keep env extrinsic reward unchanged
+            if self.high_use_acc_only_comfort:
+                comfort_mixed = np.asarray([rc.get("comfort_reward", 0.0) for rc in r_components], dtype=np.float32)
+                comfort_acc_only = np.asarray(
+                    [rc.get("comfort_reward_acc_only_for_high", rc.get("comfort_reward", 0.0)) for rc in r_components],
+                    dtype=np.float32,
+                )
+                high_ret += reward_env - comfort_mixed + comfort_acc_only
+            else:
+                high_ret += reward_env
+
             punctual = np.asarray([rc.get("punctual_reward", 0.0) for rc in r_components], dtype=np.float32)
             low_reward_ext = reward_env - punctual
             if str(getattr(self.cfg, "intrinsic_type", "l2")).lower() == "huber_shaping":

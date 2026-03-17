@@ -154,7 +154,7 @@ class TimeToCollisionObservation(ObservationType):
 class KinematicObservation(ObservationType):
     """Observe the kinematics of nearby vehicles."""
 
-    FEATURES: list[str] = ["presence", "x", "y", "vx", "vy"]
+    FEATURES: list[str] = ["presence", "x", "y", "vx", "vy", "acceleration"]
 
     def __init__(
         self,
@@ -284,6 +284,11 @@ class KinematicObservation(ObservationType):
         obs = df.values.copy()
         if self.order == "shuffled":
             self.env.np_random.shuffle(obs[1:])
+
+        # Keep acceleration as an ego-only state signal for Markovian jerk computation.
+        if "acceleration" in self.features and obs.shape[0] > 1:
+            acc_idx = self.features.index("acceleration")
+            obs[1:, acc_idx] = 0.0
 
         # ===== 关键：是否拼接时间 =====
         if self.include_time:

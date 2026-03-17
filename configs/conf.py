@@ -13,6 +13,29 @@ def _deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> Dict[str, Any]:
     return dst
 
 
+def _sync_observation_with_comfort_switch(cfg: Dict[str, Any]) -> None:
+    """Keep observation features consistent with comfort_use_jerk.
+
+    When jerk penalty is enabled, add ego acceleration feature so the process can stay Markovian.
+    When disabled, remove acceleration to keep legacy observation dimension.
+    """
+    use_jerk = bool(cfg.get("comfort_use_jerk", False))
+    obs_cfg = cfg.setdefault("observation", {})
+    features = list(obs_cfg.get("features", []))
+    features_range = dict(obs_cfg.get("features_range", {}))
+
+    if use_jerk:
+        if "acceleration" not in features:
+            features.append("acceleration")
+        features_range.setdefault("acceleration", [-5.0, 5.0])
+    else:
+        features = [f for f in features if f != "acceleration"]
+        features_range.pop("acceleration", None)
+
+    obs_cfg["features"] = features
+    obs_cfg["features_range"] = features_range
+
+
 # =========================
 # Environment config (MultiLaneEnv)
 # =========================
@@ -70,7 +93,7 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
             "x": [-200, 200],
             "y": [-10, 10],
             "vx": [-15, 15],
-            "vy": [-10, 10]
+            "vy": [-10, 10],
         },
         "normalize": False,
         "see_behind": False,
@@ -94,8 +117,16 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     # Reward weights (used by MultiLaneEnv._reward gating logic)
     "collision_reward": -10.0,
     "progress_reward": 10.0,
+
     "comfort_reward": 0.7,
     "comfort_max_accel": 3.0,
+    # "comfort_use_jerk": True,
+    "comfort_use_jerk": False,
+    "high_use_acc_only_comfort": True,
+    "comfort_max_jerk": 5.0,
+    "comfort_acc_weight": 1.0,
+    "comfort_jerk_weight": 0.1,
+
     # "lane_change_reward": -1.5,
     "lane_change_reward": -0.5,
 
@@ -113,6 +144,7 @@ def get_env_config(overrides: Mapping[str, Any] | None = None) -> Dict[str, Any]
     cfg = deepcopy(_MULTILANE_BASE_ENV_CONFIG)
     if overrides:
         _deep_update(cfg, overrides)
+    _sync_observation_with_comfort_switch(cfg)
     return cfg
 
 
@@ -263,8 +295,8 @@ def get_hiro_config():
         device="auto",
 
         # train_mode="joint",
-        train_mode="high_only",
-        # train_mode="low_only",
+        # train_mode="high_only",
+        train_mode="low_only",
 
         intrinsic_coef=intrinsic_coef,
         intrinsic_norm_ranges=intrinsic_norm_ranges,
@@ -292,40 +324,40 @@ def get_hiro_config():
         # low_sac_impl="safety_sac",
         # low_sac_impl="auto",
 
-        low_use_her=False,
-        # low_use_her=True,
+        # low_use_her=False,
+        low_use_her=True,
         low_her_ratio=0.8,
         low_her_strategy="future",
 
-        # use_off_policy_correction=True,
-        use_off_policy_correction=False,
+        use_off_policy_correction=True,
+        # use_off_policy_correction=False,
 
         use_low_safety_layer=True,
         # use_low_safety_layer=False,
 
-        low_safety_violation_penalty=0.1,
+        low_safety_violation_penalty=0.3,
 
-        # fixed_goal_vx=0.0,
-        fixed_goal_vx=None,
+        fixed_goal_vx=0.0,
+        # fixed_goal_vx=None,
 
-        # low_safety_filter=LowSafetyFilterConfig(
-        #     type="mpc_constraints",
-        #     lane_change_min_front_gap=15.0,
-        #     lane_change_min_rear_gap=10.0,
-        #     lane_change_min_front_ttc=3.0,
-        #     lane_change_min_rear_ttc=2.0,
-        # ),
         low_safety_filter=LowSafetyFilterConfig(
             type="mpc_constraints",
-            lane_change_min_front_gap=10.0,
-            lane_change_min_rear_gap=8.0,
+            lane_change_min_front_gap=15.0,
+            lane_change_min_rear_gap=10.0,
             lane_change_min_front_ttc=3.0,
             lane_change_min_rear_ttc=2.0,
         ),
         # low_safety_filter=LowSafetyFilterConfig(
+        #     type="mpc_constraints",
+        #     lane_change_min_front_gap=10.0,
+        #     lane_change_min_rear_gap=8.0,
+        #     lane_change_min_front_ttc=3.0,
+        #     lane_change_min_rear_ttc=2.0,
+        # ),
+        # low_safety_filter=LowSafetyFilterConfig(
         #     type="legacy",
         # ),
 
-        # mask_ego_position_in_low_obs=True,
-        mask_ego_position_in_low_obs=False,
+        mask_ego_position_in_low_obs=True,
+        # mask_ego_position_in_low_obs=False,
     )
