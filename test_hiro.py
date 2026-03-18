@@ -5,6 +5,7 @@ import scenarios.multi_lane  # 触发 __init__.py 里的 register
 import numpy as np
 import os
 import csv
+from datetime import datetime
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from util.plot_result import *
@@ -24,9 +25,13 @@ def main(
     model_suffix: Optional[str] = "final",
     use_low_safety_layer: Optional[bool] = None,
 ):
-    eval_dir = os.path.join(model_dir, "eval_results")
+    eval_root_dir = os.path.join(model_dir, "eval_results")
+    os.makedirs(eval_root_dir, exist_ok=True)
+    run_folder_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    eval_dir = unique_path(os.path.join(eval_root_dir, run_folder_name))
     os.makedirs(eval_dir, exist_ok=True)
-    log_path = unique_path(os.path.join(eval_dir, "eval_hiro.txt"))
+
+    log_path = os.path.join(eval_dir, "eval_hiro.txt")
     log_file = open(log_path, "w", encoding="utf-8")
     def log(msg: str = ""):
         print(msg)
@@ -90,6 +95,7 @@ def main(
 
     log("=" * 80)
     log(f"Eval HIRO model dir: {model_dir}")
+    log(f"Eval run folder    : {run_folder_name}")
     log(f"Eval results dir   : {eval_dir}")
     log(f"Episodes           : {episodes}")
     hd = high_model_dir or model_dir
@@ -120,6 +126,26 @@ def main(
         runner.reset(env, obs, float(getattr(hiro_cfg, "intrinsic_coef", 1.0)))
         should_record_trajectory = ep in trajectory_record_set
         trajectory_rows: list[Dict[str, Any]] = []
+
+        def _build_low_obs_for_logging(obs_raw: np.ndarray) -> np.ndarray:
+            """Build low_obs exactly as HIROPolicyRunner.act() does for current step."""
+            _, kin_local, kin_flat_local = runner._split(obs_raw)
+            ego_sub_local = runner._ego_sub(kin_local)
+            t_norm_local = np.array([runner.c / float(runner.hi)], dtype=np.float32)
+            goal_rel_local = (runner.goal_phys - ego_sub_local).astype(np.float32)
+
+            local_kin_flat_local = np.asarray(
+                kin_flat_local[0, : runner.local_kin_flat_dim], dtype=np.float32
+            ).copy()
+
+            if bool(getattr(runner.cfg, "mask_ego_position_in_low_obs", False)):
+                if int(runner.feat_dim) > 0 and local_kin_flat_local.shape[0] >= int(runner.feat_dim):
+                    idx_x_local = int(runner.feature_names.index("x"))
+                    idx_y_local = int(runner.feature_names.index("y"))
+                    local_kin_flat_local[idx_x_local] = 0.0
+                    local_kin_flat_local[idx_y_local] = 0.0
+
+            return np.concatenate([t_norm_local, local_kin_flat_local, goal_rel_local]).astype(np.float32)
 
         terminated, truncated, steps = False, False, 0
         high_ret, low_ext_ret, low_int_ret, low_total_ret = 0.0, 0.0, 0.0, 0.0
@@ -153,9 +179,8 @@ def main(
             # runner.c is 0 immediately after sampling a new goal.
             if runner.c == 0:
                 # k = 1: save every interval
-                save_goal_snapshot(env, runner, ep, steps, model_dir, prev_goal_phys=prev_goal_phys, intrinsic_reward=last_intrinsic_viz)
+                save_goal_snapshot(env, runner, ep, steps, eval_dir, prev_goal_phys=prev_goal_phys, intrinsic_reward=last_intrinsic_viz)
 
-            state_now = np.asarray(obs, dtype=np.float32).reshape(-1)
             obs_next, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
 
@@ -168,10 +193,11 @@ def main(
             
             if last_step:
                 last_intrinsic_viz = intrinsic
-                if ep == 4 and steps > 270:
+                if ep == 4 and steps > 20:
                     pass
 
             if should_record_trajectory:
+                low_obs_now = _build_low_obs_for_logging(obs)
                 action_before_safety = np.asarray(getattr(runner, "last_action_pre_safety", action), dtype=np.float32).reshape(-1)
                 action_after_safety = np.asarray(getattr(runner, "last_action_post_safety", action), dtype=np.float32).reshape(-1)
                 row: Dict[str, Any] = {
@@ -186,8 +212,8 @@ def main(
                     "intrinsic_reward": float(intrinsic),
                     "low_total_step_reward": float(low_ext + intrinsic),
                 }
-                for i, v in enumerate(state_now):
-                    row[f"state_{i}"] = float(v)
+                for i, v in enumerate(low_obs_now):
+                    row[f"low_obs_{i}"] = float(v)
                 for i, v in enumerate(action_before_safety):
                     row[f"action_pre_safety_{i}"] = float(v)
                 for i, v in enumerate(action_after_safety):
@@ -268,7 +294,7 @@ def main(
         if arrived and arrival_time is not None:
             log(f"  ARRIVED at t = {float(arrival_time):.3f} s")
         if base_env.config.get("show_trajectories", False):
-            save_speed_acc_curves(env, ep_idx=ep, model_path=model_dir)
+            save_speed_acc_curves(env, ep_idx=ep, model_path=eval_dir)
         if should_record_trajectory:
             csv_path = os.path.join(eval_dir, f"hiro_ep_{ep:04d}_trajectory.csv")
             if trajectory_rows:
@@ -315,14 +341,15 @@ if __name__ == "__main__":
     main(
         # model_dir="./models/hiro_260120_joint_safetyLayer_noOpc_rewShaping",
         model_dir="./models",
-        # high_model_dir="./models/hiro_test_260128_highonly_rule_vmin8", 
-        high_model_dir="./models/hiro_test_260211_highonly_pretrained_vmin0", 
-        # low_model_dir="./models/hiro_260224_lowonly_pretrained_finetune", 
-        low_model_dir="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping", 
+        high_model_dir="./models/hiro_260311_highonly_pretrained_newSLv2_lowDet_vioPenalty03_HER", 
+        # high_model_dir="./models/hiro_test_260211_highonly_pretrained_vmin0", 
+        low_model_dir="./models/hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03_HER", 
+        # low_model_dir="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping", 
         # model_suffix="step_6400000",
         use_low_safety_layer=True,
         episodes=10, 
         # record_episodes=[1, 2, 3],
         record_episodes=[i for i in range(1, 11)],
-        record_trajectory_episodes=[4],
+        # record_trajectory_episodes=[6],
+        record_trajectory_episodes=[i for i in range(1, 11)],
     )
