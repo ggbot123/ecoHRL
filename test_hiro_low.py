@@ -16,7 +16,13 @@ from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.HRL.goal_samplers import UniformGoalSampler
 from rl.utils import utils as hiro_utils
 from util.mpc import MPCController
-from util.plot_result import save_speed_acc_curves, save_low_step_snapshot, save_goal_metric_summary
+from util.plot_result import (
+    save_speed_acc_curves,
+    save_low_step_snapshot,
+    save_goal_metric_summary,
+    save_q_sa_surface_plot,
+    save_q_sa_global_summary,
+)
 from util.hiro_low_test_utils import (
     setup_env_with_state,
     build_high_action_space,
@@ -24,7 +30,9 @@ from util.hiro_low_test_utils import (
     abs_dx_metric_fn,
     abs_dy_metric_fn,
     load_test_cases_from_csv,
+    evaluate_q_sa_surface,
 )
+from util.hiro_low_batch_utils import run_batch_random_neighbors_acc_eval
 
 
 class _DummyHigh:
@@ -435,6 +443,14 @@ def main(
     lane_change_min_rear_gap: float = 8.0,
     lane_change_min_front_ttc: float = 3.0,
     lane_change_min_rear_ttc: float = 2.0,
+    record_q_sa_curve: bool = True,
+    q_sa_a0_min: float = -1.0,
+    q_sa_a0_max: float = 1.0,
+    q_sa_a1_min: float = -1.0,
+    q_sa_a1_max: float = 1.0,
+    q_sa_points_per_axis: int = 51,
+    random_neighbors_batch_size: int = 0,
+    random_neighbors_seed: int = 0,
     _is_subrun: bool = False,
 ):
     run_out_dir = out_dir
@@ -482,8 +498,29 @@ def main(
                 lane_change_min_rear_gap=lane_change_min_rear_gap,
                 lane_change_min_front_ttc=lane_change_min_front_ttc,
                 lane_change_min_rear_ttc=lane_change_min_rear_ttc,
+                record_q_sa_curve=record_q_sa_curve,
+                q_sa_a0_min=q_sa_a0_min,
+                q_sa_a0_max=q_sa_a0_max,
+                q_sa_a1_min=q_sa_a1_min,
+                q_sa_a1_max=q_sa_a1_max,
+                q_sa_points_per_axis=q_sa_points_per_axis,
                 _is_subrun=True,
             )
+        return
+
+    if int(random_neighbors_batch_size) > 0:
+        run_batch_random_neighbors_acc_eval(
+            low_model_path=low_model_path,
+            ego_state=ego_state,
+            goal_phys=goal_phys,
+            out_dir=run_out_dir,
+            n_sets=int(random_neighbors_batch_size),
+            steps=int(steps),
+            n_neighbors=max(int(len(neighbors_state)), 1),
+            seed=int(random_neighbors_seed),
+            env_overrides=env_overrides,
+            use_low_safety_layer=use_low_safety_layer,
+        )
         return
 
     # 环境配置：禁用背景车流，保持仅有指定车辆
@@ -545,6 +582,94 @@ def main(
 
     if save_initial:
         save_low_step_snapshot(env, runner, 0, run_out_dir, goal_phys_arr, title_suffix="init")
+
+    q_sa_dir = os.path.join(run_out_dir, "q_sa_curve")
+    q_sa_rows: List[Dict[str, Any]] = []
+    q_sa_step_indices: List[int] = []
+    q_sa_surface_rows: List[np.ndarray] = []
+    q_sa_a0_mesh_ref: Optional[np.ndarray] = None
+    q_sa_a1_mesh_ref: Optional[np.ndarray] = None
+
+    def _build_low_obs_for_q(obs_raw: np.ndarray) -> np.ndarray:
+        """Build low-level observation exactly as HIROPolicyRunner.act() does."""
+        _, kin_local, kin_flat_local = runner._split(obs_raw)
+        ego_sub_local = runner._ego_sub(kin_local)
+        t_norm_local = np.array([runner.c / float(runner.hi)], dtype=np.float32)
+        goal_rel_local = (runner.goal_phys - ego_sub_local).astype(np.float32)
+        local_kin_flat_local = np.asarray(kin_flat_local[0, :runner.local_kin_flat_dim], dtype=np.float32).copy()
+
+        if bool(getattr(runner.cfg, "mask_ego_position_in_low_obs", False)):
+            if int(runner.feat_dim) > 0 and local_kin_flat_local.shape[0] >= int(runner.feat_dim):
+                idx_x_local = int(runner.feature_names.index("x"))
+                idx_y_local = int(runner.feature_names.index("y"))
+                local_kin_flat_local[idx_x_local] = 0.0
+                local_kin_flat_local[idx_y_local] = 0.0
+
+        return np.concatenate([t_norm_local, local_kin_flat_local, goal_rel_local]).astype(np.float32)
+
+    def _record_q_sa_for_step(step_idx: int, low_obs_state: np.ndarray, action_ref: np.ndarray, chosen_action: Optional[np.ndarray] = None):
+        nonlocal q_sa_a0_mesh_ref, q_sa_a1_mesh_ref
+        if not bool(record_q_sa_curve):
+            return
+
+        q_data = evaluate_q_sa_surface(
+            low_model=low_model,
+            state=low_obs_state,
+            action_template=action_ref,
+            a0_min=float(q_sa_a0_min),
+            a0_max=float(q_sa_a0_max),
+            a1_min=float(q_sa_a1_min),
+            a1_max=float(q_sa_a1_max),
+            n_points_per_axis=int(q_sa_points_per_axis),
+        )
+
+        a0_mesh = np.asarray(q_data["a0_mesh"], dtype=np.float32)
+        a1_mesh = np.asarray(q_data["a1_mesh"], dtype=np.float32)
+        q_surface = np.asarray(q_data["q_min_surface"], dtype=np.float32)
+
+        if q_sa_a0_mesh_ref is None or q_sa_a1_mesh_ref is None:
+            q_sa_a0_mesh_ref = a0_mesh.copy()
+            q_sa_a1_mesh_ref = a1_mesh.copy()
+
+        q_sa_step_indices.append(int(step_idx))
+        q_sa_surface_rows.append(q_surface.copy())
+
+        save_q_sa_surface_plot(
+            out_dir=q_sa_dir,
+            step=int(step_idx),
+            a0_mesh=a0_mesh,
+            a1_mesh=a1_mesh,
+            q_surface=q_surface,
+            selected_action=(np.asarray(chosen_action, dtype=np.float32).reshape(-1) if chosen_action is not None else None),
+        )
+
+        chosen_idx_0 = -1
+        chosen_idx_1 = -1
+        if chosen_action is not None:
+            chosen_action_arr = np.asarray(chosen_action, dtype=np.float32).reshape(-1)
+            if chosen_action_arr.size >= 2:
+                chosen_idx_0 = int(np.argmin(np.abs(a0_mesh[0, :] - float(chosen_action_arr[0]))))
+                chosen_idx_1 = int(np.argmin(np.abs(a1_mesh[:, 0] - float(chosen_action_arr[1]))))
+
+        n0 = int(a0_mesh.shape[1])
+        n1 = int(a1_mesh.shape[0])
+        for i in range(n1):
+            for j in range(n0):
+                q_sa_rows.append(
+                    {
+                        "step": int(step_idx),
+                        "a0": float(a0_mesh[i, j]),
+                        "a1": float(a1_mesh[i, j]),
+                        "q_min": float(q_surface[i, j]),
+                        "is_chosen_action": int(i == chosen_idx_1 and j == chosen_idx_0),
+                    }
+                )
+
+    if bool(record_q_sa_curve):
+        low_obs_init = _build_low_obs_for_q(np.asarray(obs0, dtype=np.float32))
+        action_init, _ = low_model.predict(low_obs_init, deterministic=True)
+        action_init_arr = np.asarray(action_init, dtype=np.float32).reshape(-1)
+        _record_q_sa_for_step(0, low_obs_init, action_init_arr, chosen_action=action_init_arr)
 
     if bool(run_mpc_optimal):
         mpc_dir = os.path.join(run_out_dir, "mpc_theoretical_optimal")
@@ -649,6 +774,7 @@ def main(
         runner.need_high = False
 
         state_now = np.asarray(obs, dtype=np.float32).reshape(-1)
+        low_obs_now = _build_low_obs_for_q(obs)
         _, kin_now, _ = runner._split(obs)
         ego_abs_now, others_rel_now = runner._extract_ego_others(kin_now)
         action = runner.act(env, obs)
@@ -657,6 +783,9 @@ def main(
         action_post = np.asarray(getattr(runner, "last_action_post_safety", action), dtype=np.float32).reshape(-1)
         lane_rl = float(action_pre[0]) if action_pre.shape[0] > 0 else 0.0
         acc_norm_rl = float(action_pre[1]) if action_pre.shape[0] > 1 else 0.0
+
+        _record_q_sa_for_step(int(step), low_obs_now, action_pre, chosen_action=action_pre)
+
         rl_lane_curve.append(lane_rl)
         acc_phys_rl = _acc_norm_to_phys(acc_norm_rl)
         rl_acc_curve.append(acc_phys_rl)
@@ -876,6 +1005,30 @@ def main(
                 f"(interval={selected_interval_idx}, steps={steps}, hi={interval_len})"
             )
 
+    if bool(record_q_sa_curve):
+        os.makedirs(q_sa_dir, exist_ok=True)
+
+        q_csv_path = os.path.join(q_sa_dir, "q_sa_surface_all_steps.csv")
+        if q_sa_rows:
+            with open(q_csv_path, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=list(q_sa_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(q_sa_rows)
+            print(f"Saved Q(s,a0,a1) csv: {q_csv_path}")
+
+        if q_sa_a0_mesh_ref is not None and q_sa_a1_mesh_ref is not None and q_sa_surface_rows:
+            q_stack = np.stack([np.asarray(s, dtype=np.float32) for s in q_sa_surface_rows], axis=0)
+            q_surface_mean = np.mean(q_stack, axis=0)
+            q_surface_std = np.std(q_stack, axis=0)
+            save_q_sa_global_summary(
+                q_sa_dir,
+                np.asarray(q_sa_a0_mesh_ref, dtype=np.float32),
+                np.asarray(q_sa_a1_mesh_ref, dtype=np.float32),
+                np.asarray(q_surface_mean, dtype=np.float32),
+                np.asarray(q_surface_std, dtype=np.float32),
+            )
+            print(f"Saved Q(s,a0,a1) surfaces to: {q_sa_dir}")
+
     env.close()
     print(f"Saved {steps + (1 if save_initial else 0)} frames to: {run_out_dir}")
 
@@ -891,27 +1044,24 @@ if __name__ == "__main__":
     #    - 可选 case_id 列作为输出目录名）
 
     main(
-        # low_model_path="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping/hiro_low_final.zip",
-        # low_model_path="./models/hiro_260308_lowonly_uniform_SL_RS_newSLv2_newIni/hiro_low_final.zip",
-        # low_model_path="./models/hiro_260309_lowonly_uniform_SL_RS_newSLv3/hiro_low_final.zip",
-        # low_model_path="./models/hiro_260310_lowonly_uniform_RS_newSLv3_vioPenalty01/hiro_low_final.zip",
-        low_model_path="./models/hiro_260310_lowonly_uniform_RS_newSLv3_vioPenalty05/hiro_low_final.zip",
-        # low_model_path="./models/hiro_260310_lowonly_uniform_RS_newSLv3_vioPenalty10/hiro_low_final.zip",
+        low_model_path="./models/hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03_HER/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260316_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_lc15/hiro_low_final.zip",
         steps=25,
         ego_state=[0.0, 4.0, 10.0, 0.0],
-        neighbors_state=[
-            [30.0, 4.0, 10.0, 0.0],
-            [60.0, 8.0, 12.0, 0.0],
-            [30.0, 0.0, 10.0, 0.0],
-            [5.0, 8.0, 15.0, 0.0],
-        ],
         # neighbors_state=[
-        #     [21.3, 8.0, 7.6, 0.0],
-        #     [25.1, 0.0, 11.0, 0.0],
-        #     [47.3, 4.0, 12.6, 0.0],
-        #     [55.1, 0.0, 12.4, 0.0],
+        #     [30.0, 4.0, 10.0, 0.0],
+        #     [60.0, 8.0, 12.0, 0.0],
+        #     [30.0, 0.0, 10.0, 0.0],
+        #     [5.0, 8.0, 15.0, 0.0],
         # ],
-        goal_phys=[30, 4.0, 12.0, 0.0],
+        neighbors_state=[
+            [3.01, 0.0, 10.10, 0.0],
+            [22.60, 0.0, 11.18, 0.0],
+            [37.47, 8.0, 9.18, 0.0],
+            # [10.47, 8.0, 8.18, 0.0],
+            [38.23, 0.0, 10.92, 0.0],
+        ],
+        goal_phys=[24.8, 0.0, 14.99, 0.0],
         # batch_cases_csv="low_test_cases.csv",
         # batch_cases_csv="low_test_cases_debug.csv",
         use_low_safety_layer=True,
@@ -926,6 +1076,8 @@ if __name__ == "__main__":
         mpc_horizon=25,
         mpc_steps_to_goal=25,
         mpc_global_maxiter=200,  # joint_global 模式才会使用
+        random_neighbors_batch_size=0,
+        random_neighbors_seed=42,
         mpc_eval_actions_cont=[
             [0.0, 0.0],
             [0.0, 0.0],

@@ -115,7 +115,7 @@ class RuleBasedController:
 
         # Observation meta (for act(obs, ...))
         obs_cfg = dict(self.config.get("observation", {}) or {})
-        self.obs_features = list(obs_cfg.get("features", ["presence", "x", "y", "vx", "vy"]))
+        self.obs_features = list(obs_cfg.get("features", ["presence", "x", "y", "vx", "vy", "acceleration"]))
         self.obs_feat_dim = int(len(self.obs_features))
         self.obs_vehicles_count = int(obs_cfg.get("vehicles_count", 5))
         self.idx_presence = self.obs_features.index("presence")
@@ -759,7 +759,7 @@ class RuleBasedAgentWrapper:
 
         obs_cfg = dict(env_cfg.get("observation", {}) or {})
         self.n_veh_local = int(obs_cfg.get("vehicles_count_local", obs_cfg.get("vehicles_count", 5)))
-        self.feature_names = list(obs_cfg.get("features", ["presence", "x", "y", "vx", "vy"]))
+        self.feature_names = list(obs_cfg.get("features", ["presence", "x", "y", "vx", "vy", "acceleration"]))
         self.feat_dim = int(len(self.feature_names))
 
         self.controller = RuleBasedController(env_cfg, low_safety_filter=low_safety_filter)

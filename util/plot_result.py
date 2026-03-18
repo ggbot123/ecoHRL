@@ -40,6 +40,7 @@ def save_low_step_snapshot(
         w = lane.width
         heading = lane.heading_at(0)
         c, s = np.cos(heading), np.sin(heading)
+
         normal = np.array([-s, c])
 
         p0 = lane.start - normal * w / 2
@@ -269,6 +270,81 @@ def save_goal_candidates_snapshot(
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight", pad_inches=0.1)
     plt.close()
+
+
+def save_q_sa_surface_plot(
+    out_dir: str,
+    step: int,
+    a0_mesh: np.ndarray,
+    a1_mesh: np.ndarray,
+    q_surface: np.ndarray,
+    selected_action: np.ndarray | None,
+):
+    os.makedirs(out_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.contourf(a0_mesh, a1_mesh, q_surface, levels=40, cmap="viridis")
+    ax.contour(a0_mesh, a1_mesh, q_surface, levels=12, colors="k", linewidths=0.3, alpha=0.35)
+
+    if selected_action is not None and selected_action.size >= 2:
+        a0 = float(selected_action[0])
+        a1 = float(selected_action[1])
+        ax.scatter([a0], [a1], color="tab:red", s=30, label="chosen action", edgecolors="white", linewidths=0.7)
+        ax.legend(loc="best")
+
+    ax.set_xlabel("a[0]")
+    ax.set_ylabel("a[1]")
+    ax.set_title(f"Q_min(s,a0,a1) Contour - step {int(step)}")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Q_min")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"q_sa_surface_step{int(step):05d}.png"), dpi=150)
+    plt.close(fig)
+
+
+def save_q_sa_global_summary(
+    out_dir: str,
+    a0_mesh: np.ndarray,
+    a1_mesh: np.ndarray,
+    q_surface_mean: np.ndarray,
+    q_surface_std: np.ndarray,
+):
+    if q_surface_mean.size == 0:
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.contourf(a0_mesh, a1_mesh, q_surface_mean, levels=40, cmap="viridis")
+    ax.set_xlabel("a[0]")
+    ax.set_ylabel("a[1]")
+    ax.set_title("Mean Q_min(s,a0,a1) across rollout")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("mean Q_min")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "q_sa_surface_mean_contour.png"), dpi=150)
+    plt.close(fig)
+
+    fig = plt.figure(figsize=(8, 5))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(a0_mesh, a1_mesh, q_surface_mean, cmap="viridis", linewidth=0.0, antialiased=True, alpha=0.95)
+    ax.set_xlabel("a[0]")
+    ax.set_ylabel("a[1]")
+    ax.set_zlabel("mean Q_min")
+    ax.set_title("Mean Q_min(s,a0,a1) Surface")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "q_sa_surface_mean_3d.png"), dpi=150)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.contourf(a0_mesh, a1_mesh, q_surface_std, levels=40, cmap="magma")
+    ax.set_xlabel("a[0]")
+    ax.set_ylabel("a[1]")
+    ax.set_title("Std(Q_min) across rollout")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("std Q_min")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "q_sa_surface_std_contour.png"), dpi=150)
+    plt.close(fig)
 
 
 def save_goal_metric_summary(
@@ -644,6 +720,8 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
 
     plt.xlabel("Time [s]")
     plt.ylabel("Acceleration [m/s²]")
+    ### set ylim here ###
+    plt.ylim(-2.5, 3.5)
     plt.title(f"{title_prefix} Acceleration vs Time (ep {ep_idx})")
     plt.grid(True)
     if show_mode == "all":

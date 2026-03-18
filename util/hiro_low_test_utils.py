@@ -5,8 +5,55 @@ from typing import Sequence, Any
 
 import gymnasium as gym
 import numpy as np
+import torch as th
 
 from custom_env.vehicle.kinematics import Vehicle
+
+
+def evaluate_q_sa_surface(
+    low_model: Any,
+    state: Sequence[float],
+    action_template: Sequence[float],
+    a0_min: float,
+    a0_max: float,
+    a1_min: float,
+    a1_max: float,
+    n_points_per_axis: int,
+):
+    """Evaluate Q(s,a0,a1) on a 2D action grid using min over critic heads."""
+    state_arr = np.asarray(state, dtype=np.float32).reshape(-1)
+    action_template_arr = np.asarray(action_template, dtype=np.float32).reshape(-1)
+    if action_template_arr.size < 2:
+        raise ValueError("action_template must contain at least 2 action dimensions for 2D surface plotting.")
+
+    n = int(max(5, n_points_per_axis))
+    a0_grid = np.linspace(float(a0_min), float(a0_max), n, dtype=np.float32)
+    a1_grid = np.linspace(float(a1_min), float(a1_max), n, dtype=np.float32)
+    a0_mesh, a1_mesh = np.meshgrid(a0_grid, a1_grid)
+
+    flat_n = int(a0_mesh.size)
+    obs_batch = np.repeat(state_arr[None, :], flat_n, axis=0)
+    actions_batch = np.repeat(action_template_arr[None, :], flat_n, axis=0)
+    actions_batch[:, 0] = a0_mesh.reshape(-1)
+    actions_batch[:, 1] = a1_mesh.reshape(-1)
+
+    device = low_model.device
+    with th.no_grad():
+        obs_t = th.as_tensor(obs_batch, device=device)
+        act_t = th.as_tensor(actions_batch, device=device)
+        q_list = low_model.critic(obs_t, act_t)
+        q_stack = th.cat(q_list, dim=1)
+        q_min, _ = th.min(q_stack, dim=1)
+
+    q_min_surface = q_min.detach().cpu().numpy().astype(np.float32).reshape(n, n)
+
+    return {
+        "a0_grid": a0_grid,
+        "a1_grid": a1_grid,
+        "a0_mesh": a0_mesh.astype(np.float32),
+        "a1_mesh": a1_mesh.astype(np.float32),
+        "q_min_surface": q_min_surface,
+    }
 
 
 def make_vehicle(
