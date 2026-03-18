@@ -52,6 +52,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         intrinsic_weights: np.ndarray | None,
         intrinsic_type: str,
         low_gamma: float,
+        fixed_goal_vx: float | None = None,
         her_ratio: float = 0.8,
         her_strategy: str = "future",
         enable_her: bool = True,
@@ -76,6 +77,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         self.intrinsic_weights = None if intrinsic_weights is None else np.asarray(intrinsic_weights, dtype=np.float32)
         self.intrinsic_type = str(intrinsic_type).lower()
         self.low_gamma = float(low_gamma)
+        self.fixed_goal_vx = None if fixed_goal_vx is None else float(fixed_goal_vx)
 
         self.her_ratio = float(her_ratio)
         self.her_strategy = str(her_strategy).lower()
@@ -233,6 +235,8 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             # goal = [x*, y*, vx*, 0], i.e., target vy is always zero.
             if g_new_abs.shape[0] >= 4:
                 g_new_abs = np.array(g_new_abs, copy=True)
+                if self.fixed_goal_vx is not None and g_new_abs.shape[0] >= 3:
+                    g_new_abs[2] = float(self.fixed_goal_vx)
                 g_new_abs[3] = 0.0
 
             obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_now_all[i]).astype(np.float32)

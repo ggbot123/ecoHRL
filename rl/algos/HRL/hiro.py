@@ -253,6 +253,7 @@ class HIROSAC:
                         else np.asarray(self.cfg.intrinsic_weights, dtype=np.float32),
                         intrinsic_type=str(getattr(self.cfg, "intrinsic_type", "l2")),
                         low_gamma=float(self.low_gamma),
+                        fixed_goal_vx=getattr(self.cfg, "fixed_goal_vx", None),
                         her_ratio=float(getattr(self.cfg, "low_her_ratio", 0.8)),
                         her_strategy=str(getattr(self.cfg, "low_her_strategy", "future")),
                         enable_her=True,

@@ -57,6 +57,8 @@ def run_mpc_theoretical_optimal(
     steps_to_goal: int,
     mpc_mode: str = "qp",
     mpc_global_maxiter: int = 250,
+    mpc_plot_alternative_optima: bool = False,
+    mpc_max_alternative_optima: int = 3,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -78,6 +80,8 @@ def run_mpc_theoretical_optimal(
             goal_phys=goal_phys,
             steps_to_goal=int(max(1, steps_to_goal)),
             maxiter=int(max(1, mpc_global_maxiter)),
+            enumerate_alternative_optima=bool(mpc_plot_alternative_optima),
+            max_alternative_optima=int(max(0, mpc_max_alternative_optima)),
         )
     else:
         result = mpc.plan(goal_phys=goal_phys, steps_to_goal=int(max(1, steps_to_goal)))
@@ -97,6 +101,16 @@ def run_mpc_theoretical_optimal(
         "sum_low_total": float(result.get("sum_low_total", 0.0)),
         "reward_components": dict(result.get("reward_components", {})),
         "solver": dict(result.get("solver", {})),
+        "alternative_optima": [
+            {
+                "index": int(i + 1),
+                "fun": float(sol.get("fun", 0.0)),
+                "sum_low_total": float(sol.get("sum_low_total", 0.0)),
+                "sum_low_ext": float(sol.get("sum_low_ext", 0.0)),
+                "sum_intrinsic": float(sol.get("sum_intrinsic", 0.0)),
+            }
+            for i, sol in enumerate(list(result.get("alternative_optima", [])))
+        ],
         "start_state": np.asarray(result.get("start_state", []), dtype=np.float32).reshape(-1).tolist(),
         "goal_phys": np.asarray(result.get("goal_phys", []), dtype=np.float32).reshape(-1).tolist(),
     }
@@ -151,10 +165,18 @@ def run_mpc_theoretical_optimal(
     lane_scalar = actions[:n_steps, 0] if actions.ndim == 2 and actions.shape[0] >= n_steps else np.zeros((n_steps,), dtype=np.float32)
     lane_id = np.rint(states[1 : n_steps + 1, 1] / max(lane_width, 1e-6)).astype(np.int32) if states.ndim == 2 and states.shape[0] >= n_steps + 1 else np.zeros((n_steps,), dtype=np.int32)
 
+    alt_solutions_raw = list(result.get("alternative_optima", []))
+    alt_solutions = alt_solutions_raw[: int(max(0, mpc_max_alternative_optima))]
+
     # 1) 速度曲线
     speed_fig = os.path.join(out_dir, "mpc_speed_curve.png")
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(t, pred_vx, linewidth=1.6, label="pred_vx")
+    for idx, alt in enumerate(alt_solutions, start=1):
+        alt_states = np.asarray(alt.get("states", []), dtype=np.float32)
+        if alt_states.ndim == 2 and alt_states.shape[0] >= n_steps + 1 and alt_states.shape[1] > 2:
+            alt_vx = alt_states[1 : n_steps + 1, 2]
+            ax.plot(t, alt_vx, linewidth=1.2, linestyle="--", alpha=0.9, label=f"pred_vx alt#{idx}")
     ax.set_xlabel("Step")
     ax.set_ylabel("Speed (m/s)")
     ax.set_title("MPC Theoretical Optimal - Speed")
@@ -169,6 +191,10 @@ def run_mpc_theoretical_optimal(
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(t, acc_phys[:n_steps], linewidth=1.6, label="acc_phys (m/s^2)")
     ax.plot(t, acc_norm[:n_steps], linewidth=1.2, linestyle="--", label="acc_norm")
+    for idx, alt in enumerate(alt_solutions, start=1):
+        alt_acc_phys = np.asarray(alt.get("acc_phys", []), dtype=np.float32).reshape(-1)
+        if alt_acc_phys.size >= n_steps:
+            ax.plot(t, alt_acc_phys[:n_steps], linewidth=1.2, linestyle=":", alpha=0.9, label=f"acc_phys alt#{idx}")
     ax.set_xlabel("Step")
     ax.set_ylabel("Acceleration")
     ax.set_title("MPC Theoretical Optimal - Acceleration")
@@ -182,6 +208,23 @@ def run_mpc_theoretical_optimal(
     lane_fig = os.path.join(out_dir, "mpc_lane_change_curve.png")
     fig, ax1 = plt.subplots(figsize=(8, 3))
     ax1.plot(t, lane_scalar, color="tab:blue", linewidth=1.6, label="lane_scalar")
+    alt_lane_id_series: List[np.ndarray] = []
+    for idx, alt in enumerate(alt_solutions, start=1):
+        alt_actions = np.asarray(alt.get("best_actions_cont", []), dtype=np.float32)
+        alt_states = np.asarray(alt.get("states", []), dtype=np.float32)
+        if alt_actions.ndim == 2 and alt_actions.shape[0] >= n_steps:
+            ax1.plot(
+                t,
+                alt_actions[:n_steps, 0],
+                linewidth=1.2,
+                linestyle="--",
+                alpha=0.85,
+                label=f"lane_scalar alt#{idx}",
+            )
+        if alt_states.ndim == 2 and alt_states.shape[0] >= n_steps + 1 and alt_states.shape[1] > 1:
+            alt_lane_id_series.append(
+                np.rint(alt_states[1 : n_steps + 1, 1] / max(lane_width, 1e-6)).astype(np.int32)
+            )
     ax1.set_xlabel("Step")
     ax1.set_ylabel("lane_scalar", color="tab:blue")
     ax1.tick_params(axis="y", labelcolor="tab:blue")
@@ -189,6 +232,17 @@ def run_mpc_theoretical_optimal(
 
     ax2 = ax1.twinx()
     ax2.step(t, lane_id, where="mid", color="tab:orange", linewidth=1.4, label="lane_id")
+    for idx, alt_lane_id in enumerate(alt_lane_id_series, start=1):
+        if alt_lane_id.shape[0] >= n_steps:
+            ax2.step(
+                t,
+                alt_lane_id[:n_steps],
+                where="mid",
+                linewidth=1.1,
+                linestyle=":",
+                alpha=0.85,
+                label=f"lane_id alt#{idx}",
+            )
     ax2.set_ylabel("lane_id", color="tab:orange")
     ax2.tick_params(axis="y", labelcolor="tab:orange")
 
@@ -208,6 +262,15 @@ def run_mpc_theoretical_optimal(
     print(f"  low_ext_sum     : {summary['sum_low_ext']:.6f}")
     print(f"  intrinsic_sum   : {summary['sum_intrinsic']:.6f}")
     print(f"  low_total_sum   : {summary['sum_low_total']:.6f}")
+    solver_info = dict(summary.get("solver", {}))
+    uniqueness_checked = bool(solver_info.get("uniqueness_checked", False))
+    alt_found = int(solver_info.get("alternative_optima_found", len(alt_solutions)))
+    print(f"  uniqueness_checked : {uniqueness_checked}")
+    print(f"  alternative_optima_found : {alt_found}")
+    if uniqueness_checked:
+        print(f"  has_multiple_optima : {alt_found > 0}")
+    else:
+        print("  has_multiple_optima : N/A (uniqueness check disabled)")
     print(f"  summary_path    : {summary_path}")
     if trajectory_rows:
         print(f"  trajectory_csv  : {traj_csv}")
@@ -220,6 +283,20 @@ def run_mpc_theoretical_optimal(
     mpc_lane = lane_scalar.copy()
     neighbors_state = np.asarray(result.get("neighbors_state", []), dtype=np.float32).reshape(-1, 4)
     mpc_actions_cont = np.asarray(result.get("best_actions_cont", []), dtype=np.float32).reshape(-1, 2)
+    mpc_alt_curves: List[Dict[str, np.ndarray]] = []
+    for alt in alt_solutions:
+        alt_states = np.asarray(alt.get("states", []), dtype=np.float32)
+        alt_actions = np.asarray(alt.get("best_actions_cont", []), dtype=np.float32)
+        alt_acc = np.asarray(alt.get("acc_phys", []), dtype=np.float32).reshape(-1)
+        alt_speed = alt_states[:, 2] if alt_states.ndim == 2 and alt_states.shape[1] > 2 else np.asarray([], dtype=np.float32)
+        alt_lane = alt_actions[:, 0] if alt_actions.ndim == 2 and alt_actions.shape[1] > 0 else np.asarray([], dtype=np.float32)
+        mpc_alt_curves.append(
+            {
+                "speed": np.asarray(alt_speed, dtype=np.float32).reshape(-1),
+                "acc": np.asarray(alt_acc, dtype=np.float32).reshape(-1),
+                "lane": np.asarray(alt_lane, dtype=np.float32).reshape(-1),
+            }
+        )
     return {
         "speed": np.asarray(mpc_speed, dtype=np.float32).reshape(-1),
         "acc": np.asarray(mpc_acc, dtype=np.float32).reshape(-1),
@@ -228,6 +305,7 @@ def run_mpc_theoretical_optimal(
         "comfort_step": np.asarray(comfort_step, dtype=np.float32).reshape(-1),
         "states": np.asarray(states, dtype=np.float32),
         "actions_cont": np.asarray(mpc_actions_cont, dtype=np.float32),
+        "alternative_curves": mpc_alt_curves,
         "neighbors_state": neighbors_state,
         "dt": float(1.0 / float(base_env.config.get("policy_frequency", 10.0))),
     }
@@ -438,6 +516,8 @@ def main(
     mpc_steps_to_goal: Optional[int] = None,
     mpc_mode: str = "qp",
     mpc_global_maxiter: int = 250,
+    mpc_plot_alternative_optima: bool = False,
+    mpc_max_alternative_optima: int = 3,
     mpc_eval_actions_cont: Optional[Sequence[Sequence[float]]] = None,
     lane_change_min_front_gap: float = 10.0,
     lane_change_min_rear_gap: float = 8.0,
@@ -493,6 +573,8 @@ def main(
                 mpc_steps_to_goal=mpc_steps_to_goal,
                 mpc_mode=mpc_mode,
                 mpc_global_maxiter=mpc_global_maxiter,
+                mpc_plot_alternative_optima=mpc_plot_alternative_optima,
+                mpc_max_alternative_optima=mpc_max_alternative_optima,
                 mpc_eval_actions_cont=mpc_eval_actions_cont,
                 lane_change_min_front_gap=lane_change_min_front_gap,
                 lane_change_min_rear_gap=lane_change_min_rear_gap,
@@ -685,6 +767,8 @@ def main(
             steps_to_goal=mpc_goal_steps,
             mpc_mode=mpc_mode,
             mpc_global_maxiter=mpc_global_maxiter,
+            mpc_plot_alternative_optima=mpc_plot_alternative_optima,
+            mpc_max_alternative_optima=mpc_max_alternative_optima,
         )
     else:
         mpc_curve_data = None
@@ -883,12 +967,19 @@ def main(
     mpc_lane_safety_upper_curve = np.asarray([], dtype=np.float32)
     mpc_intrinsic_curve = np.asarray([], dtype=np.float32)
     mpc_comfort_curve = np.asarray([], dtype=np.float32)
+    mpc_alt_speed_curves: List[np.ndarray] = []
+    mpc_alt_acc_curves: List[np.ndarray] = []
+    mpc_alt_lane_curves: List[np.ndarray] = []
     if isinstance(mpc_curve_data, dict):
         mpc_speed_curve = np.asarray(mpc_curve_data.get("speed", []), dtype=np.float32).reshape(-1)
         mpc_acc_curve = np.asarray(mpc_curve_data.get("acc", []), dtype=np.float32).reshape(-1)
         mpc_lane_curve = np.asarray(mpc_curve_data.get("lane", []), dtype=np.float32).reshape(-1)
         mpc_intrinsic_curve = np.asarray(mpc_curve_data.get("intrinsic_step", []), dtype=np.float32).reshape(-1)
         mpc_comfort_curve = np.asarray(mpc_curve_data.get("comfort_step", []), dtype=np.float32).reshape(-1)
+        for alt_curve in list(mpc_curve_data.get("alternative_curves", [])):
+            mpc_alt_speed_curves.append(np.asarray(alt_curve.get("speed", []), dtype=np.float32).reshape(-1))
+            mpc_alt_acc_curves.append(np.asarray(alt_curve.get("acc", []), dtype=np.float32).reshape(-1))
+            mpc_alt_lane_curves.append(np.asarray(alt_curve.get("lane", []), dtype=np.float32).reshape(-1))
 
         mpc_states = np.asarray(mpc_curve_data.get("states", []), dtype=np.float32)
         mpc_actions = np.asarray(mpc_curve_data.get("actions_cont", []), dtype=np.float32)
@@ -974,6 +1065,9 @@ def main(
             "comfort_rl_safety_output": np.asarray(rl_safety_comfort_curve, dtype=np.float32),
             "intrinsic_mpc": mpc_intrinsic_curve,
             "comfort_mpc": mpc_comfort_curve,
+            "speed_mpc_alternatives": mpc_alt_speed_curves,
+            "acc_mpc_alternatives": mpc_alt_acc_curves,
+            "lane_mpc_alternatives": mpc_alt_lane_curves,
         },
     )
 
@@ -1044,8 +1138,8 @@ if __name__ == "__main__":
     #    - 可选 case_id 列作为输出目录名）
 
     main(
-        low_model_path="./models/hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03_HER/hiro_low_final.zip",
-        # low_model_path="./models/hiro_260316_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_lc15/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03_HER/hiro_low_final.zip",
+        low_model_path="./models/hiro_260317_lowonly_uniform_RS_newSLv2_vio03_HER_reDim/hiro_low_final.zip",
         steps=25,
         ego_state=[0.0, 4.0, 10.0, 0.0],
         # neighbors_state=[
@@ -1061,7 +1155,7 @@ if __name__ == "__main__":
             # [10.47, 8.0, 8.18, 0.0],
             [38.23, 0.0, 10.92, 0.0],
         ],
-        goal_phys=[24.8, 0.0, 14.99, 0.0],
+        goal_phys=[25, 4.0, 0.0, 0.0],
         # batch_cases_csv="low_test_cases.csv",
         # batch_cases_csv="low_test_cases_debug.csv",
         use_low_safety_layer=True,
@@ -1076,35 +1170,37 @@ if __name__ == "__main__":
         mpc_horizon=25,
         mpc_steps_to_goal=25,
         mpc_global_maxiter=200,  # joint_global 模式才会使用
-        random_neighbors_batch_size=0,
+        mpc_plot_alternative_optima=False,
+        mpc_max_alternative_optima=3,
+        random_neighbors_batch_size=100,
         random_neighbors_seed=42,
-        mpc_eval_actions_cont=[
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [1.0, 0.0],
-            [1.0, 0.0],
-            [1.0, 0.0],
-            [1.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0],
-            [0.0, 0.0]
-        ],
+        # mpc_eval_actions_cont=[
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [1.0, 0.0],
+        #     [1.0, 0.0],
+        #     [1.0, 0.0],
+        #     [1.0, 0.0],
+        #     [1.0, 0.0],
+        #     [1.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0],
+        #     [0.0, 0.0]
+        # ],
         lane_change_min_front_gap=15.0,
         lane_change_min_rear_gap=10.0,
         lane_change_min_front_ttc=3.0,

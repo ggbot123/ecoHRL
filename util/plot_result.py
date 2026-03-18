@@ -6,6 +6,7 @@ import matplotlib.transforms as transforms
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import numpy as np
+from typing import Any
 
 
 def save_low_step_snapshot(
@@ -526,12 +527,14 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         speed_safety_upper_rl = np.asarray(comparison_data.get("speed_safety_upper_rl", []), dtype=float).reshape(-1)
         speed_mpc = np.asarray(comparison_data.get("speed_mpc", []), dtype=float).reshape(-1)
         speed_safety_upper_mpc = np.asarray(comparison_data.get("speed_safety_upper_mpc", []), dtype=float).reshape(-1)
+        speed_mpc_alternatives_raw = comparison_data.get("speed_mpc_alternatives", [])
 
         acc_rl = np.asarray(comparison_data.get("acc_rl", []), dtype=float).reshape(-1)
         acc_rl_safety_output = np.asarray(comparison_data.get("acc_rl_safety_output", []), dtype=float).reshape(-1)
         acc_safety_upper_rl = np.asarray(comparison_data.get("acc_safety_upper_rl", []), dtype=float).reshape(-1)
         acc_mpc = np.asarray(comparison_data.get("acc_mpc", []), dtype=float).reshape(-1)
         acc_safety_upper_mpc = np.asarray(comparison_data.get("acc_safety_upper_mpc", []), dtype=float).reshape(-1)
+        acc_mpc_alternatives_raw = comparison_data.get("acc_mpc_alternatives", [])
 
         intrinsic_rl_safety_output = np.asarray(comparison_data.get("intrinsic_rl_safety_output", []), dtype=float).reshape(-1)
         comfort_rl_safety_output = np.asarray(comparison_data.get("comfort_rl_safety_output", []), dtype=float).reshape(-1)
@@ -543,6 +546,21 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         lane_safety_upper_rl = np.asarray(comparison_data.get("lane_safety_upper_rl", []), dtype=float).reshape(-1)
         lane_mpc = np.asarray(comparison_data.get("lane_mpc", []), dtype=float).reshape(-1)
         lane_safety_upper_mpc = np.asarray(comparison_data.get("lane_safety_upper_mpc", []), dtype=float).reshape(-1)
+        lane_mpc_alternatives_raw = comparison_data.get("lane_mpc_alternatives", [])
+
+        def _to_curve_list(raw: Any, max_n: int = 3) -> list[np.ndarray]:
+            if not isinstance(raw, (list, tuple)):
+                return []
+            out: list[np.ndarray] = []
+            for item in list(raw)[: int(max(0, max_n))]:
+                arr = np.asarray(item, dtype=float).reshape(-1)
+                if arr.size > 0:
+                    out.append(arr)
+            return out
+
+        speed_mpc_alternatives = _to_curve_list(speed_mpc_alternatives_raw, max_n=3)
+        acc_mpc_alternatives = _to_curve_list(acc_mpc_alternatives_raw, max_n=3)
+        lane_mpc_alternatives = _to_curve_list(lane_mpc_alternatives_raw, max_n=3)
 
         def _to_lane_target_code(arr: np.ndarray) -> np.ndarray:
             if arr.size == 0:
@@ -571,6 +589,17 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         if speed_mpc.size > 0:
             t_mpc = np.arange(speed_mpc.size, dtype=float) * dt
             plt.plot(t_mpc, speed_mpc, color="tab:green", linewidth=1.6, label="MPC optimal")
+        for i, speed_alt in enumerate(speed_mpc_alternatives, start=1):
+            t_alt = np.arange(speed_alt.size, dtype=float) * dt
+            plt.plot(
+                t_alt,
+                speed_alt,
+                color="tab:green",
+                linewidth=1.2,
+                linestyle="--",
+                alpha=0.8,
+                label=f"MPC optimal alt#{i}",
+            )
         if speed_safety_upper_mpc.size > 0:
             t_su_mpc = np.arange(speed_safety_upper_mpc.size, dtype=float) * dt
             plt.plot(t_su_mpc, speed_safety_upper_mpc, color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
@@ -597,6 +626,17 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         if acc_mpc.size > 0:
             t_mpc = np.arange(acc_mpc.size, dtype=float) * dt
             ax.plot(t_mpc, acc_mpc, color="tab:green", linewidth=1.6, label="MPC optimal")
+        for i, acc_alt in enumerate(acc_mpc_alternatives, start=1):
+            t_alt = np.arange(acc_alt.size, dtype=float) * dt
+            ax.plot(
+                t_alt,
+                acc_alt,
+                color="tab:green",
+                linewidth=1.2,
+                linestyle="--",
+                alpha=0.8,
+                label=f"MPC optimal alt#{i}",
+            )
         if acc_safety_upper_mpc.size > 0:
             t_su_mpc = np.arange(acc_safety_upper_mpc.size, dtype=float) * dt
             ax.plot(t_su_mpc, acc_safety_upper_mpc, color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
@@ -653,6 +693,18 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         if lane_mpc.size > 0:
             t_mpc = np.arange(lane_mpc.size, dtype=float) * dt
             plt.step(t_mpc, lane_mpc, where="post", color="tab:green", linewidth=1.6, label="MPC optimal")
+        for i, lane_alt in enumerate(lane_mpc_alternatives, start=1):
+            t_alt = np.arange(lane_alt.size, dtype=float) * dt
+            plt.step(
+                t_alt,
+                lane_alt,
+                where="post",
+                color="tab:green",
+                linewidth=1.2,
+                linestyle="--",
+                alpha=0.8,
+                label=f"MPC optimal alt#{i}",
+            )
         if lane_safety_upper_mpc.size > 0:
             t_su_mpc = np.arange(lane_safety_upper_mpc.size, dtype=float) * dt
             plt.step(t_su_mpc, lane_safety_upper_mpc, where="post", color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")

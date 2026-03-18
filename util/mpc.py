@@ -784,6 +784,9 @@ class MPCController:
         goal_phys: Sequence[float],
         steps_to_goal: int,
         maxiter: int = 250,
+        enumerate_alternative_optima: bool = False,
+        max_alternative_optima: int = 3,
+        alternative_objective_tol: float = 1e-5,
     ) -> Dict[str, Any]:
         _ = steps_to_goal
         goal = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
@@ -1013,6 +1016,79 @@ class MPCController:
             neighbors_state=neighbors_state,
         )
 
+        alternative_optima: List[Dict[str, Any]] = []
+        uniqueness_checked = bool(enumerate_alternative_optima)
+        max_alt = int(max(0, max_alternative_optima))
+        obj_tol = max(float(alternative_objective_tol), 0.0)
+        primary_obj = float(prob.value)
+
+        if uniqueness_checked and max_alt > 0:
+            cut_constraints: List[Any] = []
+
+            def _build_lane_no_good_cut(lane_idx_seq: np.ndarray) -> Any:
+                lane_idx_seq = np.asarray(lane_idx_seq, dtype=np.int32).reshape(-1)
+                terms = []
+                for tt in range(min(Hn + 1, lane_idx_seq.shape[0])):
+                    lane_idx_t = int(np.clip(lane_idx_seq[tt], 0, L - 1))
+                    terms.append(y_lane[tt, lane_idx_t])
+                if not terms:
+                    return cp.sum(y_lane[0, :]) <= 0.0
+                return cp.sum(cp.hstack(terms)) <= float(len(terms) - 1)
+
+            cut_constraints.append(_build_lane_no_good_cut(rollout["lane_idx_seq"]))
+
+            for _ in range(max_alt):
+                constraints_alt = list(constraints) + list(cut_constraints)
+                constraints_alt.append(objective <= primary_obj + obj_tol)
+                prob_alt = cp.Problem(cp.Minimize(objective), constraints_alt)
+                try:
+                    prob_alt.solve(solver=cp.GUROBI, verbose=False)
+                except Exception:
+                    break
+
+                if prob_alt.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
+                    break
+                if float(prob_alt.value) > primary_obj + obj_tol + 1e-9:
+                    break
+
+                u_alt = np.asarray(u.value, dtype=np.float32).reshape(-1)
+                k_alt_raw = np.asarray(k.value, dtype=np.float32).reshape(-1)
+                if k_alt_raw.shape[0] >= Hn + 1:
+                    lane_delta_alt = np.diff(k_alt_raw[: Hn + 1])
+                    lane_alt = np.where(
+                        lane_delta_alt > 0.5,
+                        1.0,
+                        np.where(lane_delta_alt < -0.5, -1.0, 0.0),
+                    ).astype(np.float32)
+                else:
+                    lane_alt = np.zeros((Hn,), dtype=np.float32)
+
+                rollout_alt = self._rollout_joint_from_actions(start_state, lane_alt, u_alt)
+                eval_alt = self._evaluate_joint_result(
+                    states=rollout_alt["states"],
+                    lane_change_step=rollout_alt["lane_change_step"],
+                    lane_idx_seq=rollout_alt["lane_idx_seq"],
+                    goal_phys=goal[:4],
+                    acc_phys=rollout_alt["acc_phys"],
+                    neighbors_state=neighbors_state,
+                )
+                alternative_optima.append(
+                    {
+                        "fun": float(prob_alt.value),
+                        "states": rollout_alt["states"],
+                        "acc_norm": rollout_alt["acc_norm"],
+                        "acc_phys": rollout_alt["acc_phys"],
+                        "lane_idx_seq": rollout_alt["lane_idx_seq"],
+                        "lane_change_step": rollout_alt["lane_change_step"],
+                        "best_actions_cont": rollout_alt["actions_cont"],
+                        "sum_low_total": float(eval_alt.get("sum_low_total", 0.0)),
+                        "sum_low_ext": float(eval_alt.get("sum_low_ext", 0.0)),
+                        "sum_intrinsic": float(eval_alt.get("sum_intrinsic", 0.0)),
+                    }
+                )
+
+                cut_constraints.append(_build_lane_no_good_cut(rollout_alt["lane_idx_seq"]))
+
         return {
             "success": bool(prob.status in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}),
             "message": str(prob.status),
@@ -1049,7 +1125,12 @@ class MPCController:
                 "status": str(prob.status),
                 "z_integrality_max": z_integrality_max,
                 "k_integrality_max": k_integrality_max,
+                "uniqueness_checked": uniqueness_checked,
+                "objective_optimal": primary_obj,
+                "alternative_objective_tol": obj_tol,
+                "alternative_optima_found": int(len(alternative_optima)),
             },
+            "alternative_optima": alternative_optima,
             **eval_res,
         }
 
