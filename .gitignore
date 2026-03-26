@@ -1,8 +1,11 @@
 *.pyc
 /logs
 /models
+/debug
 *.csv
 /copy
 /gpt
 env.yml
 .vscode/settings.json
+*.pkl
+*.json

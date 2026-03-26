@@ -3,6 +3,7 @@ from typing import Tuple, Optional
 from rl.algos.sac.sac import SAC
 from rl.utils import utils
 from rl.algos.HRL.rule_based import RuleBasedController
+from rl.algos.HRL.high_goal_safe_bounds import HighGoalSafeBoundsCalculator
 from configs.conf import get_hiro_config
 
 class HIROPolicyRunner:
@@ -66,6 +67,59 @@ class HIROPolicyRunner:
                 cfg,
                 low_safety_filter=getattr(self.cfg, "low_safety_filter", None),
             )
+
+        # In training we bind high-goal safe bounds explicitly. During standalone
+        # inference we must rebind it after model deserialization.
+        high_actor = getattr(self.high_model, "actor", None)
+        if high_actor is not None and hasattr(high_actor, "goal_safe_sampling_enabled"):
+            need_bind_bounds = bool(getattr(high_actor, "goal_safe_bounds_fn", None) is None)
+            if need_bind_bounds and bool(getattr(self.cfg, "use_high_goal_safety_layer", False)):
+                action_cfg = cfg.get("action", {}) if isinstance(cfg, dict) else {}
+                accel_range = action_cfg.get("acceleration_range", [-5.0, 5.0])
+                default_max_accel = float(max(abs(float(accel_range[0])), abs(float(accel_range[1]))))
+                use_custom_kin = bool(getattr(self.cfg, "high_goal_safe_use_custom_kinematics", False))
+                if use_custom_kin:
+                    cfg_max_accel = getattr(self.cfg, "high_goal_safe_max_accel", None)
+                    cfg_max_decel = getattr(self.cfg, "high_goal_safe_max_decel", None)
+                    max_accel = float(default_max_accel if cfg_max_accel is None else max(float(cfg_max_accel), 0.0))
+                    max_decel = float(default_max_accel if cfg_max_decel is None else max(float(cfg_max_decel), 0.0))
+                else:
+                    max_accel = float(default_max_accel)
+                    max_decel = float(default_max_accel)
+
+                t_h = float(self.hi) * float(self.dt)
+                v_min = 0.0
+                v_max = float(cfg.get("speed_limit", 15.0)) if isinstance(cfg, dict) else 15.0
+                dx_low = float(v_min * t_h)
+                dx_high = float(v_max * t_h)
+
+                calc = HighGoalSafeBoundsCalculator(
+                    n_lanes=int(cfg.get("lanes_count", len(self.lane_center_ys))) if isinstance(cfg, dict) else int(len(self.lane_center_ys)),
+                    lane_width=float(cfg.get("lane_width", 4.0)) if isinstance(cfg, dict) else 4.0,
+                    high_interval=int(self.hi),
+                    dt=float(self.dt),
+                    speed_min=float(v_min),
+                    speed_max=float(v_max),
+                    max_accel=float(max_accel),
+                    max_decel=float(max_decel),
+                    front_dmin=float(max(0.0, getattr(self.cfg, "high_goal_safe_front_dmin", 0.0))),
+                    lane_change_rear_dmin=float(max(0.0, getattr(self.cfg, "high_goal_safe_lane_change_rear_dmin", 0.0))),
+                    dx_low=float(dx_low),
+                    dx_high=float(dx_high),
+                    feat_dim=int(self.feat_dim),
+                    presence_idx=int(_idx("presence", 0)),
+                    x_idx=int(self.idx_x),
+                    y_idx=int(self.idx_y),
+                    vx_idx=int(self.idx_vx),
+                    vy_idx=int(self.idx_vy),
+                )
+                high_actor.goal_safe_eps = float(getattr(self.cfg, "high_goal_safe_eps", 1e-6))
+                high_actor.goal_safe_bounds_fn = calc.compute_torch
+                high_actor.goal_safe_sampling_enabled = True
+            elif need_bind_bounds:
+                # Fallback for legacy checkpoints: disable safe sampling when
+                # no bounds function can be reconstructed.
+                high_actor.goal_safe_sampling_enabled = False
 
         intrinsic_norm = getattr(self.cfg, "intrinsic_norm_ranges", None)
         self.norm_ranges = np.asarray(intrinsic_norm, dtype=np.float32)

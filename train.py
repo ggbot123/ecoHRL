@@ -67,6 +67,7 @@ def main(
     eval_freq: int,
     save_freq: int,
     n_envs: int,
+    render: bool = False,
     log_root: str = "./logs",
     save_root: str = "./models",
     run_name: str | None = None,
@@ -95,6 +96,10 @@ def main(
     print(f"[MAIN] log_dir={log_dir}")
     print(f"[MAIN] save_dir={save_dir}")
 
+    render_mode = "human" if bool(render) else None
+    if render_mode is not None and int(n_envs) != 1:
+        print(f"[MAIN] render=True 时建议 n_envs=1，当前 n_envs={n_envs}")
+
     #### ================ Train-time overrides (optional) ================ ####
     env_overrides = {
         # "initial_lane_id": "random",
@@ -116,8 +121,8 @@ def main(
 
     if algo == "ppo":
         ppo_kwargs = get_ppo_kwargs(log_dir=log_dir, seed=MASTER_SEED)
-        env_fns = [make_env(env_overrides) for _ in range(n_envs)]
-        eval_env_fn = make_env(env_overrides)
+        env_fns = [make_env(env_overrides, render_mode=render_mode) for _ in range(n_envs)]
+        eval_env_fn = make_env(env_overrides, render_mode=render_mode)
         train_ppo(
             env_fns=env_fns,
             eval_env_fn=eval_env_fn,
@@ -132,8 +137,8 @@ def main(
 
     elif algo == "sac":
         sac_kwargs = get_sac_kwargs(log_dir=log_dir, seed=MASTER_SEED)
-        env_fns = [make_env(env_overrides) for _ in range(n_envs)]
-        eval_env_fn = make_env(env_overrides)
+        env_fns = [make_env(env_overrides, render_mode=render_mode) for _ in range(n_envs)]
+        eval_env_fn = make_env(env_overrides, render_mode=render_mode)
         train_sac(
             env_fns=env_fns,
             eval_env_fn=eval_env_fn,
@@ -179,9 +184,10 @@ def main(
         print(f"[HIRO] High pretrained: {hiro_cfg.high_pretrained_path}")
         print(f"[HIRO] Low pretrained: {hiro_cfg.low_pretrained_path}")
 
-        # Rule-based low-level now only depends on observations (no env object access),
-        # so it is compatible with SubprocVecEnv.
-        env = SubprocVecEnv([make_env(env_overrides) for _ in range(n_envs)])
+        if render_mode is not None:
+            env = DummyVecEnv([make_env(env_overrides, render_mode=render_mode) for _ in range(n_envs)])
+        else:
+            env = SubprocVecEnv([make_env(env_overrides, render_mode=render_mode) for _ in range(n_envs)])
 
         train_hiro(
             env=env,
@@ -223,17 +229,25 @@ if __name__ == "__main__":
     main(
         algo="hiro",
         log_root="./logs/current",
+        # total_timesteps=20000,
         total_timesteps=10_000_000,
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,
+        # render=True,
         # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
-        # hiro_low_pretrained_path="./models/hiro_260317_lowonly_uniform_RS_newSLv2_vio03_HER_reDim/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
         hiro_low_target_entropy="auto",
         hiro_low_target_entropy_scale=1,
-        # run_name=f"hiro_260318_highonly_pretrained_newSLv2_vio03_HER_reDim_lc10",
+
+        # run_name=f"hiro_260323_lowonly_reachableUniform_newSLv2_vio03_HER_reDim_amax2_dmin0",
+        # run_name=f"hiro_260325_highonly_reachableUniformv2_newSLv2_vio03_HER_reDim_amax3_dmin10_8",
+        run_name=f"hiro_260325_lowonly_reachableUniformv2_newSLv2_vio03_HER_reDim_amax3_dmin10_8",
+        # run_name=f"hiro_260323_lowonly_nearCruise_newSLv2_vio03_HER_reDim",
+
+        # run_name=f"hiro_260319_highonly_pretrained_newSLv2_vio03_HER_reDim_lc15",
         # run_name=f"hiro_260309_highonly_rule_withSL",
         # run_name=f"hiro_260315_lowonly_uniform_RS_newSLv3_vioPenalty01_jerk01",
-        # run_name=f"hiro_260316_highonly_newSLv3_vio01_jerk01",
-        run_name=f"hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2",
+        # run_name=f"hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2",
+        # run_name=f"hiro_debug",
     )

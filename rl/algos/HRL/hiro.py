@@ -10,9 +10,11 @@ import numpy as np
 
 from rl.algos.sac.sac import SAC
 from rl.algos.sac.safety_sac import SafetyLayerSAC
+from rl.algos.sac.safe_goal_policies import SafeGoalMlpPolicy
 from rl.utils import utils
 from rl.algos.HRL.rule_based import RuleBasedAgentWrapper
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig
+from rl.algos.HRL.high_goal_safe_bounds import HighGoalSafeBoundsCalculator
 from rl.algos.HRL.low_her_buffer import HiROLowHERReplayBuffer
 from stable_baselines3.common.utils import get_device, configure_logger
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
@@ -144,7 +146,7 @@ class HIROConfig:
     intrinsic_type: str # "l2" | "huber_shaping"
     train_mode: str  # "joint", "low_only", "high_only"
     goal_sampler: GoalSamplerConfig
-    low_level_type: str = "sac" # "sac" or "rule_based" or "mpc"
+    low_level_type: str = "sac" # "sac" | "rule_based"
     low_sac_impl: str = "auto" # "auto" | "sac" | "safety_sac"
     low_use_her: bool = False
     low_her_ratio: float = 0.8
@@ -156,6 +158,14 @@ class HIROConfig:
     low_safety_filter: Optional[LowSafetyFilterConfig] = None
     low_safety_violation_penalty: float = 0.0
     fixed_goal_vx: Optional[float] = None
+    use_high_goal_safety_layer: bool = False
+    high_goal_safe_eps: float = 1e-6
+    high_goal_safe_use_custom_kinematics: bool = False
+    high_goal_safe_max_accel: Optional[float] = None
+    high_goal_safe_max_decel: Optional[float] = None
+    high_goal_safe_front_dmin: float = 0.0
+    high_goal_safe_lane_change_rear_dmin: float = 0.0
+    high_goal_safe_min_goal_x_span: float = 0.0
 
 
 class HIROSAC:
@@ -206,6 +216,40 @@ class HIROSAC:
             goal_high[2] = fixed_goal_vx + 0.01
         high_act_space = gym.spaces.Box(goal_low, goal_high, dtype=np.float32)
 
+        action_cfg = env_cfg.get("action", {})
+        accel_range = action_cfg.get("acceleration_range", [-5.0, 5.0])
+        default_max_accel = float(max(abs(float(accel_range[0])), abs(float(accel_range[1]))))
+        use_custom_kin = bool(getattr(self.cfg, "high_goal_safe_use_custom_kinematics", False))
+        if use_custom_kin:
+            cfg_max_accel = getattr(self.cfg, "high_goal_safe_max_accel", None)
+            cfg_max_decel = getattr(self.cfg, "high_goal_safe_max_decel", None)
+            max_accel = float(default_max_accel if cfg_max_accel is None else max(float(cfg_max_accel), 0.0))
+            max_decel = float(default_max_accel if cfg_max_decel is None else max(float(cfg_max_decel), 0.0))
+        else:
+            max_accel = float(default_max_accel)
+            max_decel = float(default_max_accel)
+        self.high_goal_safe_bounds = HighGoalSafeBoundsCalculator(
+            n_lanes=self.n_lanes,
+            lane_width=lane_w,
+            high_interval=int(self.cfg.high_interval),
+            dt=self.dt,
+            speed_min=self.v_min,
+            speed_max=self.v_max,
+            max_accel=max_accel,
+            max_decel=max_decel,
+            front_dmin=float(max(0.0, getattr(self.cfg, "high_goal_safe_front_dmin", 0.0))),
+            lane_change_rear_dmin=float(max(0.0, getattr(self.cfg, "high_goal_safe_lane_change_rear_dmin", 0.0))),
+            min_goal_x_span=float(max(0.0, getattr(self.cfg, "high_goal_safe_min_goal_x_span", 0.0))),
+            dx_low=float(goal_low[0]),
+            dx_high=float(goal_high[0]),
+            feat_dim=int(self.feat_dim),
+            presence_idx=int(self.feature_names.index("presence")),
+            x_idx=int(self.feature_names.index("x")),
+            y_idx=int(self.feature_names.index("y")),
+            vx_idx=int(self.feature_names.index("vx")),
+            vy_idx=int(self.feature_names.index("vy")),
+        )
+
         low_obs_dim = self.local_kin_flat_dim + self.ego_dim + 1
         low_obs_space = gym.spaces.Box(-np.inf, np.inf, shape=(low_obs_dim,), dtype=np.float32)
         low_act_space = env.action_space
@@ -238,7 +282,18 @@ class HIROSAC:
             # Resolve scaled auto target entropy for low-level SAC: -scale * action_dim.
             low_sac_kwargs = dict(low_sac_kwargs)
 
+            # In high_only mode, low SAC is inference-only: avoid allocating large replay memory.
+            low_inference_only = self.train_mode == "high_only"
+            low_sac_n_envs = self.n_envs
+            if low_inference_only:
+                low_sac_kwargs["buffer_size"] = int(min(int(low_sac_kwargs.get("buffer_size", 1000000)), 1024))
+                low_sac_kwargs.pop("replay_buffer_class", None)
+                low_sac_kwargs.pop("replay_buffer_kwargs", None)
+                print("[HIRO] Low SAC inference-only mode in high_only: keep n_envs, use small replay buffer")
+
             use_low_her = bool(self.low_use_her)
+            if low_inference_only:
+                use_low_her = False
             if use_low_her:
                 rb_kwargs_low = dict(low_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
                 rb_kwargs_low.update(
@@ -274,12 +329,12 @@ class HIROSAC:
                 print(f"[HIRO] Load low-level pretrained model from: {low_pretrained_path}")
                 low_sac = low_sac_cls.load(
                     low_pretrained_path,
-                    env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs),
+                    env=_make_dummy_vec_env(low_obs_space, low_act_space, low_sac_n_envs),
                     device=self.device,
                     **low_sac_kwargs,
                 )
             else:
-                low_sac = low_sac_cls(env=_make_dummy_vec_env(low_obs_space, low_act_space, self.n_envs), **low_sac_kwargs)
+                low_sac = low_sac_cls(env=_make_dummy_vec_env(low_obs_space, low_act_space, low_sac_n_envs), **low_sac_kwargs)
             self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
             if use_low_safety_layer:
                 self.low_safety = RuleBasedAgentWrapper(
@@ -295,6 +350,14 @@ class HIROSAC:
 
         # ----- High-level buffer config (dynamic OPC metadata only) ----- #
         high_sac_kwargs = dict(high_sac_kwargs)
+        if bool(getattr(self.cfg, "use_high_goal_safety_layer", False)):
+            high_sac_kwargs["policy"] = SafeGoalMlpPolicy
+            high_sac_kwargs["safe_warmup_sampling"] = True
+
+            policy_kwargs = dict(high_sac_kwargs.get("policy_kwargs", {}) or {})
+            policy_kwargs["goal_safe_eps"] = float(getattr(self.cfg, "high_goal_safe_eps", 1e-6))
+            high_sac_kwargs["policy_kwargs"] = policy_kwargs
+
         if self.use_off_policy_correction:
             rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
             rb_kwargs.update(
@@ -325,6 +388,10 @@ class HIROSAC:
             )
         else:
             high_sac = SAC(env=_make_dummy_vec_env(high_obs_space, high_act_space, 1), **high_sac_kwargs)
+
+        if bool(getattr(self.cfg, "use_high_goal_safety_layer", False)):
+            high_sac.actor.goal_safe_eps = float(getattr(self.cfg, "high_goal_safe_eps", 1e-6))
+            high_sac.actor.goal_safe_bounds_fn = self.high_goal_safe_bounds.compute_torch
 
         self.high_agent = SB3AgentWrapper(high_sac, config.train_freq, config.gradient_steps_high, config.batch_size)
 
@@ -456,7 +523,6 @@ class HIROSAC:
                 term[i] = tobs
         return term
 
-
     def learn(self, total_timesteps: int, callback=None, log_interval: int = 1, progress_bar: bool = False):
         """
         Standard HIRO training (Joint).
@@ -539,6 +605,9 @@ class HIROSAC:
                     a_buf = a.copy()
                 else:
                     a, a_buf = self.high_agent.sample_action(high_obs[idx])
+
+                a = np.asarray(a, dtype=np.float32)
+                a_buf = np.asarray(a_buf, dtype=np.float32)
 
                 high_obs_start[idx] = high_obs[idx]
                 goal_action[idx] = a
@@ -686,7 +755,8 @@ class HIROSAC:
                     low_infos,
                 )
                 self.low_agent.num_timesteps += n_envs
-                self.low_agent.train_if_needed()
+                if self.low_level_type == "sac":
+                    self.low_agent.train_if_needed()
 
             self.total_timesteps += n_envs
 
