@@ -1,5 +1,7 @@
 import os
 import shutil
+import csv
+import json
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.transforms as transforms
@@ -7,6 +9,508 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import numpy as np
 from typing import Any
+from pathlib import Path
+from datetime import datetime
+from configs.conf import get_hiro_config
+from rl.algos.HRL.high_goal_safe_bounds import HighGoalSafeBoundsCalculator
+
+
+def _parse_json_array(raw: str) -> np.ndarray:
+    text = str(raw).strip()
+    if not text:
+        return np.asarray([], dtype=np.float32)
+    try:
+        obj = json.loads(text)
+        return np.asarray(obj, dtype=np.float32)
+    except Exception:
+        if text.startswith("[") and text.endswith("]"):
+            return np.fromstring(text[1:-1], sep=",", dtype=np.float32)
+        return np.asarray([], dtype=np.float32)
+
+
+def _squeeze_to_1d(arr: np.ndarray) -> np.ndarray:
+    a = np.asarray(arr, dtype=np.float32)
+    while a.ndim > 1 and a.shape[0] == 1:
+        a = a[0]
+    return a
+
+
+def _infer_lane_centers_from_kin(kin: np.ndarray, lane_count: int = 3) -> np.ndarray:
+    if kin.ndim != 2 or kin.shape[1] < 3:
+        return np.asarray([0.0, 4.0, 8.0], dtype=np.float32)
+
+    presence = kin[:, 0] if kin.shape[1] >= 1 else np.ones((kin.shape[0],), dtype=np.float32)
+    y_all = kin[presence > 0.5, 2]
+    if y_all.size == 0:
+        return np.asarray([0.0, 4.0, 8.0], dtype=np.float32)
+
+    y_round = np.round(y_all.astype(np.float32), 1)
+    uniq, counts = np.unique(y_round, return_counts=True)
+    order = np.argsort(counts)[::-1]
+    top = np.sort(uniq[order[: max(1, int(lane_count))]])
+
+    if top.size >= lane_count:
+        return top[:lane_count].astype(np.float32)
+
+    # Fallback: extend by estimated lane width around observed values.
+    if top.size >= 2:
+        lane_w = float(np.median(np.diff(top)))
+        if lane_w < 1e-3:
+            lane_w = 4.0
+    else:
+        lane_w = 4.0
+
+    vals = list(top.tolist())
+    while len(vals) < lane_count:
+        vals.append(vals[-1] + lane_w)
+    return np.asarray(vals[:lane_count], dtype=np.float32)
+
+
+def _infer_lane_width(lane_centers: np.ndarray) -> float:
+    c = np.asarray(lane_centers, dtype=np.float32).reshape(-1)
+    if c.size >= 2:
+        d = np.diff(np.sort(c))
+        d = d[d > 1e-3]
+        if d.size:
+            return float(np.median(d))
+    return 4.0
+
+
+def _convert_kin_xy_to_absolute(kin: np.ndarray, x_margin: float) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Convert kinematics x/y to absolute coordinates when neighbors are ego-relative.
+
+    In this project, ego x/y is often absolute while neighbors may be stored as relative offsets.
+    This helper detects that pattern and converts neighbors to absolute coordinates.
+    """
+    if kin.ndim != 2 or kin.shape[0] < 1 or kin.shape[1] < 3:
+        return None, None
+
+    x_abs = kin[:, 1].astype(np.float32).copy()
+    y_abs = kin[:, 2].astype(np.float32).copy()
+
+    ego_x = float(x_abs[0])
+    ego_y = float(y_abs[0])
+
+    if kin.shape[0] > 1:
+        # x conversion: if others are clustered far from ego_x scale, treat as relative.
+        med_other_x = float(np.median(x_abs[1:]))
+        if abs(med_other_x - ego_x) > float(max(20.0, x_margin * 0.4)):
+            x_abs[1:] = x_abs[1:] + ego_x
+
+        # y conversion: if there are clear negative lane offsets while ego is on positive lane center,
+        # neighbors are likely ego-relative y.
+        y_other = y_abs[1:]
+        if np.any(y_other < -1.0) and ego_y > 1.0:
+            y_abs[1:] = y_abs[1:] + ego_y
+
+    return x_abs, y_abs
+
+
+def _stable_lane_centers_from_abs_y(y_abs: np.ndarray, ego_y: float, lane_count: int = 3) -> np.ndarray:
+    """Get stable lane centers to avoid visual gaps caused by noisy inferred widths."""
+    y_abs = np.asarray(y_abs, dtype=np.float32).reshape(-1)
+    if y_abs.size == 0:
+        return np.asarray([0.0, 4.0, 8.0], dtype=np.float32)
+
+    # Prefer canonical 3-lane centers if data fits that regime.
+    if float(np.nanmin(y_abs)) > -2.0 and float(np.nanmax(y_abs)) < 10.0:
+        return np.asarray([0.0, 4.0, 8.0], dtype=np.float32)
+
+    # Otherwise build centers around ego lane with fixed 4m spacing.
+    lane_w = 4.0
+    center_idx = int(np.round(float(ego_y) / lane_w))
+    return np.asarray([(center_idx - 1) * lane_w, center_idx * lane_w, (center_idx + 1) * lane_w], dtype=np.float32)
+
+
+def _neighbor_abs_vx_from_kin(kin: np.ndarray) -> np.ndarray | None:
+    """Convert neighbor vx to absolute speed for coloring.
+
+    In HIRO kinematic observations, ego vx is absolute while neighbor vx is ego-relative.
+    """
+    if kin.ndim != 2 or kin.shape[0] < 1 or kin.shape[1] < 4:
+        return None
+
+    vx_abs = kin[:, 3].astype(np.float32).copy()
+    if kin.shape[0] > 1:
+        ego_vx = float(vx_abs[0])
+        vx_abs[1:] = vx_abs[1:] + ego_vx
+    return vx_abs
+
+
+def _predict_neighbor_positions_one_interval(
+    kin: np.ndarray,
+    x_abs: np.ndarray,
+    y_abs: np.ndarray,
+    vx_abs: np.ndarray | None,
+    high_interval: int,
+    dt: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Predict neighbor positions after one high interval in world coordinates.
+
+    Uses x_abs(t+h) = x_abs(t) + vx_abs * h.
+    """
+    if kin.ndim != 2 or kin.shape[0] < 2 or kin.shape[1] < 4:
+        return (
+            np.asarray([], dtype=np.int32),
+            np.asarray([], dtype=np.float32),
+            np.asarray([], dtype=np.float32),
+        )
+
+    horizon_t = float(high_interval) * float(dt)
+    presence = kin[:, 0] if kin.shape[1] >= 1 else np.ones((kin.shape[0],), dtype=np.float32)
+    if vx_abs is None or vx_abs.size != kin.shape[0]:
+        vx_abs = _neighbor_abs_vx_from_kin(kin)
+    if vx_abs is None or vx_abs.size != kin.shape[0]:
+        return (
+            np.asarray([], dtype=np.int32),
+            np.asarray([], dtype=np.float32),
+            np.asarray([], dtype=np.float32),
+        )
+
+    idx_list: list[int] = []
+    px_list: list[float] = []
+    py_list: list[float] = []
+    for i in range(1, kin.shape[0]):
+        if float(presence[i]) <= 0.5:
+            continue
+        idx_list.append(i)
+        px_list.append(float(x_abs[i] + vx_abs[i] * horizon_t))
+        py_list.append(float(y_abs[i]))
+
+    return (
+        np.asarray(idx_list, dtype=np.int32),
+        np.asarray(px_list, dtype=np.float32),
+        np.asarray(py_list, dtype=np.float32),
+    )
+
+
+def render_high_interval_debug_snapshot(
+    row: dict[str, Any],
+    save_path: str,
+    x_margin: float = 70.0,
+    veh_length: float = 5.0,
+    veh_width: float = 2.0,
+    goal_marker_size: float = 85.0,
+    high_interval: int = 25,
+    dt: float = 0.1,
+) -> None:
+    """Render one high-interval-start debug snapshot.
+
+    Figure content:
+    - Ego and nearby vehicles from `kin`
+    - Goal position from `goal_phys`
+    - Safe goal region (3 lane rectangles) from `safe_dx_l2/safe_dx_u2`
+    """
+    kin = _parse_json_array(row.get("kin", ""))
+    goal_phys = _squeeze_to_1d(_parse_json_array(row.get("goal_phys", "")))
+    goal_phys_samples = _parse_json_array(row.get("goal_phys_samples", ""))
+    safe_dx_l2 = _squeeze_to_1d(_parse_json_array(row.get("safe_dx_l2", "")))
+    safe_dx_u2 = _squeeze_to_1d(_parse_json_array(row.get("safe_dx_u2", "")))
+
+    fig, ax = plt.subplots(figsize=(15, 3))
+    fig.patch.set_facecolor("#d9d9d9")
+    ax.set_facecolor("#d9d9d9")
+
+    ego_x = 0.0
+    ego_y = 0.0
+    if kin.ndim == 2 and kin.shape[1] >= 3 and kin.shape[0] >= 1:
+        ego_x = float(kin[0, 1])
+        ego_y = float(kin[0, 2])
+
+    x_abs, y_abs = _convert_kin_xy_to_absolute(kin, x_margin=float(x_margin))
+
+    if y_abs is not None and y_abs.size:
+        lane_centers = _stable_lane_centers_from_abs_y(y_abs, ego_y=ego_y, lane_count=3)
+    else:
+        lane_centers = _infer_lane_centers_from_kin(kin, lane_count=3)
+    lane_w = 4.0
+
+    x0 = ego_x - float(x_margin)
+    x1 = ego_x + float(x_margin)
+
+    # Draw lane backgrounds and separators.
+    for y in lane_centers:
+        rect = patches.Rectangle(
+            (x0, float(y - lane_w / 2.0)),
+            float(x1 - x0),
+            float(lane_w),
+            facecolor="#666666",
+            edgecolor="none",
+            zorder=0,
+        )
+        ax.add_patch(rect)
+
+    y_min = float(np.min(lane_centers) - lane_w / 2.0)
+    y_max = float(np.max(lane_centers) + lane_w / 2.0)
+    for y in lane_centers:
+        ax.plot([x0, x1], [float(y), float(y)], color="white", linestyle="--", linewidth=1.0, zorder=1)
+    ax.plot([x0, x1], [y_min, y_min], color="white", linewidth=1.0, zorder=1)
+    ax.plot([x0, x1], [y_max, y_max], color="white", linewidth=1.0, zorder=1)
+
+    # Draw safe-goal regions: components are relative [left, keep, right].
+    safe_colors = ["#66ff66", "#44dd44", "#66ff66"]
+    lane_range_lines: list[str] = []
+    rel_names = ["left", "keep", "right"]
+    rel_offsets = [-1, 0, 1]
+    ego_lane_idx = int(np.argmin(np.abs(lane_centers - float(ego_y))))
+    for comp_i in range(min(3, safe_dx_l2.size, safe_dx_u2.size)):
+        target_lane = ego_lane_idx + int(rel_offsets[comp_i])
+        if target_lane < 0 or target_lane >= lane_centers.size:
+            lane_range_lines.append(f"{rel_names[comp_i]}: infeasible (out of road)")
+            continue
+
+        # safe_dx_* in debug CSV is rel_x; convert to absolute x by adding ego_x.
+        xl = float(ego_x + safe_dx_l2[comp_i])
+        xu = float(ego_x + safe_dx_u2[comp_i])
+        if np.isnan(xl) or np.isnan(xu) or xl >= xu:
+            lane_range_lines.append(f"{rel_names[comp_i]}: infeasible")
+            continue
+        lane_range_lines.append(
+            f"{rel_names[comp_i]} (lane{target_lane}): x=[{xl:.1f}, {xu:.1f}]"
+        )
+        y = float(lane_centers[target_lane])
+        safe_rect = patches.Rectangle(
+            (xl, y - lane_w / 2.0),
+            xu - xl,
+            lane_w,
+            facecolor=safe_colors[comp_i % len(safe_colors)],
+            edgecolor="#00dd00",
+            linestyle="--",
+            linewidth=1.8,
+            alpha=0.28,
+            zorder=2,
+        )
+        ax.add_patch(safe_rect)
+
+    # Draw vehicles.
+    speed_limit = 15.0
+    norm = mcolors.Normalize(vmin=0.0, vmax=speed_limit)
+    cmap = cm.get_cmap("jet")
+
+    if kin.ndim == 2 and kin.shape[1] >= 4 and x_abs is not None and y_abs is not None:
+        presence = kin[:, 0] if kin.shape[1] >= 1 else np.ones((kin.shape[0],), dtype=np.float32)
+        vx_abs = _neighbor_abs_vx_from_kin(kin)
+        for i in range(kin.shape[0]):
+            if presence[i] <= 0.5:
+                continue
+            x_i = float(x_abs[i])
+            y_i = float(y_abs[i])
+            vx_i = float(vx_abs[i]) if vx_abs is not None else float(kin[i, 3])
+            color = cmap(norm(max(0.0, vx_i)))
+            edge = "red" if i == 0 else "black"
+            lw = 1.6 if i == 0 else 1.0
+            veh_rect = patches.Rectangle(
+                (x_i - veh_length / 2.0, y_i - veh_width / 2.0),
+                veh_length,
+                veh_width,
+                facecolor=color,
+                edgecolor=edge,
+                linewidth=lw,
+                alpha=0.95,
+                zorder=4,
+            )
+            ax.add_patch(veh_rect)
+
+        # Draw predicted neighbor positions after one high interval.
+        pred_idx, pred_x, pred_y = _predict_neighbor_positions_one_interval(
+            kin=kin,
+            x_abs=x_abs,
+            y_abs=y_abs,
+            vx_abs=vx_abs,
+            high_interval=int(high_interval),
+            dt=float(dt),
+        )
+        pred_size = float(max(1.6, veh_width * 1.05))
+        for k in range(pred_idx.size):
+            i = int(pred_idx[k])
+            vx_i = float(vx_abs[i]) if vx_abs is not None else float(kin[i, 3])
+            pred_color = cmap(norm(max(0.0, vx_i)))
+            px_i = float(pred_x[k])
+            py_i = float(pred_y[k])
+            pred_rect = patches.Rectangle(
+                (px_i - pred_size / 2.0, py_i - pred_size / 2.0),
+                pred_size,
+                pred_size,
+                facecolor=pred_color,
+                edgecolor="white",
+                linewidth=0.9,
+                alpha=0.35,
+                zorder=5,
+            )
+            ax.add_patch(pred_rect)
+            ax.text(
+                px_i + pred_size * 0.55,
+                py_i - pred_size * 0.55,
+                f"pred{i}: x={px_i:.1f}, v={vx_i:.1f}",
+                fontsize=8,
+                color="white",
+                ha="left",
+                va="center",
+                zorder=7,
+                bbox=dict(facecolor="black", alpha=0.35, pad=1.5, edgecolor="none"),
+            )
+
+    # Draw goal.
+    samples_vis_jittered = False
+    samples_spread_x = 0.0
+    samples_spread_y = 0.0
+    if goal_phys_samples.size > 0:
+        g_samples = np.asarray(goal_phys_samples, dtype=np.float32).reshape(-1, 4)
+        g_vis = g_samples.copy()
+        samples_spread_x = float(np.ptp(g_samples[:, 0])) if g_samples.shape[0] > 0 else 0.0
+        samples_spread_y = float(np.ptp(g_samples[:, 1])) if g_samples.shape[0] > 0 else 0.0
+
+        # If samples almost overlap exactly, spread markers on a tiny ring for visualization only.
+        if g_samples.shape[0] > 1 and samples_spread_x < 1e-3 and samples_spread_y < 1e-3:
+            n = int(g_samples.shape[0])
+            theta = np.linspace(0.0, 2.0 * np.pi, num=n, endpoint=False, dtype=np.float32)
+            radius_x = 0.45
+            radius_y = 0.22
+            g_vis[:, 0] = g_samples[:, 0] + radius_x * np.cos(theta)
+            g_vis[:, 1] = g_samples[:, 1] + radius_y * np.sin(theta)
+            samples_vis_jittered = True
+
+        ax.scatter(
+            g_vis[:, 0],
+            g_vis[:, 1],
+            s=max(float(goal_marker_size) * 0.38, 20.0),
+            marker="o",
+            facecolors="none",
+            edgecolors="gold",
+            linewidths=1.0,
+            alpha=0.75,
+            zorder=5,
+        )
+
+    if goal_phys.size >= 2:
+        gx = float(goal_phys[0])
+        gy = float(goal_phys[1])
+        ax.scatter([gx], [gy], s=goal_marker_size, marker="o", c="orangered", edgecolors="white", linewidths=1.4, zorder=6)
+        goal_label = f"goal: ({gx:.1f}, {gy:.1f})"
+        if goal_phys.size >= 4:
+            gvx = float(goal_phys[2])
+            gvy = float(goal_phys[3])
+            goal_label = f"goal: ({gx:.1f}, {gy:.1f}, {gvx:.1f}, {gvy:.1f})"
+        ax.text(
+            gx + 1.8,
+            gy - 0.4,
+            goal_label,
+            fontsize=9,
+            color="white",
+            ha="left",
+            va="center",
+            zorder=8,
+            bbox=dict(facecolor="black", alpha=0.45, pad=1.8, edgecolor="none"),
+        )
+
+    if goal_phys_samples.size > 0:
+        g_samples = np.asarray(goal_phys_samples, dtype=np.float32).reshape(-1, 4)
+        jitter_note = " (vis spread)" if samples_vis_jittered else ""
+        ax.text(
+            0.99,
+            0.98,
+            (
+                f"goal samples: n={int(g_samples.shape[0])}{jitter_note}\n"
+                f"spread: dx={samples_spread_x:.4f}, dy={samples_spread_y:.4f}"
+            ),
+            transform=ax.transAxes,
+            fontsize=9,
+            color="white",
+            ha="right",
+            va="top",
+            zorder=9,
+            bbox=dict(facecolor="black", alpha=0.45, pad=2.2, edgecolor="none"),
+        )
+
+    # Annotate ego current state.
+    if kin.ndim == 2 and kin.shape[0] >= 1 and kin.shape[1] >= 4 and x_abs is not None and y_abs is not None:
+        ego_vx_abs = float(kin[0, 3])
+        ego_info = f"ego: x={float(x_abs[0]):.1f}, y={float(y_abs[0]):.1f}, vx={ego_vx_abs:.1f}"
+        ax.text(
+            0.01,
+            0.02,
+            ego_info,
+            transform=ax.transAxes,
+            fontsize=9,
+            color="white",
+            ha="left",
+            va="bottom",
+            zorder=9,
+            bbox=dict(facecolor="black", alpha=0.45, pad=2.5, edgecolor="none"),
+        )
+
+    # Formatting similar to existing debug snapshots.
+    step = row.get("step", "")
+    hi_s = row.get("hi_start_saved", "")
+    seg = row.get("segment_id", "")
+    ax.set_title(f"High-Interval Start {hi_s} | Step {step} | Seg {seg}", fontsize=12)
+
+    if lane_range_lines:
+        ax.text(
+            0.01,
+            0.98,
+            "feasible x-ranges\n" + "\n".join(lane_range_lines),
+            transform=ax.transAxes,
+            fontsize=9,
+            color="white",
+            ha="left",
+            va="top",
+            zorder=9,
+            bbox=dict(facecolor="black", alpha=0.45, pad=2.5, edgecolor="none"),
+        )
+
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y_min - 1.0, y_max + 1.0)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, aspect=30, shrink=0.8, pad=0.02)
+    cbar.set_label("Speed [m/s]", fontsize=10)
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", pad_inches=0.1)
+    plt.close()
+
+
+def batch_render_high_interval_debug_csv(
+    csv_path: str,
+    debug_root: str,
+    n_last: int = 100,
+) -> str:
+    """Render last N rows in high_interval_debug.csv to a datetime folder.
+
+    Returns the output directory path.
+    """
+    csv_p = Path(csv_path)
+    if not csv_p.exists():
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    with csv_p.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    if not rows:
+        raise RuntimeError(f"CSV is empty: {csv_path}")
+
+    rows = rows[-int(max(1, n_last)):]
+
+    out_dir = Path(debug_root) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, row in enumerate(rows):
+        fn = f"{i:03d}_hiStart{row.get('hi_start_saved', i)}_step{row.get('step', 'na')}.png"
+        render_high_interval_debug_snapshot(row=row, save_path=str(out_dir / fn))
+
+    summary_path = out_dir / "summary.txt"
+    with summary_path.open("w", encoding="utf-8") as f:
+        f.write(f"csv_path={csv_p}\n")
+        f.write(f"samples={len(rows)}\n")
+        f.write(f"output_dir={out_dir}\n")
+
+    return str(out_dir)
 
 
 def save_low_step_snapshot(
@@ -99,6 +603,124 @@ def save_low_step_snapshot(
     gx, gy, gvx, gvy = [float(x) for x in goal_phys[:4]]
     goal_color = cmap(norm(gvx))
     ax.scatter([gx], [gy], c=[goal_color], marker="o", s=50, linewidth=1.5, edgecolors="white", zorder=10)
+
+    # Overlay high-level goal feasible region computed from current reachable-set bounds.
+    try:
+        hiro_cfg = get_hiro_config()
+        lane_width = float(base_env.config.get("lane_width", 4.0))
+        n_lanes = int(base_env.config.get("lanes_count", 3))
+        lane_centers = np.arange(n_lanes, dtype=np.float32) * lane_width
+        ego_lane_idx = int(np.argmin(np.abs(lane_centers - float(ego.position[1]))))
+
+        obs_features = list(base_env.config.get("observation", {}).get("features", ["presence", "x", "y", "vx", "vy"]))
+
+        def _fidx(name: str, default: int) -> int:
+            try:
+                return int(obs_features.index(name))
+            except ValueError:
+                return int(default)
+
+        policy_freq = float(base_env.config.get("policy_frequency", 10.0))
+        dt = 1.0 / max(policy_freq, 1e-6)
+        hi = int(getattr(runner, "hi", getattr(hiro_cfg, "high_interval", 25)))
+        horizon_t = float(hi) * float(dt)
+
+        speed_limit = float(base_env.config.get("speed_limit", 15.0))
+        v_min = 0.0
+        v_max = speed_limit
+        dx_low = float(v_min * horizon_t)
+        dx_high = float(v_max * horizon_t)
+
+        action_cfg = base_env.config.get("action", {})
+        accel_range = action_cfg.get("acceleration_range", [-5.0, 5.0])
+        default_max_accel = float(max(abs(float(accel_range[0])), abs(float(accel_range[1]))))
+        use_custom_kin = bool(getattr(hiro_cfg, "high_goal_safe_use_custom_kinematics", False))
+        if use_custom_kin:
+            cfg_max_accel = getattr(hiro_cfg, "high_goal_safe_max_accel", None)
+            cfg_max_decel = getattr(hiro_cfg, "high_goal_safe_max_decel", None)
+            max_accel = float(default_max_accel if cfg_max_accel is None else max(float(cfg_max_accel), 0.0))
+            max_decel = float(default_max_accel if cfg_max_decel is None else max(float(cfg_max_decel), 0.0))
+        else:
+            max_accel = float(default_max_accel)
+            max_decel = float(default_max_accel)
+
+        calc = HighGoalSafeBoundsCalculator(
+            n_lanes=n_lanes,
+            lane_width=lane_width,
+            high_interval=hi,
+            dt=dt,
+            speed_min=v_min,
+            speed_max=v_max,
+            max_accel=max_accel,
+            max_decel=max_decel,
+            front_dmin=float(max(0.0, getattr(hiro_cfg, "high_goal_safe_front_dmin", 0.0))),
+            lane_change_rear_dmin=float(max(0.0, getattr(hiro_cfg, "high_goal_safe_lane_change_rear_dmin", 0.0))),
+            dx_low=dx_low,
+            dx_high=dx_high,
+            feat_dim=int(len(obs_features)),
+            presence_idx=int(_fidx("presence", 0)),
+            x_idx=int(_fidx("x", 1)),
+            y_idx=int(_fidx("y", 2)),
+            vx_idx=int(_fidx("vx", 3)),
+            vy_idx=int(_fidx("vy", 4)),
+        )
+
+        high_obs_now = np.asarray(base_env.observation_type.observe(), dtype=np.float32).reshape(1, -1)
+        bounds = calc.compute_np(high_obs_now)
+        l2 = np.asarray(bounds.get("l2", [[1.0, 1.0, 1.0]]), dtype=np.float32).reshape(1, 3)[0]
+        u2 = np.asarray(bounds.get("u2", [[-1.0, -1.0, -1.0]]), dtype=np.float32).reshape(1, 3)[0]
+
+        rel_offsets = [-1, 0, 1]
+        rel_names = ["left", "keep", "right"]
+        feasible_lines: list[str] = []
+        denom = max(float(dx_high - dx_low), 1e-6)
+        for comp_i in range(3):
+            target_lane = ego_lane_idx + int(rel_offsets[comp_i])
+            if target_lane < 0 or target_lane >= n_lanes:
+                feasible_lines.append(f"{rel_names[comp_i]}: infeasible (out of road)")
+                continue
+
+            lo_n = float(l2[comp_i])
+            hi_n = float(u2[comp_i])
+            lo_dx = float(dx_low + 0.5 * (lo_n + 1.0) * denom)
+            hi_dx = float(dx_low + 0.5 * (hi_n + 1.0) * denom)
+            xl = float(ego.position[0] + lo_dx)
+            xu = float(ego.position[0] + hi_dx)
+            if (not np.isfinite(xl)) or (not np.isfinite(xu)) or (xl >= xu):
+                feasible_lines.append(f"{rel_names[comp_i]}: infeasible")
+                continue
+
+            feasible_lines.append(f"{rel_names[comp_i]}: x=[{xl:.1f}, {xu:.1f}]")
+            y_center = float(lane_centers[target_lane])
+            rect = patches.Rectangle(
+                (xl, y_center - lane_width / 2.0),
+                xu - xl,
+                lane_width,
+                facecolor="#66ff66",
+                edgecolor="#00cc00",
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.25,
+                zorder=2,
+            )
+            ax.add_patch(rect)
+
+        if feasible_lines:
+            ax.text(
+                0.01,
+                0.98,
+                "goal feasible set\n" + "\n".join(feasible_lines),
+                transform=ax.transAxes,
+                fontsize=9,
+                color="white",
+                bbox=dict(facecolor="black", alpha=0.55, pad=3, edgecolor="none"),
+                ha="left",
+                va="top",
+                zorder=20,
+            )
+    except Exception:
+        # Snapshot rendering should remain robust even if feasible-set computation fails.
+        pass
 
     dx = float(gx - ego.position[0])
     dy = float(gy - ego.position[1])
@@ -605,6 +1227,7 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
             plt.plot(t_su_mpc, speed_safety_upper_mpc, color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
         plt.xlabel("Time [s]")
         plt.ylabel("Speed [m/s]")
+        plt.ylim(0.0, 16.0)
         plt.title(f"Ego Speed Comparison (ep {ep_idx})")
         plt.grid(True)
         plt.legend(loc="best")
@@ -744,6 +1367,7 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
 
     plt.xlabel("Time [s]")
     plt.ylabel("Speed [m/s]")
+    plt.ylim(0.0, 16.0)
     plt.title(f"{title_prefix} Speed vs Time (ep {ep_idx})")
     plt.grid(True)
     if show_mode == "all":

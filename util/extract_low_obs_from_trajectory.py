@@ -5,16 +5,16 @@ from pathlib import Path
 import numpy as np
 
 
-_STATE_COL_PATTERN = re.compile(r"^state_(\d+)$")
+_STATE_COL_PATTERN = re.compile(r"^low_obs_(\d+)$")
+# _STATE_COL_PATTERN = re.compile(r"^state_(\d+)$")
 
 # ===== Edit parameters here =====
-CSV_PATH = Path(r"d:\workspace\python\ecoHRL\models\eval_results\20260317_165130\hiro_ep_0006_trajectory.csv")
-ROW_N = 177  # 1-based data row index (excluding header)
+CSV_PATH = Path(r"d:\workspace\python\ecoHRL\models\eval_results\20260323_102850\hiro_ep_0010_trajectory.csv")
+ROW_N = 51  # 1-based data row index (excluding header)
 # Feature order used in state_* flattening.
 FEATURE_NAMES = ["presence", "x", "y", "vx", "vy"]
-# goal_rel in ego subspace [dx, dy, dvx, dvy], used to convert to absolute goal_phys.
-# If None, goal_phys will be printed as None.
-GOAL_REL = np.array([20.0, 0.0, 0.0, 0.0], dtype=np.float32)
+# goal_rel is expected to be embedded in low_obs tail as [dx, dy, dvx, dvy].
+GOAL_REL_DIM = 4
 
 
 def _load_row(csv_path: Path, row_n: int) -> dict:
@@ -40,7 +40,7 @@ def _extract_state_vector_from_row(row: dict) -> np.ndarray:
         state_items.append((int(m.group(1)), float(v)))
 
     if not state_items:
-        raise KeyError("No state_* columns found in CSV row.")
+        raise KeyError("No low_obs_* columns found in CSV row.")
 
     state_items.sort(key=lambda x: x[0])
     return np.asarray([x[1] for x in state_items], dtype=np.float32)
@@ -51,10 +51,21 @@ def _to_abs_states(state_vec: np.ndarray, feature_names: list[str]):
         raise ValueError("state vector is invalid.")
 
     feat_dim = int(len(feature_names))
-    kin_flat = state_vec[1:]
-    if kin_flat.size % feat_dim != 0:
+    payload = state_vec[1:]
+
+    # Compatible with both formats:
+    # 1) [t_norm, kin_flat]
+    # 2) [t_norm, kin_flat, goal_rel(4)]
+    goal_rel_from_obs: np.ndarray | None = None
+    if payload.size % feat_dim == 0:
+        kin_flat = payload
+    elif payload.size > GOAL_REL_DIM and (payload.size - GOAL_REL_DIM) % feat_dim == 0:
+        kin_flat = payload[:-GOAL_REL_DIM]
+        goal_rel_from_obs = payload[-GOAL_REL_DIM:].astype(np.float32)
+    else:
         raise ValueError(
-            f"state length mismatch: kin_flat size={kin_flat.size}, feat_dim={feat_dim}."
+            "state length mismatch: cannot split payload into kin_flat(+optional goal_rel). "
+            f"payload size={payload.size}, feat_dim={feat_dim}, goal_rel_dim={GOAL_REL_DIM}."
         )
 
     kin = kin_flat.reshape(-1, feat_dim)
@@ -91,7 +102,7 @@ def _to_abs_states(state_vec: np.ndarray, feature_names: list[str]):
         )
         neighbors_abs.append(abs_state)
 
-    return ego_state, neighbors_abs
+    return ego_state, neighbors_abs, goal_rel_from_obs
 
 
 def _format_vec4(vec: np.ndarray) -> str:
@@ -99,13 +110,10 @@ def _format_vec4(vec: np.ndarray) -> str:
     return f"[{vals[0]:.6f}, {vals[1]:.6f}, {vals[2]:.6f}, {vals[3]:.6f}]"
 
 
-def _build_goal_phys(ego_state: np.ndarray, goal_rel: np.ndarray | None) -> np.ndarray | None:
-    if goal_rel is None:
-        return None
-
+def _build_goal_phys(ego_state: np.ndarray, goal_rel: np.ndarray) -> np.ndarray:
     g = np.asarray(goal_rel, dtype=np.float32).reshape(-1)
     if g.size < 4:
-        raise ValueError("GOAL_REL must contain 4 values: [dx, dy, dvx, dvy].")
+        raise ValueError("goal_rel must contain 4 values: [dx, dy, dvx, dvy].")
     return (ego_state + g[:4]).astype(np.float32)
 
 
@@ -114,14 +122,20 @@ def main() -> None:
     row = _load_row(CSV_PATH, ROW_N)
     state_vec = _extract_state_vector_from_row(row)
     feature_names = list(FEATURE_NAMES)
-    ego_state, neighbors_state = _to_abs_states(state_vec, feature_names)
-    goal_phys = _build_goal_phys(ego_state, GOAL_REL)
+    ego_state, neighbors_state, goal_rel_from_obs = _to_abs_states(state_vec, feature_names)
+    if goal_rel_from_obs is None:
+        raise ValueError(
+            "Cannot extract goal_rel from low_obs. This CSV row likely stores format [t_norm, kin_flat] "
+            "without goal_rel tail."
+        )
+    goal_phys = _build_goal_phys(ego_state, goal_rel_from_obs)
 
     print(f"csv_path: {CSV_PATH}")
     print(f"row_n: {ROW_N}")
     print(f"state_dim: {state_vec.shape[0]}")
     print(f"features: {feature_names}")
     print(f"neighbors_present: {len(neighbors_state)}")
+    print(f"goal_rel_from_low_obs: {_format_vec4(goal_rel_from_obs)}")
 
     print("\n# Copy to test_hiro_low.py")
     print(f"ego_state={_format_vec4(ego_state)},")
@@ -131,11 +145,7 @@ def main() -> None:
         print(f"    {_format_vec4(n)},")
     print("],")
 
-    if goal_phys is None:
-        print("# GOAL_REL is None, set goal_phys manually")
-        print("goal_phys=[0.0, 4.0, 0.0, 0.0],")
-    else:
-        print(f"goal_phys={_format_vec4(goal_phys)},")
+    print(f"goal_phys={_format_vec4(goal_phys)},")
 
 
 if __name__ == "__main__":

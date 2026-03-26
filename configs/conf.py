@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional, Union
 
@@ -75,10 +76,12 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     # Ego
     "controlled_vehicles": 1,
     "ego_speed": 10.0,
+    "ego_speed_range": None,
     "initial_lane_id": "random",
     "warmup_time": 100.0,
     "warmup_each_episode": False,
-    "ego_clear_radius": 10.0,
+    "ego_clear_radius": 20.0,
+    # "ego_clear_radius": 10.0,
     # "ego_clear_radius": "auto",
     # "ego_clear_margin": 0.5,
 
@@ -127,7 +130,7 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "comfort_acc_weight": 1.0,
     "comfort_jerk_weight": 0.1,
 
-    # "lane_change_reward": -1.5,
+    # "lane_change_reward": -1.0,
     "lane_change_reward": -0.5,
 
     # Termination
@@ -170,6 +173,13 @@ def get_ppo_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
 
 
 def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, Any]:
+    numerics_guard_cfg = dict(
+        enabled=True,
+        save_dir=log_dir,
+        file_name="sac_non_finite_debug.csv",
+        max_rows_per_event=8,
+    )
+
     if level == "high":
         sac_kwargs = dict(
             policy="MlpPolicy",
@@ -186,6 +196,7 @@ def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, An
             train_freq=(1, "step"),
             # train_freq=(4, "step"),
             gradient_steps=1,
+            numerics_guard=numerics_guard_cfg,
         )
     elif level == "low":
         sac_kwargs = dict(
@@ -201,6 +212,7 @@ def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, An
             learning_rate=3e-4,
             train_freq=(1, "step"),
             gradient_steps=1,
+            numerics_guard=numerics_guard_cfg,
         )
     else:
         sac_kwargs = dict(
@@ -215,6 +227,7 @@ def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, An
             learning_rate=3e-4,
             train_freq=(1, "step"),
             gradient_steps=1,
+            numerics_guard=numerics_guard_cfg,
         )
     return sac_kwargs
 
@@ -226,6 +239,12 @@ def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, An
 def get_hiro_high_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
     """Get SAC kwargs for HiRO high-level agent, including static buffer config."""
     kwargs = get_sac_kwargs(log_dir, seed, level="high")
+
+    # Keep numerics guard CSV at run-level log dir (same level as high_interval_debug.csv).
+    run_log_dir = os.path.dirname(log_dir) if os.path.basename(log_dir) == "hiro_high" else log_dir
+    numerics_guard = dict(kwargs.get("numerics_guard", {}) or {})
+    numerics_guard["save_dir"] = run_log_dir
+    kwargs["numerics_guard"] = numerics_guard
     
     # Static config for HiROHighReplayBuffer
     kwargs["replay_buffer_kwargs"] = dict(
@@ -248,6 +267,13 @@ def get_hiro_low_sac_kwargs(
     The actual action_dim is only known inside HIRO at runtime, so the scaling is applied there.
     """
     kwargs = get_sac_kwargs(log_dir, seed, level="low")
+
+    # Keep numerics guard CSV at run-level log dir (same level as high_interval_debug.csv).
+    run_log_dir = os.path.dirname(log_dir) if os.path.basename(log_dir) == "hiro_low" else log_dir
+    numerics_guard = dict(kwargs.get("numerics_guard", {}) or {})
+    numerics_guard["save_dir"] = run_log_dir
+    kwargs["numerics_guard"] = numerics_guard
+
     kwargs["target_entropy"] = target_entropy
     kwargs["target_entropy_scale"] = target_entropy_scale
     return kwargs
@@ -303,9 +329,15 @@ def get_hiro_config():
         intrinsic_weights=intrinsic_weights,
         intrinsic_type=intrinsic_type,
 
+        # goal_sampler=GoalSamplerConfig(
+        #     type="uniform",
+        # ),
         goal_sampler=GoalSamplerConfig(
-            type="uniform",
+            type="reachable_uniform",
         ),
+        # goal_sampler=GoalSamplerConfig(
+        #     type="speed_near_cruise",
+        # ),
         # goal_sampler=GoalSamplerConfig(
         #     type="pretrained",
         #     path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
@@ -334,6 +366,20 @@ def get_hiro_config():
 
         use_low_safety_layer=True,
         # use_low_safety_layer=False,
+
+        # use_high_goal_safety_layer=False,
+        use_high_goal_safety_layer=True,
+        high_goal_safe_eps=1e-6,
+
+        # high_goal_safe_use_custom_kinematics=False,
+        high_goal_safe_use_custom_kinematics=True,
+        high_goal_safe_max_accel=3.0,
+        high_goal_safe_max_decel=3.0,
+        high_goal_safe_front_dmin=10.0,
+        high_goal_safe_lane_change_rear_dmin=8.0,
+        # high_goal_safe_front_dmin=0.0,
+        # high_goal_safe_lane_change_rear_dmin=0.0,
+        high_goal_safe_min_goal_x_span=0,
 
         low_safety_violation_penalty=0.3,
 

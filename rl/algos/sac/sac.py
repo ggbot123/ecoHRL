@@ -12,6 +12,7 @@ from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
 from rl.algos.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
+from rl.utils.numerics_guard import SACNumericsGuard
 
 SelfSAC = TypeVar("SelfSAC", bound="SAC")
 
@@ -76,6 +77,8 @@ class SAC(OffPolicyAlgorithm):
     :param device: Device (cpu, cuda, ...) on which the code should be run.
         Setting it to auto, the code will be run on the GPU if possible.
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
+    :param safe_warmup_sampling: When True, warmup actions (before learning_starts) are sampled from policy
+        instead of uniform random actions. Useful for hard safety constraints from step 0.
     """
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
@@ -118,6 +121,8 @@ class SAC(OffPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        safe_warmup_sampling: bool = False,
+        numerics_guard: Optional[dict[str, Any]] = None,
     ):
         super().__init__(
             policy,
@@ -155,6 +160,8 @@ class SAC(OffPolicyAlgorithm):
         self.ent_coef = ent_coef
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
+        self.safe_warmup_sampling = bool(safe_warmup_sampling)
+        self.numerics_guard = SACNumericsGuard.from_dict(numerics_guard)
 
         if _init_setup_model:
             self._setup_model()
@@ -198,6 +205,97 @@ class SAC(OffPolicyAlgorithm):
         self.actor = self.policy.actor
         self.critic = self.policy.critic
         self.critic_target = self.policy.critic_target
+
+    def _sample_safe_reachable_warmup_action(self, n_envs: int) -> Optional[np.ndarray]:
+        """Sample warmup actions uniformly from reachable safe segments when available."""
+        if self._last_obs is None or not isinstance(self.action_space, spaces.Box):
+            return None
+
+        goal_safe_bounds_fn = getattr(self.policy.actor, "goal_safe_bounds_fn", None)
+        if goal_safe_bounds_fn is None:
+            return None
+
+        obs_np = np.asarray(self._last_obs, dtype=np.float32)
+        if obs_np.ndim == 1:
+            obs_np = obs_np.reshape(1, -1)
+        if obs_np.shape[0] != n_envs:
+            return None
+
+        with th.no_grad():
+            obs_tensor = th.as_tensor(obs_np, device=self.device)
+            bounds = goal_safe_bounds_fn(obs_tensor)
+
+        required = ("l2", "u2")
+        if any(key not in bounds for key in required):
+            return None
+
+        l2 = bounds["l2"].detach().cpu().numpy().astype(np.float32)
+        u2 = bounds["u2"].detach().cpu().numpy().astype(np.float32)
+
+        if l2.ndim != 2 or u2.ndim != 2 or l2.shape[1] != 3 or u2.shape[1] != 3:
+            return None
+
+        low = self.action_space.low.astype(np.float32)
+        high = self.action_space.high.astype(np.float32)
+        actions = np.random.uniform(low=low, high=high, size=(n_envs, low.shape[0])).astype(np.float32)
+
+        seg_low = np.asarray([-1.0, -1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)[None, :]
+        seg_high = np.asarray([-1.0 / 3.0, 1.0 / 3.0, 1.0], dtype=np.float32)[None, :]
+
+        valid_box2 = u2 > l2
+        valid_k = valid_box2
+        valid_any = np.any(valid_k, axis=1)
+        if not np.all(valid_any):
+            # Fall back to policy sampling when any env has no feasible component.
+            return None
+
+        k = np.zeros((n_envs,), dtype=np.int64)
+        for i in range(n_envs):
+            candidates = np.flatnonzero(valid_k[i])
+            k[i] = int(np.random.choice(candidates))
+
+        row = np.arange(n_envs)
+        y_low = seg_low[0, k]
+        y_high = seg_high[0, k]
+        x_low_n = l2[row, k]
+        x_high_n = u2[row, k]
+
+        y_code = y_low + np.random.rand(n_envs).astype(np.float32) * (y_high - y_low)
+        x_norm = x_low_n + np.random.rand(n_envs).astype(np.float32) * (x_high_n - x_low_n)
+        x_norm = np.clip(x_norm, -1.0, 1.0)
+
+        if actions.shape[1] >= 1:
+            actions[:, 0] = low[0] + 0.5 * (x_norm + 1.0) * (high[0] - low[0])
+        if actions.shape[1] >= 2:
+            actions[:, 1] = np.clip(y_code, low[1], high[1])
+
+        return actions
+
+    def _sample_action(
+        self,
+        learning_starts: int,
+        action_noise: Optional[ActionNoise] = None,
+        n_envs: int = 1,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Sample action with optional policy-based warmup for hard safety from step 0."""
+        if not self.safe_warmup_sampling or self.num_timesteps >= learning_starts:
+            return super()._sample_action(learning_starts=learning_starts, action_noise=action_noise, n_envs=n_envs)
+
+        if self._last_obs is None:
+            return super()._sample_action(learning_starts=learning_starts, action_noise=action_noise, n_envs=n_envs)
+
+        if not isinstance(self.action_space, spaces.Box):
+            return super()._sample_action(learning_starts=learning_starts, action_noise=action_noise, n_envs=n_envs)
+
+        action = self._sample_safe_reachable_warmup_action(n_envs=n_envs)
+        if action is None:
+            action, _ = self.predict(self._last_obs, deterministic=False)
+            action = np.asarray(action, dtype=np.float32)
+
+        buffer_action = self.policy.scale_action(action)
+        buffer_action = np.clip(buffer_action, -1.0, 1.0)
+        action = self.policy.unscale_action(buffer_action)
+        return action, buffer_action
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         # Switch to train mode (this affects batch norm / dropout)
@@ -252,8 +350,8 @@ class SAC(OffPolicyAlgorithm):
                 # Select action according to policy
                 next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
                 # Compute the next Q values: min over all critics targets
-                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
-                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                target_q_values_all = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                next_q_values, _ = th.min(target_q_values_all, dim=1, keepdim=True)
                 # add entropy term
                 next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
                 # td error + entropy term
@@ -262,20 +360,33 @@ class SAC(OffPolicyAlgorithm):
             # Get current Q-values estimates for each critic network
             # using action from the replay buffer
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
+            current_q_values_all = th.cat(current_q_values, dim=1)
 
             # Compute critic loss
             critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
             assert isinstance(critic_loss, th.Tensor)  # for type checker
             critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
 
+            self.numerics_guard.check_and_raise(
+                algo_update=self._n_updates,
+                gradient_step=gradient_step,
+                replay_data=replay_data,
+                next_actions=next_actions,
+                next_log_prob=next_log_prob.reshape(-1, 1),
+                target_q_values_all=target_q_values_all,
+                target_q_values=target_q_values,
+                current_q_values_all=current_q_values_all,
+                critic_loss=critic_loss,
+            )
+
             # Optimize the critic
             self.critic.optimizer.zero_grad()
             critic_loss.backward()
             self.critic.optimizer.step()
 
-            # Compute actor loss
-            # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
-            # Min over all critic networks
+            # Compute actor loss using the same sampled action/log-prob pair as in standard SAC.
+            # The safe actor already returns actions sampled from the desired safe policy
+            # together with the matching safe log-prob.
             q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
             min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
             actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
