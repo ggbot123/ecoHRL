@@ -5,10 +5,13 @@ import os
 from dataclasses import replace
 from typing import Any, Dict
 
+import numpy as np
+
 from rl.algos.HRL.hiro import HIROSAC
 from rl.algos.HRL.buffer import HiROHighReplayBuffer
-from rl.algos.HRL.callbacks import HIROLoggingCallback, HIROCheckpointCallback
+from rl.algos.HRL.callbacks import HIROLoggingCallback, HIROCheckpointCallback, HIROLowEpisodeTrajectoryCallback
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig, get_goal_sampler
+from rl.utils import utils
 from stable_baselines3.common.callbacks import CallbackList
 
 
@@ -36,7 +39,7 @@ def train_hiro(
 
     # Resolve mode-dependent effective settings here; HIRO should not contain redundant guardrails.
     opc_enabled = train_mode == "joint" and bool(getattr(cfg, "use_off_policy_correction", True))
-    low_level_type = str(getattr(cfg, "low_level_type", "sac")).lower() if train_mode == "high_only" else "sac"
+    low_level_type = str(getattr(cfg, "low_level_type", "sac")).lower()
     goal_sampler_cfg = getattr(cfg, "goal_sampler", GoalSamplerConfig()) if train_mode == "low_only" else GoalSamplerConfig()
 
     effective_cfg = replace(
@@ -64,7 +67,31 @@ def train_hiro(
             high_sac_kwargs.pop("replay_buffer_kwargs", None)
 
     model = HIROSAC(env, high_sac_kwargs, low_sac_kwargs, effective_cfg)
-    
+
+    sampler_type = str(getattr(effective_cfg.goal_sampler, "type", "")).lower()
+    if sampler_type in {"speed_near_cruise", "near_cruise", "cruise_nearby"}:
+        # For speed-near-cruise goals, diversify x by randomizing ego initial speed.
+        cfg_list = env.get_attr("config")
+        for i, cfg_i in enumerate(cfg_list):
+            cfg_new = dict(cfg_i)
+            cfg_new["ego_speed_range"] = [8.0, 12.0]
+            env.set_attr("config", cfg_new, indices=i)
+        print("[HIRO Trainer] Enabled ego_speed_range=[8,12] for speed_near_cruise sampler")
+
+    def _extract_ego_speed(high_obs_batch: np.ndarray) -> np.ndarray:
+        arr = np.asarray(high_obs_batch, dtype=np.float32)
+        _, kin, _ = utils.split_time_kinematics(arr, model.n_veh, model.feat_dim)
+        ego_sub = utils.extract_ego_substate(kin, model.ego_feature_idx)
+        if ego_sub.shape[1] >= 4:
+            vx = ego_sub[:, 2]
+            vy = ego_sub[:, 3]
+            speed = np.sqrt(np.maximum(vx * vx + vy * vy, 0.0))
+        elif ego_sub.shape[1] >= 3:
+            speed = np.abs(ego_sub[:, 2])
+        else:
+            raise ValueError("Cannot extract ego speed from high observation")
+        return np.asarray(speed, dtype=np.float32)
+
     # Set seed for high-level replay buffer if it exists (for OPC noise reproducibility)
     if hasattr(model.high_agent.replay_buffer, "set_seed"):
         model.high_agent.replay_buffer.set_seed(seed)
@@ -76,7 +103,8 @@ def train_hiro(
     logging_cb = HIROLoggingCallback(
         high_log_interval_episodes=n_envs * 1,
         low_log_interval_hi=n_envs * 4,
-        csv_log_freq_episodes=20,
+        # csv_log_freq_episodes=20,
+        csv_log_freq_episodes=0,
         csv_save_dir=log_dir,
         low_obs_csv_interval_hi=10,
         low_obs_csv_env0_only=True,
@@ -88,7 +116,12 @@ def train_hiro(
         prefix=save_name_prefix,
         verbose=1,
     )
+    low_traj_cb = HIROLowEpisodeTrajectoryCallback(
+        save_path=os.path.join(log_dir, "low_episode_trajectories.jsonl"),
+        verbose=0,
+    )
 
+    # callback = CallbackList([logging_cb, low_traj_cb, checkpoint_cb])
     callback = CallbackList([logging_cb, checkpoint_cb])
     
     if train_mode == "joint":
@@ -99,7 +132,12 @@ def train_hiro(
         )
     elif train_mode == "low_only":
         print(f"[HIRO Trainer] Training Low-Level Only. Goal Sampler: {effective_cfg.goal_sampler.type}")
-        sampler = get_goal_sampler(effective_cfg.goal_sampler, model.high_agent.action_space)
+        sampler = get_goal_sampler(
+            effective_cfg.goal_sampler,
+            model.high_agent.action_space,
+            bounds_fn=model.high_goal_safe_bounds.compute_np,
+            speed_fn=_extract_ego_speed,
+        )
         model.learn_low(
             total_timesteps=total_timesteps,
             goal_sampler=sampler,

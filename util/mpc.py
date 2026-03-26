@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import warnings
 
 import numpy as np
 import cvxpy as cp  # type: ignore[import-not-found]
@@ -970,7 +971,9 @@ class MPCController:
 
         solver_tried: List[str] = ["GUROBI"]
         try:
-            prob.solve(solver=cp.GUROBI, verbose=True)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                prob.solve(solver=cp.GUROBI, verbose=False)
         except Exception as e:  # pragma: no cover
             raise RuntimeError(f"joint_global GUROBI solve failed. error={e}") from e
 

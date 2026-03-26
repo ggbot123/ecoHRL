@@ -400,12 +400,27 @@ class MultiLaneEnv(AbstractEnv):
         self.road.vehicles = remaining
 
     # ----------------- 预热后，在入口插入 ego ----------------- #
+    def _sample_ego_speed(self) -> float:
+        cfg = self.config
+        speed_range = cfg.get("ego_speed_range", None)
+        if isinstance(speed_range, (list, tuple, np.ndarray)) and len(speed_range) == 2:
+            s0 = float(speed_range[0])
+            s1 = float(speed_range[1])
+            lo = min(s0, s1)
+            hi = max(s0, s1)
+            if np.isfinite(lo) and np.isfinite(hi):
+                if hi > lo:
+                    return float(self.np_random.uniform(lo, hi))
+                return float(lo)
+        return float(cfg["ego_speed"])
+
     def _create_ego(self):
         cfg = self.config
         lanes = int(cfg["lanes_count"])
         lane_id = int(self.np_random.integers(lanes)) if cfg["initial_lane_id"] == "random" else int(cfg["initial_lane_id"])
         lane_index = ("0", "1", int(lane_id))
         lane = self.road.network.get_lane(lane_index)
+        ego_speed = self._sample_ego_speed()
 
         # 清理入口前方车辆：
         # - ego_clear_radius 为数值时，使用固定半径（兼容旧配置）
@@ -425,7 +440,7 @@ class MultiLaneEnv(AbstractEnv):
                         front_speed = float(getattr(v, "speed", np.linalg.norm(getattr(v, "velocity", np.zeros(2)))))
                         required_clear_dist = compute_ego_clear_distance_for_front_vehicle(
                             cfg,
-                            ego_speed=float(cfg["ego_speed"]),
+                            ego_speed=ego_speed,
                             front_speed=front_speed,
                         )
                         if longi < required_clear_dist:
@@ -437,7 +452,6 @@ class MultiLaneEnv(AbstractEnv):
         longi0 = 0
         position = lane.position(longi0, 0.0)
         heading = lane.heading_at(longi0)
-        ego_speed = cfg["ego_speed"]
         ego = self.action_type.vehicle_class(self.road, position, heading, ego_speed)
 
         self.vehicle = ego
