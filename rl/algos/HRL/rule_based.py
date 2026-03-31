@@ -112,6 +112,9 @@ class RuleBasedController:
 
         # Safety filter mode
         self.low_safety_filter_type = str(self.config.get("low_safety_filter_type", "legacy")).lower().strip()
+        self.compute_action_mode = str(
+            self.config.get("rule_based_compute_action_mode", "target_speed_lane")
+        ).lower().strip()
 
         # Observation meta (for act(obs, ...))
         obs_cfg = dict(self.config.get("observation", {}) or {})
@@ -624,7 +627,7 @@ class RuleBasedController:
 
         return act.astype(np.float32)
 
-    def compute_action(
+    def _compute_action_idm_mobil(
         self,
         ego_abs: np.ndarray,
         others_rel: np.ndarray,
@@ -632,12 +635,7 @@ class RuleBasedController:
         dt: float,
         remaining_time: Optional[float] = None,
     ) -> np.ndarray:
-        """从 (ego, others, goal) 计算一个动作。
-
-        ego_abs: [x, y, vx, vy] (绝对)
-        others_rel: (M, 4) [dx, dy, dvx, dvy] (相对 ego)
-        goal_phys: [x*, y*, vx*, vy*] (绝对目标)
-        """
+        """完整规则：使用 IDM/MOBIL 与目标约束。"""
 
         ego = self._as_ego_abs4(ego_abs)
         ego_x, ego_y, ego_vx, ego_vy = [float(v) for v in ego]
@@ -645,7 +643,6 @@ class RuleBasedController:
         ego_heading = float(math.atan2(ego_vy, ego_vx)) if ego_speed > 0.1 else 0.0
         ego_lane = self.get_lane_index(ego_y)
 
-        # Reconstruct other vehicles in absolute frame for neighbor queries
         others: List[VirtualVehicle] = []
         for row in np.asarray(others_rel, dtype=np.float32).reshape(-1, 4):
             dx, dy, dvx, dvy = [float(v) for v in row]
@@ -668,7 +665,6 @@ class RuleBasedController:
                 )
             )
 
-        # Parse goal
         goal_x = float(goal_phys[0])
         goal_y = float(goal_phys[1])
         goal_vx = float(goal_phys[2])
@@ -690,21 +686,15 @@ class RuleBasedController:
             length=self.LENGTH,
         )
 
-        # Desired lane (nearest lane center to goal_y)
         target_lane = self.get_lane_index(goal_y)
         if abs(target_lane - ego_lane) > 1:
             target_lane = ego_lane + int(np.sign(target_lane - ego_lane))
             target_lane = int(np.clip(target_lane, 0, self.lanes_count - 1))
 
-        # MOBIL safety/incentive gate
-        if target_lane != ego_lane:
-            if not self.mobil_ok(ego, target_lane, others):
-                target_lane = ego_lane
+        if target_lane != ego_lane and not self.mobil_ok(ego, target_lane, others):
+            target_lane = ego_lane
 
-        # Longitudinal control: PID towards target speed
         acc_pid = float(self.KP_A) * (target_speed - ego_speed)
-
-        # IDM safety constraint
         front, _ = self._get_neighbors(ego, others, ego_lane)
         acc_idm = self.idm_acceleration(ego, front)
         if target_lane != ego_lane:
@@ -719,7 +709,122 @@ class RuleBasedController:
             acc_norm = self._acc_phys_to_norm(acc_phys)
             return np.array([lane_scalar, acc_norm], dtype=np.float32)
 
-        # Default: ContinuousAction [acc_norm, steer_norm]
+        target_lane_y = self.get_lane_y(target_lane)
+        lateral_error = float(target_lane_y - ego_y)
+        lateral_speed_command = float(self.KP_LATERAL) * lateral_error
+        v_s = float(c_utils.not_zero(ego_speed))
+        heading_ref = float(math.asin(float(np.clip(lateral_speed_command / v_s, -1.0, 1.0))))
+        heading_rate_command = float(self.KP_HEADING) * float(c_utils.wrap_to_pi(heading_ref - ego_heading))
+        slip_angle = float(math.asin(float(np.clip(self.LENGTH / 2.0 / v_s * heading_rate_command, -1.0, 1.0))))
+        steering_angle = float(math.atan(2.0 * math.tan(slip_angle)))
+        steering_angle = float(np.clip(steering_angle, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE))
+
+        acc_norm = self._acc_phys_to_norm(acc_phys)
+        steer_min, steer_max = float(self.steer_range[0]), float(self.steer_range[1])
+        if steer_max == steer_min:
+            steer_norm = 0.0
+        else:
+            steer_norm = 2.0 * (steering_angle - steer_min) / (steer_max - steer_min) - 1.0
+        steer_norm = float(np.clip(steer_norm, -1.0, 1.0))
+        return np.array([acc_norm, steer_norm], dtype=np.float32)
+
+    def _compute_action_goal_x_accel(
+        self,
+        ego_abs: np.ndarray,
+        others_rel: np.ndarray,
+        goal_phys: np.ndarray,
+        dt: float,
+        remaining_time: Optional[float] = None,
+    ) -> np.ndarray:
+        """简化规则：按匀加速到目标 x，不使用 IDM/MOBIL。"""
+
+        _ = others_rel
+
+        ego = self._as_ego_abs4(ego_abs)
+        ego_x, ego_y, ego_vx, ego_vy = [float(v) for v in ego]
+        ego_speed = float(math.sqrt(ego_vx * ego_vx + ego_vy * ego_vy))
+        ego_heading = float(math.atan2(ego_vy, ego_vx)) if ego_speed > 0.1 else 0.0
+        ego_lane = self.get_lane_index(ego_y)
+
+        goal_x = float(goal_phys[0])
+        goal_y = float(goal_phys[1])
+
+        rt = max(float(remaining_time), float(dt)) if remaining_time is not None else float(dt)
+        acc_phys = 2.0 * (goal_x - ego_x - ego_vx * rt) / max(rt * rt, 1e-6)
+
+        target_lane = self.get_lane_index(goal_y)
+        if abs(target_lane - ego_lane) > 1:
+            target_lane = ego_lane + int(np.sign(target_lane - ego_lane))
+            target_lane = int(np.clip(target_lane, 0, self.lanes_count - 1))
+
+        acc_phys = float(np.clip(acc_phys, self.acc_min, self.acc_max))
+
+        if self.action_type == "ParamLaneAccelAction":
+            lane_scalar = self._lane_to_scalar(ego_lane, target_lane)
+            acc_norm = self._acc_phys_to_norm(acc_phys)
+            return np.array([lane_scalar, acc_norm], dtype=np.float32)
+
+        target_lane_y = self.get_lane_y(target_lane)
+        lateral_error = float(target_lane_y - ego_y)
+        lateral_speed_command = float(self.KP_LATERAL) * lateral_error
+        v_s = float(c_utils.not_zero(ego_speed))
+        heading_ref = float(math.asin(float(np.clip(lateral_speed_command / v_s, -1.0, 1.0))))
+        heading_rate_command = float(self.KP_HEADING) * float(c_utils.wrap_to_pi(heading_ref - ego_heading))
+        slip_angle = float(math.asin(float(np.clip(self.LENGTH / 2.0 / v_s * heading_rate_command, -1.0, 1.0))))
+        steering_angle = float(math.atan(2.0 * math.tan(slip_angle)))
+        steering_angle = float(np.clip(steering_angle, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE))
+
+        acc_norm = self._acc_phys_to_norm(acc_phys)
+        steer_min, steer_max = float(self.steer_range[0]), float(self.steer_range[1])
+        if steer_max == steer_min:
+            steer_norm = 0.0
+        else:
+            steer_norm = 2.0 * (steering_angle - steer_min) / (steer_max - steer_min) - 1.0
+        steer_norm = float(np.clip(steer_norm, -1.0, 1.0))
+        return np.array([acc_norm, steer_norm], dtype=np.float32)
+
+    def _compute_action_target_speed_lane(
+        self,
+        ego_abs: np.ndarray,
+        others_rel: np.ndarray,
+        goal_phys: np.ndarray,
+        dt: float,
+        remaining_time: Optional[float] = None,
+    ) -> np.ndarray:
+        """简化版动作计算：不使用 IDM/MOBIL，直接按目标速度与目标车道输出动作。"""
+
+        _ = others_rel
+
+        ego = self._as_ego_abs4(ego_abs)
+        ego_x, ego_y, ego_vx, ego_vy = [float(v) for v in ego]
+        ego_speed = float(math.sqrt(ego_vx * ego_vx + ego_vy * ego_vy))
+        ego_heading = float(math.atan2(ego_vy, ego_vx)) if ego_speed > 0.1 else 0.0
+        ego_lane = self.get_lane_index(ego_y)
+
+        goal_x = float(goal_phys[0])
+        goal_y = float(goal_phys[1])
+        goal_vx = float(goal_phys[2])
+
+        if remaining_time is not None:
+            rt = max(float(remaining_time), float(dt))
+            target_speed = max((goal_x - ego_x) / rt, 0.0)
+        else:
+            target_speed = abs(goal_vx)
+        target_speed = float(np.clip(target_speed, 0.0, self.speed_limit))
+
+        target_lane = self.get_lane_index(goal_y)
+        if abs(target_lane - ego_lane) > 1:
+            target_lane = ego_lane + int(np.sign(target_lane - ego_lane))
+            target_lane = int(np.clip(target_lane, 0, self.lanes_count - 1))
+
+        acc_phys = float(self.KP_A) * (target_speed - ego_speed)
+        acc_phys = float(np.clip(acc_phys, self.acc_min, self.acc_max))
+
+        if self.action_type == "ParamLaneAccelAction":
+            lane_scalar = self._lane_to_scalar(ego_lane, target_lane)
+            acc_norm = self._acc_phys_to_norm(acc_phys)
+            return np.array([lane_scalar, acc_norm], dtype=np.float32)
+
         target_lane_y = self.get_lane_y(target_lane)
         lateral_error = float(target_lane_y - ego_y)
 
@@ -740,14 +845,29 @@ class RuleBasedController:
         steer_norm = float(np.clip(steer_norm, -1.0, 1.0))
         return np.array([acc_norm, steer_norm], dtype=np.float32)
 
+    def compute_action(
+        self,
+        ego_abs: np.ndarray,
+        others_rel: np.ndarray,
+        goal_phys: np.ndarray,
+        dt: float,
+        remaining_time: Optional[float] = None,
+    ) -> np.ndarray:
+        """从配置选择 rule-based 动作策略。"""
+        mode = self.compute_action_mode
+        if mode in {"idm_mobil", "full"}:
+            return self._compute_action_idm_mobil(ego_abs, others_rel, goal_phys, dt, remaining_time=remaining_time)
+        if mode in {"goal_x_accel", "const_accel_to_goal_x"}:
+            return self._compute_action_goal_x_accel(ego_abs, others_rel, goal_phys, dt, remaining_time=remaining_time)
+        if mode in {"target_speed_lane", "simple"}:
+            return self._compute_action_target_speed_lane(ego_abs, others_rel, goal_phys, dt, remaining_time=remaining_time)
+        raise ValueError(
+            f"Unknown rule_based_compute_action_mode: {mode}. "
+            "Expected one of: idm_mobil, goal_x_accel, target_speed_lane"
+        )
+
 
 class RuleBasedAgentWrapper:
-    """给 HIRO 调用的 low-level wrapper。
-
-    - 输入：HIRO 的 low_obs（包含 t_norm + local kinematics + goal_rel）
-    - 输出：env action space 对应的 2D action
-    """
-
     def __init__(self, vec_env, n_envs: int, high_interval: int, low_safety_filter: Any = None):
         self.vec_env = vec_env
         self.n_envs = int(n_envs)

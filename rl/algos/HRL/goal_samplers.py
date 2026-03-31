@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from statistics import NormalDist
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
@@ -10,11 +11,13 @@ import numpy as np
 
 @dataclass(frozen=True)
 class GoalSamplerConfig:
-    type: str = "uniform"  # "uniform" | "reachable_uniform" | "speed_near_cruise" | "pretrained" | "pretrained_sac"
+    type: str = "uniform"  # "uniform" | "reachable_uniform" | "reachable_gaussian" | "speed_near_cruise" | "pretrained" | "pretrained_sac"
     path: Optional[str] = None
     device: str = "auto"
     deterministic: bool = True
     action: Optional[list[float]] = None  # used when type == "fixed"
+    gaussian_mean_x_m: float = 27.0  # used when type == "reachable_gaussian"
+    gaussian_half_range_m: float = 5.0  # used when type == "reachable_gaussian"
 
 class GoalSampler:
     """Base class for goal samplers."""
@@ -96,6 +99,89 @@ class ReachableUniformGoalSampler(GoalSampler):
                 denom = max(float(high[0] - low[0]), 1e-6)
                 x_env = low[0] + 0.5 * (x_norm + 1.0) * denom
                 actions[idx, 0] = np.clip(x_env, low[0], high[0])
+
+        return actions.astype(np.float32)
+
+
+class ReachableGaussianGoalSampler(GoalSampler):
+    """Sample goals from reachable set with x following truncated Gaussian mass.
+
+    x is sampled from N(mu=27m, sigma) with sigma chosen such that
+    P(|X - mu| <= 5m) = 0.7, then truncated and renormalized on the selected
+    reachable segment interval. Segment (lane choice) is sampled uniformly over
+    feasible components, and y is sampled uniformly in the chosen segment code range.
+    """
+
+    def __init__(
+        self,
+        action_space: gym.spaces.Box,
+        bounds_fn: Callable[[np.ndarray], dict[str, np.ndarray]],
+        mean_x_m: float = 27.0,
+        half_range_m: float = 5.0,
+    ):
+        super().__init__(action_space)
+        self._bounds_fn = bounds_fn
+        self._mu_x_m = float(mean_x_m)
+        half = float(max(half_range_m, 1e-6))
+        # Keep 70% probability mass inside [mu-half, mu+half].
+        z = float(NormalDist().inv_cdf(0.85))
+        sigma = max(half / max(z, 1e-6), 1e-6)
+        self._gauss = NormalDist(mu=self._mu_x_m, sigma=sigma)
+
+    def __call__(self, obs: np.ndarray) -> np.ndarray:
+        obs = np.asarray(obs, dtype=np.float32)
+        n = int(obs.shape[0])
+        act_dim = int(np.prod(self.action_space.shape))
+
+        low = np.asarray(self.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(self.action_space.high, dtype=np.float32).reshape(-1)
+
+        # Fallback values for unconstrained dims and rows with no feasible component.
+        actions = np.random.uniform(low, high, size=(n, act_dim)).astype(np.float32)
+        if act_dim < 2:
+            return actions
+
+        stats = self._bounds_fn(obs)
+        l2 = np.asarray(stats["l2"], dtype=np.float32)
+        u2 = np.asarray(stats["u2"], dtype=np.float32)
+
+        seg_low = np.asarray([-1.0, -1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)
+        seg_high = np.asarray([-1.0 / 3.0, 1.0 / 3.0, 1.0], dtype=np.float32)
+
+        valid = u2 > l2
+        denom = max(float(high[0] - low[0]), 1e-6)
+
+        for i in range(n):
+            candidates = np.flatnonzero(valid[i])
+            if candidates.size == 0:
+                continue
+
+            xl_norm = l2[i, candidates]
+            xh_norm = u2[i, candidates]
+            xl_env = low[0] + 0.5 * (xl_norm + 1.0) * denom
+            xh_env = low[0] + 0.5 * (xh_norm + 1.0) * denom
+
+            # Keep segment selection uniform among feasible components.
+            cidx = int(np.random.randint(0, candidates.size))
+            k = int(candidates[cidx])
+
+            lo = float(min(xl_env[cidx], xh_env[cidx]))
+            hi = float(max(xl_env[cidx], xh_env[cidx]))
+            p_lo = self._gauss.cdf(lo)
+            p_hi = self._gauss.cdf(hi)
+            dp = max(p_hi - p_lo, 0.0)
+
+            if dp <= 1e-15:
+                x_env = float(np.clip(self._mu_x_m, lo, hi))
+            else:
+                p = p_lo + float(np.random.rand()) * dp
+                p = float(np.clip(p, 1e-12, 1.0 - 1e-12))
+                x_env = float(self._gauss.inv_cdf(p))
+                x_env = float(np.clip(x_env, lo, hi))
+
+            y_code = float(seg_low[k] + np.random.rand() * (seg_high[k] - seg_low[k]))
+            actions[i, 0] = np.float32(np.clip(x_env, low[0], high[0]))
+            actions[i, 1] = np.float32(y_code)
 
         return actions.astype(np.float32)
 
@@ -201,6 +287,15 @@ def get_goal_sampler(
         if bounds_fn is None:
             raise ValueError("bounds_fn is required for type='reachable_uniform'")
         return ReachableUniformGoalSampler(action_space, bounds_fn=bounds_fn)
+    if sampler_type in {"reachable_gaussian", "gaussian_reachable", "reachable_trunc_gaussian"}:
+        if bounds_fn is None:
+            raise ValueError("bounds_fn is required for type='reachable_gaussian'")
+        return ReachableGaussianGoalSampler(
+            action_space,
+            bounds_fn=bounds_fn,
+            mean_x_m=float(cfg.gaussian_mean_x_m),
+            half_range_m=float(cfg.gaussian_half_range_m),
+        )
     if sampler_type in {"speed_near_cruise", "near_cruise", "cruise_nearby"}:
         if speed_fn is None:
             raise ValueError("speed_fn is required for type='speed_near_cruise'")

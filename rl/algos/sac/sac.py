@@ -298,6 +298,10 @@ class SAC(OffPolicyAlgorithm):
         return action, buffer_action
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
+        if not hasattr(self.numerics_guard, "check_and_raise"):
+            cfg = self.numerics_guard if isinstance(self.numerics_guard, dict) else None
+            self.numerics_guard = SACNumericsGuard.from_dict(cfg)
+
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
         # Update optimizers learning rate

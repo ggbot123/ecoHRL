@@ -29,9 +29,7 @@ def main() -> None:
             "under debug/<datetime>/"
         )
     )
-    parser.add_argument("--csv", type=str, default="./logs/current/hiro_260322_highonly_reachableUniform_newSLv2_vio03_HER_reDim_lc10_amax3_dmin10_8/high_interval_debug.csv")
-    # parser.add_argument("--csv", type=str, default="./logs/current/hiro_260322_highonly_reachableUniform_newSLv2_vio03_HER_reDim_lc10_amax3_dmin0/high_interval_debug.csv")
-    # parser.add_argument("--csv", type=str, default="./logs/current/hiro_260320_debug/high_interval_debug.csv", help="Path to high_interval_debug.csv")
+    parser.add_argument("--csv", type=str, default="./logs/current/hiro_260325_highonly_reachableUniformv2_newSLv2_vio03_HER_reDim_amax3_dmin10_8/high_interval_debug.csv")
     parser.add_argument("--last", type=int, default=100, help="Number of latest rows to plot")
     parser.add_argument("--workspace", type=str, default=".", help="Workspace root used for auto CSV search")
     parser.add_argument("--debug-root", type=str, default="./debug", help="Root debug output directory")
