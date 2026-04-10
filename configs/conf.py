@@ -5,6 +5,87 @@ from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional, Union
 
 
+# =========================
+# Algorithm kwargs
+# =========================
+
+def get_ppo_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
+    return dict(
+        policy="MlpPolicy",
+        device="cpu",
+        verbose=1,
+        tensorboard_log=log_dir,
+        seed=seed,
+        n_steps=2048,
+        batch_size=64,
+        gamma=0.99,
+        gae_lambda=0.95,
+        n_epochs=10,
+        clip_range=0.2,
+        ent_coef=0.0,
+    )
+
+
+def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, Any]:
+    numerics_guard_cfg = dict(
+        enabled=True,
+        save_dir=log_dir,
+        file_name="sac_non_finite_debug.csv",
+        max_rows_per_event=8,
+    )
+
+    if level == "high":
+        sac_kwargs = dict(
+            policy="MlpPolicy",
+            verbose=0,
+            tensorboard_log=log_dir,
+            seed=seed,
+            # buffer_size=100_000,
+            buffer_size=1_000_000,
+            batch_size=256,
+            gamma=0.99,
+            tau=0.005,
+            learning_rate=3e-4,
+            # learning_rate=1e-4,
+            train_freq=(1, "step"),
+            # train_freq=(4, "step"),
+            gradient_steps=1,
+            numerics_guard=numerics_guard_cfg,
+        )
+    elif level == "low":
+        sac_kwargs = dict(
+            policy="MlpPolicy",
+            verbose=0,
+            tensorboard_log=log_dir,
+            seed=seed,
+            # buffer_size=100_000,
+            buffer_size=1_000_000,
+            batch_size=256,
+            gamma=0.99,
+            tau=0.005,
+            learning_rate=3e-4,
+            train_freq=(1, "step"),
+            gradient_steps=1,
+            numerics_guard=numerics_guard_cfg,
+        )
+    else:
+        sac_kwargs = dict(
+            policy="MlpPolicy",
+            verbose=0,
+            tensorboard_log=log_dir,
+            seed=seed,
+            buffer_size=1_000_000,
+            batch_size=256,
+            gamma=0.99,
+            tau=0.005,
+            learning_rate=3e-4,
+            train_freq=(1, "step"),
+            gradient_steps=1,
+            numerics_guard=numerics_guard_cfg,
+        )
+    return sac_kwargs
+
+
 def _deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> Dict[str, Any]:
     for k, v in src.items():
         if isinstance(v, Mapping) and isinstance(dst.get(k), dict):
@@ -117,9 +198,13 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "punctual_time_target": 35.0,
     "punctual_reward": 10.0,
 
+    # Termination
+    "offroad_terminal": False,
+
     # Reward weights (used by MultiLaneEnv._reward gating logic)
     "collision_reward": -10.0,
     "progress_reward": 10.0,
+    "speed_ref_aux_reward": 0.0,
 
     "comfort_reward": 0.7,
     "comfort_max_accel": 3.0,
@@ -130,11 +215,15 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "comfort_acc_weight": 1.0,
     "comfort_jerk_weight": 0.1,
 
-    # "lane_change_reward": -1.0,
-    "lane_change_reward": -0.5,
+    "lane_change_reward": -1.0,
+    # "lane_change_reward": -0.5,
+    
+    # RuleBasedController compute_action strategy:
+    # "target_speed_lane" | "goal_x_accel" | "idm_mobil"
+    "rule_based_compute_action_mode": "goal_x_accel",
 
-    # Termination
-    "offroad_terminal": False,
+    # SAC can optionally reuse HIRO low-safety-filter lane-change constraints.
+    "enable_sac_low_safety_filter": True,
 }
 
 
@@ -152,132 +241,8 @@ def get_env_config(overrides: Mapping[str, Any] | None = None) -> Dict[str, Any]
 
 
 # =========================
-# Algorithm kwargs
-# =========================
-
-def get_ppo_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
-    return dict(
-        policy="MlpPolicy",
-        device="cpu",
-        verbose=1,
-        tensorboard_log=log_dir,
-        seed=seed,
-        n_steps=2048,
-        batch_size=64,
-        gamma=0.99,
-        gae_lambda=0.95,
-        n_epochs=10,
-        clip_range=0.2,
-        ent_coef=0.0,
-    )
-
-
-def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, Any]:
-    numerics_guard_cfg = dict(
-        enabled=True,
-        save_dir=log_dir,
-        file_name="sac_non_finite_debug.csv",
-        max_rows_per_event=8,
-    )
-
-    if level == "high":
-        sac_kwargs = dict(
-            policy="MlpPolicy",
-            verbose=0,
-            tensorboard_log=log_dir,
-            seed=seed,
-            # buffer_size=100_000,
-            buffer_size=1_000_000,
-            batch_size=256,
-            gamma=0.99,
-            tau=0.005,
-            learning_rate=3e-4,
-            # learning_rate=1e-4,
-            train_freq=(1, "step"),
-            # train_freq=(4, "step"),
-            gradient_steps=1,
-            numerics_guard=numerics_guard_cfg,
-        )
-    elif level == "low":
-        sac_kwargs = dict(
-            policy="MlpPolicy",
-            verbose=0,
-            tensorboard_log=log_dir,
-            seed=seed,
-            # buffer_size=100_000,
-            buffer_size=1_000_000,
-            batch_size=256,
-            gamma=0.99,
-            tau=0.005,
-            learning_rate=3e-4,
-            train_freq=(1, "step"),
-            gradient_steps=1,
-            numerics_guard=numerics_guard_cfg,
-        )
-    else:
-        sac_kwargs = dict(
-            policy="MlpPolicy",
-            verbose=0,
-            tensorboard_log=log_dir,
-            seed=seed,
-            buffer_size=1_000_000,
-            batch_size=256,
-            gamma=0.99,
-            tau=0.005,
-            learning_rate=3e-4,
-            train_freq=(1, "step"),
-            gradient_steps=1,
-            numerics_guard=numerics_guard_cfg,
-        )
-    return sac_kwargs
-
-
-# =========================
 # HiRO centralized configs
 # =========================
-
-def get_hiro_high_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
-    """Get SAC kwargs for HiRO high-level agent, including static buffer config."""
-    kwargs = get_sac_kwargs(log_dir, seed, level="high")
-
-    # Keep numerics guard CSV at run-level log dir (same level as high_interval_debug.csv).
-    run_log_dir = os.path.dirname(log_dir) if os.path.basename(log_dir) == "hiro_high" else log_dir
-    numerics_guard = dict(kwargs.get("numerics_guard", {}) or {})
-    numerics_guard["save_dir"] = run_log_dir
-    kwargs["numerics_guard"] = numerics_guard
-    
-    # Static config for HiROHighReplayBuffer
-    kwargs["replay_buffer_kwargs"] = dict(
-        n_candidates=20,
-        noise_std=0.5,
-        enable_off_policy_correction=True,
-    )
-    return kwargs
-
-
-def get_hiro_low_sac_kwargs(
-    log_dir: str,
-    seed: int,
-    target_entropy: Union[str, float] = "auto",
-    target_entropy_scale: Optional[float] = 0.5,
-) -> Dict[str, Any]:
-    """Get SAC kwargs for HiRO low-level agent.
-
-    By default, we use a scaled auto target entropy: target_entropy = -target_entropy_scale * action_dim.
-    The actual action_dim is only known inside HIRO at runtime, so the scaling is applied there.
-    """
-    kwargs = get_sac_kwargs(log_dir, seed, level="low")
-
-    # Keep numerics guard CSV at run-level log dir (same level as high_interval_debug.csv).
-    run_log_dir = os.path.dirname(log_dir) if os.path.basename(log_dir) == "hiro_low" else log_dir
-    numerics_guard = dict(kwargs.get("numerics_guard", {}) or {})
-    numerics_guard["save_dir"] = run_log_dir
-    kwargs["numerics_guard"] = numerics_guard
-
-    kwargs["target_entropy"] = target_entropy
-    kwargs["target_entropy_scale"] = target_entropy_scale
-    return kwargs
-
 
 def get_hiro_config():
     """Centralized HiRO algorithm config."""
@@ -321,20 +286,25 @@ def get_hiro_config():
         device="auto",
 
         # train_mode="joint",
-        # train_mode="high_only",
-        train_mode="low_only",
+        train_mode="high_only",
+        # train_mode="low_only",
 
         intrinsic_coef=intrinsic_coef,
         intrinsic_norm_ranges=intrinsic_norm_ranges,
         intrinsic_weights=intrinsic_weights,
         intrinsic_type=intrinsic_type,
 
-        # goal_sampler=GoalSamplerConfig(
-        #     type="uniform",
-        # ),
         goal_sampler=GoalSamplerConfig(
-            type="reachable_uniform",
+            type="uniform",
         ),
+        # goal_sampler=GoalSamplerConfig(
+        #     type="reachable_uniform",
+        # ),
+        # goal_sampler=GoalSamplerConfig(
+        #     type="reachable_gaussian",
+        #     gaussian_mean_x_m=27.0,
+        #     gaussian_half_range_m=5.0,
+        # ),
         # goal_sampler=GoalSamplerConfig(
         #     type="speed_near_cruise",
         # ),
@@ -349,8 +319,8 @@ def get_hiro_config():
         #     action=[25.0, 0.0, 10.0],
         # ),
 
-        # low_level_type="rule_based",
         low_level_type="sac",
+        # low_level_type="rule_based",
 
         low_sac_impl="sac",
         # low_sac_impl="safety_sac",
@@ -361,8 +331,8 @@ def get_hiro_config():
         low_her_ratio=0.8,
         low_her_strategy="future",
 
-        use_off_policy_correction=True,
-        # use_off_policy_correction=False,
+        # use_off_policy_correction=True,
+        use_off_policy_correction=False,
 
         use_low_safety_layer=True,
         # use_low_safety_layer=False,
@@ -371,20 +341,18 @@ def get_hiro_config():
         use_high_goal_safety_layer=True,
         high_goal_safe_eps=1e-6,
 
-        # high_goal_safe_use_custom_kinematics=False,
         high_goal_safe_use_custom_kinematics=True,
         high_goal_safe_max_accel=3.0,
         high_goal_safe_max_decel=3.0,
-        high_goal_safe_front_dmin=10.0,
-        high_goal_safe_lane_change_rear_dmin=8.0,
+        high_goal_safe_front_dmin=15.0,
+        high_goal_safe_lane_change_rear_dmin=10.0,
+        # high_goal_safe_front_dmin=10.0,
+        # high_goal_safe_lane_change_rear_dmin=8.0,
         # high_goal_safe_front_dmin=0.0,
         # high_goal_safe_lane_change_rear_dmin=0.0,
         high_goal_safe_min_goal_x_span=0,
 
         low_safety_violation_penalty=0.3,
-
-        fixed_goal_vx=0.0,
-        # fixed_goal_vx=None,
 
         low_safety_filter=LowSafetyFilterConfig(
             type="mpc_constraints",
@@ -392,6 +360,8 @@ def get_hiro_config():
             lane_change_min_rear_gap=10.0,
             lane_change_min_front_ttc=3.0,
             lane_change_min_rear_ttc=2.0,
+            # lane_change_min_front_ttc=0.0,
+            # lane_change_min_rear_ttc=0.0,
         ),
         # low_safety_filter=LowSafetyFilterConfig(
         #     type="mpc_constraints",
@@ -406,4 +376,48 @@ def get_hiro_config():
 
         mask_ego_position_in_low_obs=True,
         # mask_ego_position_in_low_obs=False,
+        fixed_goal_vx=0.0,
+        # fixed_goal_vx=None,
     )
+
+def get_hiro_high_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
+    """Get SAC kwargs for HiRO high-level agent, including static buffer config."""
+    kwargs = get_sac_kwargs(log_dir, seed, level="high")
+
+    # Keep numerics guard CSV at run-level log dir (same level as high_interval_debug.csv).
+    run_log_dir = os.path.dirname(log_dir) if os.path.basename(log_dir) == "hiro_high" else log_dir
+    numerics_guard = dict(kwargs.get("numerics_guard", {}) or {})
+    numerics_guard["save_dir"] = run_log_dir
+    kwargs["numerics_guard"] = numerics_guard
+    
+    # Static config for HiROHighReplayBuffer
+    kwargs["replay_buffer_kwargs"] = dict(
+        n_candidates=20,
+        noise_std=0.5,
+        enable_off_policy_correction=True,
+    )
+    return kwargs
+
+
+def get_hiro_low_sac_kwargs(
+    log_dir: str,
+    seed: int,
+    target_entropy: Union[str, float] = "auto",
+    target_entropy_scale: Optional[float] = 0.5,
+) -> Dict[str, Any]:
+    """Get SAC kwargs for HiRO low-level agent.
+
+    By default, we use a scaled auto target entropy: target_entropy = -target_entropy_scale * action_dim.
+    The actual action_dim is only known inside HIRO at runtime, so the scaling is applied there.
+    """
+    kwargs = get_sac_kwargs(log_dir, seed, level="low")
+
+    # Keep numerics guard CSV at run-level log dir (same level as high_interval_debug.csv).
+    run_log_dir = os.path.dirname(log_dir) if os.path.basename(log_dir) == "hiro_low" else log_dir
+    numerics_guard = dict(kwargs.get("numerics_guard", {}) or {})
+    numerics_guard["save_dir"] = run_log_dir
+    kwargs["numerics_guard"] = numerics_guard
+
+    kwargs["target_entropy"] = target_entropy
+    kwargs["target_entropy_scale"] = target_entropy_scale
+    return kwargs

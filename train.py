@@ -102,8 +102,10 @@ def main(
 
     #### ================ Train-time overrides (optional) ================ ####
     env_overrides = {
-        # "initial_lane_id": "random",
-        "initial_lane_id": 1,
+        "initial_lane_id": "random",
+        # "initial_lane_id": 0,
+        # "initial_lane_id": 1,
+        # "initial_lane_id": 2,
         # "PERCEPTION_DISTANCE": 200,
         # "observation": {
         #     "vehicles_count": 20,
@@ -137,8 +139,33 @@ def main(
 
     elif algo == "sac":
         sac_kwargs = get_sac_kwargs(log_dir=log_dir, seed=MASTER_SEED)
-        env_fns = [make_env(env_overrides, render_mode=render_mode) for _ in range(n_envs)]
-        eval_env_fn = make_env(env_overrides, render_mode=render_mode)
+        sac_env_overrides = dict(env_overrides)
+        sac_env_overrides.update(
+            {
+                "speed_ref_aux_reward": 0.1,
+            }
+        )
+
+        # Optional: reuse HIRO low safety filter constraints in SAC via conf switch.
+        cfg_for_sac = get_env_config(sac_env_overrides)
+        if bool(cfg_for_sac.get("enable_sac_low_safety_filter", False)):
+            hiro_cfg_for_sac: HIROConfig = get_hiro_config()
+            if hiro_cfg_for_sac.low_safety_filter is not None:
+                sac_env_overrides.update(
+                    {
+                        "enable_low_safety_filter": True,
+                        "lane_change_min_front_gap": float(hiro_cfg_for_sac.low_safety_filter.lane_change_min_front_gap),
+                        "lane_change_min_rear_gap": float(hiro_cfg_for_sac.low_safety_filter.lane_change_min_rear_gap),
+                        "lane_change_min_front_ttc": float(hiro_cfg_for_sac.low_safety_filter.lane_change_min_front_ttc),
+                        "lane_change_min_rear_ttc": float(hiro_cfg_for_sac.low_safety_filter.lane_change_min_rear_ttc),
+                    }
+                )
+                print("[SAC] 启用 low safety filter（参数来自 HIRO low_safety_filter）")
+            else:
+                print("[SAC] enable_sac_low_safety_filter=True，但 HIRO low_safety_filter 为 None，跳过")
+
+        env_fns = [make_env(sac_env_overrides, render_mode=render_mode) for _ in range(n_envs)]
+        eval_env_fn = make_env(sac_env_overrides, render_mode=render_mode)
         train_sac(
             env_fns=env_fns,
             eval_env_fn=eval_env_fn,
@@ -217,37 +244,53 @@ if __name__ == "__main__":
     #     n_envs=8,
     #     run_name=f"ppo_1e7_lane1_seed2"
     # )
-    # main(
-    #     algo="sac",
-    #     log_root="./logs/current",
-    #     total_timesteps=5_000_000,
-    #     eval_freq=10_000,
-    #     save_freq=50_000,
-    #     n_envs=8,
-    #     run_name=f"sac_1e7_lane1_seed2"
-    # )
     main(
-        algo="hiro",
+        algo="sac",
         log_root="./logs/current",
-        # total_timesteps=20000,
         total_timesteps=10_000_000,
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,
-        # render=True,
-        # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
-        # hiro_low_pretrained_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
-        hiro_low_target_entropy="auto",
-        hiro_low_target_entropy_scale=1,
-
-        # run_name=f"hiro_260323_lowonly_reachableUniform_newSLv2_vio03_HER_reDim_amax2_dmin0",
-        # run_name=f"hiro_260325_highonly_reachableUniformv2_newSLv2_vio03_HER_reDim_amax3_dmin10_8",
-        run_name=f"hiro_260325_lowonly_reachableUniformv2_newSLv2_vio03_HER_reDim_amax3_dmin10_8",
-        # run_name=f"hiro_260323_lowonly_nearCruise_newSLv2_vio03_HER_reDim",
-
-        # run_name=f"hiro_260319_highonly_pretrained_newSLv2_vio03_HER_reDim_lc15",
-        # run_name=f"hiro_260309_highonly_rule_withSL",
-        # run_name=f"hiro_260315_lowonly_uniform_RS_newSLv3_vioPenalty01_jerk01",
-        # run_name=f"hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2",
-        # run_name=f"hiro_debug",
+        # run_name=f"sac_260402_withPrior_randomlane"
+        # run_name=f"sac_260403_withPrior_SL_randomlane"
+        # run_name=f"sac_260403_withConstPrior_SLv2_randomlane"
+        # run_name=f"sac_260403_withConstPrior_SL_randomlane"
+        run_name=f"sac_260403_base_SLv2_randomlane"
     )
+    # main(
+    #     algo="hiro",
+    #     log_root="./logs/current",
+    #     # total_timesteps=20000,
+    #     total_timesteps=10_000_000,
+    #     eval_freq=10_000,
+    #     save_freq=50_000,
+    #     n_envs=8,
+    #     # render=True,
+    #     # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
+    #     hiro_low_pretrained_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
+    #     # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane0/hiro_low_final.zip",
+    #     # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane2/hiro_low_final.zip",
+    #     # hiro_low_pretrained_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
+    #     hiro_low_target_entropy="auto",
+    #     hiro_low_target_entropy_scale=1,
+
+    #     # run_name=f"hiro_260331_highonly_reachableUniformLane1_Rainbow_amax3_dmin15_10_randomlane",
+    #     run_name=f"hiro_260402_highonly_UniformLane1_Rainbow_amax3_dmin15_10_randomlane",
+    #     # run_name=f"hiro_260401_highonly_reachableUniform_amax3_dmin15_10_lane0",
+    #     # run_name=f"hiro_260401_highonly_reachableUniform_amax3_dmin15_10_lane2",
+    #     # run_name=f"hiro_260401_highonly_UniformLane1_Rainbow_randomLane",
+    #     # run_name=f"hiro_260401_lowonly_Uniform_lane0",
+    #     # run_name=f"hiro_260401_lowonly_Uniform_lane2",
+    #     # run_name=f"hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane2",
+    #     # run_name=f"hiro_260331_lowonly_reachableUniform_Rainbow_amax3_dmin15_10_randomLane",
+    #     # run_name=f"hiro_260323_lowonly_nearCruise_newSLv2_vio03_HER_reDim",
+    #     # run_name=f"hiro_260402_highonly_rule_accwithSL_randomLane",
+    #     # run_name=f"hiro_260331_highonly_rule_accwithSL_lane0",
+    #     # run_name=f"hiro_260331_highonly_rule_accwithSL_lane2",
+
+    #     # run_name=f"hiro_260319_highonly_pretrained_newSLv2_vio03_HER_reDim_lc15",
+    #     # run_name=f"hiro_260315_lowonly_uniform_RS_newSLv3_vioPenalty01_jerk01",
+    #     # run_name=f"hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2",
+    #     # run_name=f"hiro_260331_highonly_reachableGaussian_Rainbow_amax3_dmin15_10",
+    #     # run_name=f"hiro_debug",
+    # )

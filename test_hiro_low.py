@@ -1138,24 +1138,26 @@ if __name__ == "__main__":
     #    - 可选 case_id 列作为输出目录名）
 
     main(
-        # low_model_path="./models/hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03_HER/hiro_low_final.zip",
-        low_model_path="./models/hiro_260317_lowonly_uniform_RS_newSLv2_vio03_HER_reDim/hiro_low_final.zip",
+        low_model_path="./models/hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260321_lowonly_reachableUniform_newSLv2_vio03_HER_reDim_amax3_dmin0/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
         steps=25,
         ego_state=[0.0, 4.0, 10.0, 0.0],
-        # neighbors_state=[
-        #     [30.0, 4.0, 10.0, 0.0],
-        #     [60.0, 8.0, 12.0, 0.0],
-        #     [30.0, 0.0, 10.0, 0.0],
-        #     [5.0, 8.0, 15.0, 0.0],
-        # ],
         neighbors_state=[
-            [3.01, 0.0, 10.10, 0.0],
-            [22.60, 0.0, 11.18, 0.0],
-            [37.47, 8.0, 9.18, 0.0],
-            # [10.47, 8.0, 8.18, 0.0],
-            [38.23, 0.0, 10.92, 0.0],
+            [30.0, 4.0, 10.0, 0.0],
+            [60.0, 8.0, 12.0, 0.0],
+            [30.0, 0.0, 10.0, 0.0],
+            [5.0, 8.0, 15.0, 0.0],
         ],
-        goal_phys=[25, 4.0, 0.0, 0.0],
+        goal_phys=[30, 4, 10, 0],
+        # ego_state=[0.000000, 8.000000, 12.320744, 0],
+        # neighbors_state=[
+        #     [33.611660, 0, 12.699497, 0.000000],
+        #     [55.454609, 4, 12.963794, 0.000000],
+        #     [73.182320, 8, 12.303981, 0.000000],
+        #     [85.691025, 0, 13.218258, 0.000000],
+        # ],
+        # goal_phys=[31.408527, 8, 0, 0.000000],
         # batch_cases_csv="low_test_cases.csv",
         # batch_cases_csv="low_test_cases_debug.csv",
         use_low_safety_layer=True,
@@ -1172,7 +1174,7 @@ if __name__ == "__main__":
         mpc_global_maxiter=200,  # joint_global 模式才会使用
         mpc_plot_alternative_optima=False,
         mpc_max_alternative_optima=3,
-        random_neighbors_batch_size=100,
+        random_neighbors_batch_size=0,
         random_neighbors_seed=42,
         # mpc_eval_actions_cont=[
         #     [0.0, 0.0],

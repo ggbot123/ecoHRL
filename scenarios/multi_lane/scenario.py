@@ -209,6 +209,19 @@ class MultiLaneEnv(AbstractEnv):
         last_speed = getattr(self, "_last_speed", cur_speed)
         acc = (cur_speed - last_speed) / dt
 
+        # 参考车速辅助奖励：超时后参考车速退化为限速
+        remaining_distance = max(goal_long - longi, 0.0)
+        remaining_expected_time = float(self.config.get("punctual_time_target", self.config.get("duration", 0.0))) - float(self.time)
+        speed_limit = float(self.config.get("speed_limit", 0.0))
+        if remaining_expected_time <= 0.0:
+            ref_speed = speed_limit
+        else:
+            ref_speed = remaining_distance / max(remaining_expected_time, 1e-6)
+        ref_speed = goal_long / float(self.config.get("punctual_time_target", self.config.get("duration", 0.0)))
+        # speed_ref_aux = -abs(float(cur_speed) - float(ref_speed)) * dt
+        speed_ref_aux = 0
+
+
         a_max = float(self.config["comfort_max_accel"])
         acc_term = (abs(acc) / max(a_max, 1e-6)) ** 2
 
@@ -247,6 +260,7 @@ class MultiLaneEnv(AbstractEnv):
         return {
             "collision_reward": float(self.vehicle.crashed),
             "progress_reward": progress,
+            "speed_ref_aux_reward": float(speed_ref_aux),
             "comfort_reward": comfort,
             "comfort_reward_acc_only": comfort_acc_only,
             "lane_change_reward": lane_changed,

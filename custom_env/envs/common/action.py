@@ -384,6 +384,136 @@ class ParamLaneAccelAction(ActionType):
             return float(utils.lmap(a, [-1.0, 1.0], [self.acc_min, self.acc_max]))
         else:
             return float(np.clip(a, self.acc_min, self.acc_max))
+
+    @staticmethod
+    def _ttc_ok(distance: float, rel_speed_closing: float, min_ttc: float) -> bool:
+        return bool(float(distance) >= float(min_ttc) * max(float(rel_speed_closing), 0.0))
+
+    def _find_nearest_on_lane(self, ego, lane_index):
+        lane = self.env.road.network.get_lane(lane_index)
+        ego_longi, _ = lane.local_coordinates(ego.position)
+
+        front_dist = None
+        front_speed = None
+        rear_dist = None
+        rear_speed = None
+
+        for v in self.env.road.vehicles:
+            if v is ego or getattr(v, "crashed", False):
+                continue
+            v_lane_index = getattr(v, "lane_index", None)
+            if not isinstance(v_lane_index, tuple) or len(v_lane_index) < 3:
+                continue
+            if v_lane_index[0] != lane_index[0] or v_lane_index[1] != lane_index[1] or v_lane_index[2] != lane_index[2]:
+                continue
+
+            v_longi, _ = lane.local_coordinates(v.position)
+            if v_longi >= ego_longi:
+                d = float(v_longi - ego_longi)
+                if front_dist is None or d < front_dist:
+                    front_dist = d
+                    front_speed = float(getattr(v, "speed", 0.0))
+            else:
+                d = float(ego_longi - v_longi)
+                if rear_dist is None or d < rear_dist:
+                    rear_dist = d
+                    rear_speed = float(getattr(v, "speed", 0.0))
+
+        return front_dist, front_speed, rear_dist, rear_speed
+
+    def _lane_constraints_ok(self, ego, lane_index, check_rear: bool) -> bool:
+        front_dist, front_speed, rear_dist, rear_speed = self._find_nearest_on_lane(ego, lane_index)
+
+        front_gap_min = float(self.env.config.get("lane_change_min_front_gap", 10.0))
+        rear_gap_min = float(self.env.config.get("lane_change_min_rear_gap", 8.0))
+        front_ttc_min = float(self.env.config.get("lane_change_min_front_ttc", 3.0))
+        rear_ttc_min = float(self.env.config.get("lane_change_min_rear_ttc", 2.0))
+
+        ego_speed = float(getattr(ego, "speed", 0.0))
+
+        if front_dist is not None:
+            rel_front = max(ego_speed - float(front_speed), 0.0)
+            if float(front_dist) < front_gap_min:
+                return False
+            if not self._ttc_ok(float(front_dist), rel_front, front_ttc_min):
+                return False
+
+        if check_rear and rear_dist is not None:
+            rel_rear = max(float(rear_speed) - ego_speed, 0.0)
+            if float(rear_dist) < rear_gap_min:
+                return False
+            if not self._ttc_ok(float(rear_dist), rel_rear, rear_ttc_min):
+                return False
+
+        return True
+
+    def _apply_low_safety_filter(self, ego, lane_cmd_idx: int) -> int:
+        if not bool(self.env.config.get("enable_low_safety_filter", False)):
+            return int(lane_cmd_idx)
+
+        _from, _to, cur_id = ego.lane_index
+        max_lane_id = len(self.env.road.network.graph[_from][_to]) - 1
+
+        if lane_cmd_idx == self._lane_index_by_name["LANE_LEFT"]:
+            target_id = int(np.clip(cur_id - 1, 0, max_lane_id))
+        elif lane_cmd_idx == self._lane_index_by_name["LANE_RIGHT"]:
+            target_id = int(np.clip(cur_id + 1, 0, max_lane_id))
+        else:
+            return int(lane_cmd_idx)
+
+        if target_id == int(cur_id):
+            return self._lane_index_by_name["KEEP"]
+
+        origin_lane_index = (_from, _to, int(cur_id))
+        target_lane_index = (_from, _to, int(target_id))
+
+        ok_origin = self._lane_constraints_ok(ego, origin_lane_index, check_rear=False)
+        ok_target = self._lane_constraints_ok(ego, target_lane_index, check_rear=True)
+
+        if ok_origin and ok_target:
+            return int(lane_cmd_idx)
+        return self._lane_index_by_name["KEEP"]
+
+    def _apply_keep_front_safety_acc_limit(self, ego, acc_phys: float) -> float:
+        """When KEEP is selected, clamp acceleration using front gap/TTC constraints."""
+        if not bool(self.env.config.get("enable_low_safety_filter", False)):
+            return float(acc_phys)
+
+        ego_lane_index = getattr(ego, "lane_index", None)
+        if ego_lane_index is None or len(ego_lane_index) < 3:
+            return float(np.clip(acc_phys, self.acc_min, self.acc_max))
+
+        front_dist, front_speed, _, _ = self._find_nearest_on_lane(ego, ego_lane_index)
+        if front_dist is None:
+            return float(np.clip(acc_phys, self.acc_min, self.acc_max))
+
+        dt = 1.0 / max(float(self.env.config.get("policy_frequency", 10.0)), 1e-6)
+        front_gap_min = float(self.env.config.get("lane_change_min_front_gap", 10.0))
+        front_ttc_min = float(self.env.config.get("lane_change_min_front_ttc", 3.0))
+
+        ego_speed = float(getattr(ego, "speed", 0.0))
+        vf = float(front_speed)
+        d0 = float(front_dist)
+        dv = vf - ego_speed
+
+        # Keep acceleration within both physics limits and one-step safety bounds.
+        a_upper = float(self.acc_max)
+        speed_limit = float(self.env.config.get("speed_limit", np.inf))
+        if np.isfinite(speed_limit):
+            a_upper = min(a_upper, float((speed_limit - ego_speed) / max(dt, 1e-6)))
+
+        den_gap = 0.5 * dt * dt
+        if den_gap > 1e-9:
+            a_gap = float((d0 - front_gap_min + dv * dt) / den_gap)
+            a_upper = min(a_upper, a_gap)
+
+        den_ttc = den_gap + front_ttc_min * dt
+        if den_ttc > 1e-9:
+            a_ttc = float((d0 + dv * (dt + front_ttc_min)) / den_ttc)
+            a_upper = min(a_upper, a_ttc)
+
+        acc_safe = min(float(acc_phys), float(a_upper))
+        return float(np.clip(acc_safe, self.acc_min, self.acc_max))
     
     # ---------- 动作执行 ----------
     def act(self, action: Action) -> None:
@@ -420,8 +550,14 @@ class ParamLaneAccelAction(ActionType):
                 a1 = float(action[1])
                 acc_phys = self._map_acceleration(a1, normalized=True)
 
+        lane_cmd_idx = self._apply_low_safety_filter(ego, int(lane_cmd_idx))
+
         # 防御性截断 lane index
         lane_cmd_idx = int(np.clip(lane_cmd_idx, 0, len(self.lane_actions) - 1))
+
+        # 直行时也做前车防碰撞纵向约束
+        if lane_cmd_idx == self._lane_index_by_name["KEEP"]:
+            acc_phys = self._apply_keep_front_safety_acc_limit(ego, acc_phys)
 
         # 把解析出的 “离散车道选择 + 物理加速度” 交给车模
         ego.act({"lane_change": lane_cmd_idx, "acceleration": acc_phys})
