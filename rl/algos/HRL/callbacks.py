@@ -35,6 +35,9 @@ class HIROLoggingCallback(BaseCallback):
         # Low-obs snapshot CSV (high-interval starts)
         low_obs_csv_interval_hi: int = 1,
         low_obs_csv_env0_only: bool = True,
+        # HER relabel debug CSV
+        her_debug_csv_interval_steps: int = 0,
+        her_debug_csv_max_rows_per_flush: int = 200,
     ):
         super().__init__(verbose)
         self.high_log_interval_episodes = int(high_log_interval_episodes)
@@ -45,9 +48,12 @@ class HIROLoggingCallback(BaseCallback):
         self.mpc_fail_csv_path = mpc_fail_csv_path
         self.low_obs_csv_interval_hi = max(1, int(low_obs_csv_interval_hi))
         self.low_obs_csv_env0_only = bool(low_obs_csv_env0_only)
+        self.her_debug_csv_interval_steps = max(0, int(her_debug_csv_interval_steps))
+        self.her_debug_csv_max_rows_per_flush = max(1, int(her_debug_csv_max_rows_per_flush))
 
         self._traj_csv_enabled = self.csv_log_freq > 0 and bool(self.csv_save_dir)
         self._low_obs_csv_enabled = bool(self.csv_save_dir)
+        self._her_debug_csv_enabled = self.her_debug_csv_interval_steps > 0 and bool(self.csv_save_dir)
 
         self.csv_active = False  # Whether current episode is being logged to CSV (env 0)
         self.csv_low_traj_recorded = False # Only record first interval's low traj per logged episode
@@ -60,6 +66,7 @@ class HIROLoggingCallback(BaseCallback):
         self._rollout_counter = 0
         self._last_dump_high = 0
         self._last_dump_low = 0
+        self._last_her_debug_dump_step = 0
         self._high_buffers, self._low_buffers = {}, {}
 
         # CSV Headers
@@ -105,6 +112,45 @@ class HIROLoggingCallback(BaseCallback):
                 "safe_dx_u2",
             ]
             self._init_csv(self.high_interval_debug_csv_path, high_debug_header)
+
+        if self._her_debug_csv_enabled:
+            self.her_debug_csv_path = os.path.join(self.csv_save_dir, "her_relabel_debug.csv")
+            her_debug_header = [
+                "global_step",
+                "batch_i",
+                "her_strategy",
+                "her_future_mode",
+                "steps_ahead",
+                "source_seg_id",
+                "source_t_in_seg",
+                "source_ep_id",
+                "source_ep_step",
+                "source_done",
+                "source_reward_stored",
+                "source_ego_abs",
+                "source_obs",
+                "source_action",
+                "source_next_obs",
+                "goal_seg_id",
+                "goal_t_in_seg",
+                "goal_ep_id",
+                "goal_ep_step",
+                "goal_reward_stored",
+                "goal_ego_abs",
+                "goal_obs",
+                "goal_action",
+                "goal_next_obs",
+                "relabeled_obs",
+                "relabeled_next_obs",
+                "relabeled_goal_rel",
+                "relabeled_ego_abs",
+                "relabel_t_norm_obs",
+                "relabel_t_norm_next",
+                "intrinsic_reward_new",
+                "reward_ext",
+                "reward_total_new",
+            ]
+            self._init_csv(self.her_debug_csv_path, her_debug_header)
 
     def _init_csv(self, path, header):
         if not os.path.exists(path):
@@ -287,6 +333,51 @@ class HIROLoggingCallback(BaseCallback):
         reward_env = np.asarray(loc.get("reward_env", 0.0), dtype=np.float32).reshape(-1)
         dones = np.asarray(loc.get("done", False), dtype=bool).reshape(-1)
         infos = loc.get("infos", [])
+
+        if self._her_debug_csv_enabled and hasattr(self, "her_debug_csv_path"):
+            step_now = int(getattr(self.model, "num_timesteps", 0))
+            if (step_now - self._last_her_debug_dump_step) >= self.her_debug_csv_interval_steps:
+                rb = getattr(getattr(self.model, "low_agent", None), "replay_buffer", None)
+                if rb is not None and hasattr(rb, "pop_her_debug_records"):
+                    records = rb.pop_her_debug_records(max_items=self.her_debug_csv_max_rows_per_flush)
+                    for rec in records:
+                        row = [
+                            step_now,
+                            int(rec.get("batch_i", -1)),
+                            str(rec.get("her_strategy", "")),
+                            str(rec.get("her_future_mode", "")),
+                            int(rec.get("steps_ahead", -1)),
+                            int(rec.get("source_seg_id", -1)),
+                            int(rec.get("source_t_in_seg", -1)),
+                            int(rec.get("source_ep_id", -1)),
+                            int(rec.get("source_ep_step", -1)),
+                            int(bool(rec.get("source_done", False))),
+                            float(rec.get("source_reward_stored", 0.0)),
+                            json.dumps(rec.get("source_ego_abs", []), ensure_ascii=True),
+                            json.dumps(rec.get("source_obs", []), ensure_ascii=True),
+                            json.dumps(rec.get("source_action", []), ensure_ascii=True),
+                            json.dumps(rec.get("source_next_obs", []), ensure_ascii=True),
+                            int(rec.get("goal_seg_id", -1)),
+                            int(rec.get("goal_t_in_seg", -1)),
+                            int(rec.get("goal_ep_id", -1)),
+                            int(rec.get("goal_ep_step", -1)),
+                            float(rec.get("goal_reward_stored", 0.0)),
+                            json.dumps(rec.get("goal_ego_abs", []), ensure_ascii=True),
+                            json.dumps(rec.get("goal_obs", []), ensure_ascii=True),
+                            json.dumps(rec.get("goal_action", []), ensure_ascii=True),
+                            json.dumps(rec.get("goal_next_obs", []), ensure_ascii=True),
+                            json.dumps(rec.get("relabeled_obs", []), ensure_ascii=True),
+                            json.dumps(rec.get("relabeled_next_obs", []), ensure_ascii=True),
+                            json.dumps(rec.get("relabeled_goal_rel", []), ensure_ascii=True),
+                            json.dumps(rec.get("relabeled_ego_abs", []), ensure_ascii=True),
+                            float(rec.get("relabel_t_norm_obs", 0.0)),
+                            float(rec.get("relabel_t_norm_next", 0.0)),
+                            float(rec.get("intrinsic_reward_new", 0.0)),
+                            float(rec.get("reward_ext", 0.0)),
+                            float(rec.get("reward_total_new", 0.0)),
+                        ]
+                        self._append_csv(self.her_debug_csv_path, row)
+                self._last_her_debug_dump_step = step_now
 
         if self.mpc_fail_csv_path:
             fail_records = list(loc.get("mpc_fail_records", []) or [])

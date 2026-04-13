@@ -215,8 +215,8 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "comfort_acc_weight": 1.0,
     "comfort_jerk_weight": 0.1,
 
-    "lane_change_reward": -1.0,
-    # "lane_change_reward": -0.5,
+    # "lane_change_reward": -1.0,
+    "lane_change_reward": -0.5,
     
     # RuleBasedController compute_action strategy:
     # "target_speed_lane" | "goal_x_accel" | "idm_mobil"
@@ -286,20 +286,20 @@ def get_hiro_config():
         device="auto",
 
         # train_mode="joint",
-        train_mode="high_only",
-        # train_mode="low_only",
+        # train_mode="high_only",
+        train_mode="low_only",
 
         intrinsic_coef=intrinsic_coef,
         intrinsic_norm_ranges=intrinsic_norm_ranges,
         intrinsic_weights=intrinsic_weights,
         intrinsic_type=intrinsic_type,
 
-        goal_sampler=GoalSamplerConfig(
-            type="uniform",
-        ),
         # goal_sampler=GoalSamplerConfig(
-        #     type="reachable_uniform",
+        #     type="uniform",
         # ),
+        goal_sampler=GoalSamplerConfig(
+            type="reachable_uniform",
+        ),
         # goal_sampler=GoalSamplerConfig(
         #     type="reachable_gaussian",
         #     gaussian_mean_x_m=27.0,
@@ -330,6 +330,20 @@ def get_hiro_config():
         low_use_her=True,
         low_her_ratio=0.8,
         low_her_strategy="future",
+        # future mode:
+        # - "episode_timeaware": same env+episode future step, sync t_norm (can cross segments)
+        # - "segment_timeaware": future step only within current segment, sync t_norm
+        # - "segment_legacy": legacy same-segment future relabeling without t_norm relabel
+        # low_her_future_mode="segment_timeaware",
+        low_her_future_mode="episode_timeaware",
+
+        # low_her_future_timeaware=True,
+        # low_her_future_timeaware=False,
+        # HER debug CSV (saved by HIRO callback): 0 disables periodic flush.
+        low_her_debug_csv_interval_steps=1000,
+        low_her_debug_csv_max_rows_per_flush=200,
+        # Replay-buffer-side cap for pending HER debug records.
+        low_her_debug_max_records=20000,
 
         # use_off_policy_correction=True,
         use_off_policy_correction=False,
@@ -351,6 +365,7 @@ def get_hiro_config():
         # high_goal_safe_front_dmin=0.0,
         # high_goal_safe_lane_change_rear_dmin=0.0,
         high_goal_safe_min_goal_x_span=0,
+        high_goal_safe_enable_goal_vx_bounds=True,
 
         low_safety_violation_penalty=0.3,
 

@@ -108,6 +108,8 @@ def train_hiro(
         csv_save_dir=log_dir,
         low_obs_csv_interval_hi=10,
         low_obs_csv_env0_only=True,
+        her_debug_csv_interval_steps=int(getattr(effective_cfg, "low_her_debug_csv_interval_steps", 0)),
+        her_debug_csv_max_rows_per_flush=int(getattr(effective_cfg, "low_her_debug_csv_max_rows_per_flush", 200)),
         verbose=1,
     )
     checkpoint_cb = HIROCheckpointCallback(
@@ -132,11 +134,16 @@ def train_hiro(
         )
     elif train_mode == "low_only":
         print(f"[HIRO Trainer] Training Low-Level Only. Goal Sampler: {effective_cfg.goal_sampler.type}")
+        enable_vx_bounds = bool(getattr(effective_cfg, "high_goal_safe_enable_goal_vx_bounds", True))
+        fixed_goal_vx = getattr(effective_cfg, "fixed_goal_vx", None)
+        if fixed_goal_vx is not None and np.isclose(float(fixed_goal_vx), 0.0):
+            enable_vx_bounds = False
         sampler = get_goal_sampler(
             effective_cfg.goal_sampler,
             model.high_agent.action_space,
             bounds_fn=model.high_goal_safe_bounds.compute_np,
             speed_fn=_extract_ego_speed,
+            enable_vx_bounds=enable_vx_bounds,
         )
         model.learn_low(
             total_timesteps=total_timesteps,

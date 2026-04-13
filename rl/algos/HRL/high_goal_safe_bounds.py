@@ -34,6 +34,7 @@ class HighGoalSafeBoundsCalculator:
         y_idx: int = 2,
         vx_idx: int = 3,
         vy_idx: int = 4,
+        enable_goal_vx_bounds: bool = True,
     ):
         self.n_lanes = int(max(1, n_lanes))
         self.lane_width = float(lane_width)
@@ -55,6 +56,7 @@ class HighGoalSafeBoundsCalculator:
         self.y_idx = int(y_idx)
         self.vx_idx = int(vx_idx)
         self.vy_idx = int(vy_idx)
+        self.enable_goal_vx_bounds = bool(enable_goal_vx_bounds)
         # Hardcoded threshold for vy-based target-lane classification.
         self.lane_assign_vy_eps = 0.05
         self.lane_center_ys = (np.arange(self.n_lanes, dtype=np.float32) * self.lane_width).astype(np.float32)
@@ -163,11 +165,82 @@ class HighGoalSafeBoundsCalculator:
         s_high = self._disp_const_accel_with_speed_cap(ego_vx, abs(self.max_accel), horizon_t)
         return s_low.astype(np.float32), s_high.astype(np.float32)
 
+    def _ego_speed_bounds(self, ego_vx: np.ndarray, horizon_t: float) -> Tuple[np.ndarray, np.ndarray]:
+        ego_vx = np.asarray(ego_vx, dtype=np.float32)
+        v_low = np.clip(ego_vx - abs(self.max_decel) * horizon_t, self.speed_min, self.speed_max)
+        v_high = np.clip(ego_vx + abs(self.max_accel) * horizon_t, self.speed_min, self.speed_max)
+        return v_low.astype(np.float32), v_high.astype(np.float32)
+
     def _to_normalized_dx(self, dx: np.ndarray) -> np.ndarray:
         dx = np.asarray(dx, dtype=np.float32)
         denom = max(self.dx_high - self.dx_low, 1e-6)
         y = 2.0 * (dx - self.dx_low) / denom - 1.0
         return np.clip(y, -0.999999, 0.999999).astype(np.float32)
+
+    def _to_normalized_vx(self, vx: np.ndarray) -> np.ndarray:
+        vx = np.asarray(vx, dtype=np.float32)
+        denom = max(self.speed_max - self.speed_min, 1e-6)
+        y = 2.0 * (vx - self.speed_min) / denom - 1.0
+        return np.clip(y, -0.999999, 0.999999).astype(np.float32)
+
+    def _vx_bounds_from_distance_interval(
+        self,
+        v0: np.ndarray,
+        disp_low: np.ndarray,
+        disp_high: np.ndarray,
+        horizon_t: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Infer terminal vx bounds induced by displacement interval [l, u].
+
+        Piecewise profiles follow the requested construction:
+        1) s0<u  : coast, then max-accelerate to hit u -> upper vx
+        2) s0>u  : max-decelerate, then coast to hit u -> upper vx
+        3) s0>l  : coast, then max-decelerate to hit l -> lower vx
+        4) s0<l  : max-accelerate, then coast to hit l -> lower vx
+        """
+        v0 = np.asarray(v0, dtype=np.float32)
+        l = np.asarray(disp_low, dtype=np.float32)
+        u = np.asarray(disp_high, dtype=np.float32)
+
+        T = float(max(horizon_t, 1e-6))
+        a = float(max(abs(self.max_accel), 1e-6))
+        d = float(max(abs(self.max_decel), 1e-6))
+        s0 = v0 * T
+
+        # Upper bound from distance upper limit u
+        upper_case1 = s0 <= u
+        du_plus = np.maximum(u - s0, 0.0)
+        tau_u_1 = np.sqrt(np.maximum(2.0 * du_plus / a, 0.0))
+        tau_u_1 = np.clip(tau_u_1, 0.0, T)
+        v_up_1 = v0 + a * tau_u_1
+
+        du_minus = np.maximum(s0 - u, 0.0)
+        disc_u = np.maximum(T * T - 2.0 * du_minus / d, 0.0)
+        tau_u_2 = T - np.sqrt(disc_u)
+        tau_u_2 = np.clip(tau_u_2, 0.0, T)
+        v_up_2 = v0 - d * tau_u_2
+
+        v_up = np.where(upper_case1, v_up_1, v_up_2)
+
+        # Lower bound from distance lower limit l
+        lower_case3 = s0 >= l
+        dl_minus = np.maximum(s0 - l, 0.0)
+        tau_l_3 = np.sqrt(np.maximum(2.0 * dl_minus / d, 0.0))
+        tau_l_3 = np.clip(tau_l_3, 0.0, T)
+        v_lo_3 = v0 - d * tau_l_3
+
+        dl_plus = np.maximum(l - s0, 0.0)
+        disc_l = np.maximum(T * T - 2.0 * dl_plus / a, 0.0)
+        tau_l_4 = T - np.sqrt(disc_l)
+        tau_l_4 = np.clip(tau_l_4, 0.0, T)
+        v_lo_4 = v0 + a * tau_l_4
+
+        v_lo = np.where(lower_case3, v_lo_3, v_lo_4)
+
+        # Numerical guard for rare branch boundary jitter.
+        lo = np.minimum(v_lo, v_up)
+        hi = np.maximum(v_lo, v_up)
+        return lo.astype(np.float32), hi.astype(np.float32)
 
     def compute_np(self, high_obs_np: np.ndarray) -> Dict[str, np.ndarray]:
         """Build union-of-3-rectangles bounds in normalized action space."""
@@ -179,11 +252,21 @@ class HighGoalSafeBoundsCalculator:
         ego_lane_idx = np.argmin(np.abs(ego_y[:, None] - self.lane_center_ys[None, :]), axis=1)
         horizon_t = float(self.high_interval) * float(self.dt)
         s_min, s_max = self._ego_displacement_bounds(ego_vx, horizon_t)
+        if self.enable_goal_vx_bounds:
+            v_dyn_min, v_dyn_max = self._ego_speed_bounds(ego_vx, horizon_t)
+        else:
+            v_dyn_min, v_dyn_max = None, None
 
         # Lane-conditioned interval for rel_x dimension (action dim 0).
         # Mixture component order is relative semantics: [left, keep, right].
         l2 = np.zeros((n, 3), dtype=np.float32)
         u2 = np.zeros((n, 3), dtype=np.float32)
+        if self.enable_goal_vx_bounds:
+            l_vx = np.zeros((n, 3), dtype=np.float32)
+            u_vx = np.zeros((n, 3), dtype=np.float32)
+        else:
+            l_vx = None
+            u_vx = None
 
         # Precompute absolute-lane nearest front/rear predictions once, then remap
         # per-sample to relative components [left, keep, right].
@@ -213,23 +296,53 @@ class HighGoalSafeBoundsCalculator:
             else:
                 lo = np.maximum(s_min, rear_dx + self.lane_change_rear_dmin)
 
+            if self.enable_goal_vx_bounds:
+                v_lo_x, v_hi_x = self._vx_bounds_from_distance_interval(ego_vx, lo, hi, horizon_t)
+                v_lo = np.maximum(v_dyn_min, v_lo_x)
+                v_hi = np.minimum(v_dyn_max, v_hi_x)
+            else:
+                v_lo = None
+                v_hi = None
+
             lo_n = self._to_normalized_dx(lo)
             hi_n = self._to_normalized_dx(hi)
+            if self.enable_goal_vx_bounds:
+                v_lo_n = self._to_normalized_vx(v_lo)
+                v_hi_n = self._to_normalized_vx(v_hi)
+            else:
+                v_lo_n = None
+                v_hi_n = None
 
             # Keep empty interval explicit: l2 > u2 means infeasible for that component.
             # Also discard very narrow reachable intervals to avoid unstable sampling.
             span = hi - lo
             empty = (~valid_lane) | (lo >= hi) | (span < self.min_goal_x_span)
+            if self.enable_goal_vx_bounds:
+                empty = empty | (v_lo >= v_hi)
             lo_n = np.where(empty, 1.0, lo_n)
             hi_n = np.where(empty, -1.0, hi_n)
+            if self.enable_goal_vx_bounds:
+                v_lo_n = np.where(empty, 1.0, v_lo_n)
+                v_hi_n = np.where(empty, -1.0, v_hi_n)
             l2[:, comp_idx] = lo_n
             u2[:, comp_idx] = hi_n
+            if self.enable_goal_vx_bounds:
+                l_vx[:, comp_idx] = v_lo_n
+                u_vx[:, comp_idx] = v_hi_n
 
-        return {"l2": l2, "u2": u2}
+        out: Dict[str, np.ndarray] = {"l2": l2, "u2": u2}
+        if self.enable_goal_vx_bounds:
+            out["l_vx"] = l_vx
+            out["u_vx"] = u_vx
+        return out
 
     def compute_torch(self, high_obs_t: th.Tensor) -> Dict[str, th.Tensor]:
         bounds_np = self.compute_np(high_obs_t.detach().cpu().numpy())
-        return {
+        out = {
             "l2": th.as_tensor(bounds_np["l2"], dtype=high_obs_t.dtype, device=high_obs_t.device),
             "u2": th.as_tensor(bounds_np["u2"], dtype=high_obs_t.dtype, device=high_obs_t.device),
         }
+        if self.enable_goal_vx_bounds:
+            out["l_vx"] = th.as_tensor(bounds_np["l_vx"], dtype=high_obs_t.dtype, device=high_obs_t.device)
+            out["u_vx"] = th.as_tensor(bounds_np["u_vx"], dtype=high_obs_t.dtype, device=high_obs_t.device)
+        return out

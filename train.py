@@ -102,9 +102,9 @@ def main(
 
     #### ================ Train-time overrides (optional) ================ ####
     env_overrides = {
-        "initial_lane_id": "random",
+        # "initial_lane_id": "random",
         # "initial_lane_id": 0,
-        # "initial_lane_id": 1,
+        "initial_lane_id": 1,
         # "initial_lane_id": 2,
         # "PERCEPTION_DISTANCE": 200,
         # "observation": {
@@ -244,53 +244,52 @@ if __name__ == "__main__":
     #     n_envs=8,
     #     run_name=f"ppo_1e7_lane1_seed2"
     # )
-    main(
-        algo="sac",
-        log_root="./logs/current",
-        total_timesteps=10_000_000,
-        eval_freq=10_000,
-        save_freq=50_000,
-        n_envs=8,
-        # run_name=f"sac_260402_withPrior_randomlane"
-        # run_name=f"sac_260403_withPrior_SL_randomlane"
-        # run_name=f"sac_260403_withConstPrior_SLv2_randomlane"
-        # run_name=f"sac_260403_withConstPrior_SL_randomlane"
-        run_name=f"sac_260403_base_SLv2_randomlane"
-    )
     # main(
-    #     algo="hiro",
+    #     algo="sac",
     #     log_root="./logs/current",
-    #     # total_timesteps=20000,
     #     total_timesteps=10_000_000,
     #     eval_freq=10_000,
     #     save_freq=50_000,
     #     n_envs=8,
-    #     # render=True,
-    #     # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
-    #     hiro_low_pretrained_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
-    #     # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane0/hiro_low_final.zip",
-    #     # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane2/hiro_low_final.zip",
-    #     # hiro_low_pretrained_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
-    #     hiro_low_target_entropy="auto",
-    #     hiro_low_target_entropy_scale=1,
-
-    #     # run_name=f"hiro_260331_highonly_reachableUniformLane1_Rainbow_amax3_dmin15_10_randomlane",
-    #     run_name=f"hiro_260402_highonly_UniformLane1_Rainbow_amax3_dmin15_10_randomlane",
-    #     # run_name=f"hiro_260401_highonly_reachableUniform_amax3_dmin15_10_lane0",
-    #     # run_name=f"hiro_260401_highonly_reachableUniform_amax3_dmin15_10_lane2",
-    #     # run_name=f"hiro_260401_highonly_UniformLane1_Rainbow_randomLane",
-    #     # run_name=f"hiro_260401_lowonly_Uniform_lane0",
-    #     # run_name=f"hiro_260401_lowonly_Uniform_lane2",
-    #     # run_name=f"hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane2",
-    #     # run_name=f"hiro_260331_lowonly_reachableUniform_Rainbow_amax3_dmin15_10_randomLane",
-    #     # run_name=f"hiro_260323_lowonly_nearCruise_newSLv2_vio03_HER_reDim",
-    #     # run_name=f"hiro_260402_highonly_rule_accwithSL_randomLane",
-    #     # run_name=f"hiro_260331_highonly_rule_accwithSL_lane0",
-    #     # run_name=f"hiro_260331_highonly_rule_accwithSL_lane2",
-
-    #     # run_name=f"hiro_260319_highonly_pretrained_newSLv2_vio03_HER_reDim_lc15",
-    #     # run_name=f"hiro_260315_lowonly_uniform_RS_newSLv3_vioPenalty01_jerk01",
-    #     # run_name=f"hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2",
-    #     # run_name=f"hiro_260331_highonly_reachableGaussian_Rainbow_amax3_dmin15_10",
-    #     # run_name=f"hiro_debug",
+    #     # run_name=f"sac_260402_withPrior_randomlane"
+    #     # run_name=f"sac_260403_withPrior_SL_randomlane"
+    #     # run_name=f"sac_260403_withConstPrior_SLv2_randomlane"
+    #     # run_name=f"sac_260403_withConstPrior_SL_randomlane"
+    #     run_name=f"sac_260403_base_SLv2_randomlane"
     # )
+    main(
+        algo="hiro",
+        log_root="./logs/current",
+        # total_timesteps=20000,
+        total_timesteps=10_000_000,
+        eval_freq=10_000,
+        save_freq=50_000,
+        n_envs=8,
+        # render=True,
+        # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260410_lowonly_reUni_fixedHER_amax3_dmin15_10/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260410_lowonly_reUni_oldHER_amax3_dmin15_10/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260410_lowonly_reUniWithVx_oldHER_amax3_dmin15_10/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260410_lowonly_reUniWithVx_fixedHER_amax3_dmin15_10/hiro_low_final.zip",
+        hiro_low_target_entropy="auto",
+        hiro_low_target_entropy_scale=1,
+
+        run_name=f"hiro_260412_lowonly_reUni_fixedHERv2_amax3_dmin15_10",
+        # run_name=f"hiro_260412_lowonly_reUni_fixedHERsimp_amax3_dmin15_10",
+        # run_name=f"hiro_260410_lowonly_reUni_oldHER_amax3_dmin15_10",
+        # run_name=f"hiro_260410_lowonly_reUniWithVx_oldHER_amax3_dmin15_10",
+        # run_name=f"hiro_260410_lowonly_reUniWithVx_fixedHER_amax3_dmin15_10",
+        # run_name=f"hiro_260402_highonly_UniformLane1_Rainbow_amax3_dmin15_10_randomlane",
+        # run_name=f"hiro_260411_highonly_reUni_fixedHER_amax3_dmin15_10",
+        # run_name=f"hiro_260411_highonly_reUni_oldHER_amax3_dmin15_10",
+        # run_name=f"hiro_260411_highonly_reUniWithVx_oldHER_amax3_dmin15_10",
+        # run_name=f"hiro_260411_highonly_reUniWithVx_fixedHER_amax3_dmin15_10",
+
+        # run_name=f"hiro_260319_highonly_pretrained_newSLv2_vio03_HER_reDim_lc15",
+        # run_name=f"hiro_260315_lowonly_uniform_RS_newSLv3_vioPenalty01_jerk01",
+        # run_name=f"hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2",
+        # run_name=f"hiro_260331_highonly_reachableGaussian_Rainbow_amax3_dmin15_10",
+        # run_name=f"hiro_debug",
+    )
