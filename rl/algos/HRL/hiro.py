@@ -152,10 +152,12 @@ class HIROConfig:
     low_her_ratio: float = 0.8
     low_her_strategy: str = "future"  # "future" | "final"
     low_her_future_mode: str | None = None  # None->compat map, or "episode_timeaware"|"segment_timeaware"|"segment_legacy"
+    low_her_episode_timeaware_steps_ahead_range: Optional[tuple[int, int] | List[int]] = None  # e.g. (1, 8)
     low_her_future_timeaware: bool = True  # True: new episode-time HER, False: legacy segment-future HER
     low_her_debug_csv_interval_steps: int = 0
     low_her_debug_csv_max_rows_per_flush: int = 200
     low_her_debug_max_records: int = 20000
+    low_her_debug_sample_prob: float = 1.0
     high_pretrained_path: Optional[str] = None
     low_pretrained_path: Optional[str] = None
     mask_ego_position_in_low_obs: bool = False
@@ -323,9 +325,11 @@ class HIROSAC:
                         her_ratio=float(getattr(self.cfg, "low_her_ratio", 0.8)),
                         her_strategy=str(getattr(self.cfg, "low_her_strategy", "future")),
                         her_future_mode=getattr(self.cfg, "low_her_future_mode", None),
+                        her_episode_timeaware_steps_ahead_range=getattr(self.cfg, "low_her_episode_timeaware_steps_ahead_range", None),
                         her_future_timeaware=bool(getattr(self.cfg, "low_her_future_timeaware", True)),
                         her_debug_enabled=bool(int(getattr(self.cfg, "low_her_debug_csv_interval_steps", 0)) > 0),
                         her_debug_max_records=int(getattr(self.cfg, "low_her_debug_max_records", 20000)),
+                        her_debug_sample_prob=float(getattr(self.cfg, "low_her_debug_sample_prob", 1.0)),
                         enable_her=True,
                     )
                 )

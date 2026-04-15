@@ -336,14 +336,16 @@ def get_hiro_config():
         # - "segment_legacy": legacy same-segment future relabeling without t_norm relabel
         # low_her_future_mode="segment_timeaware",
         low_her_future_mode="episode_timeaware",
+        # Only for episode_timeaware: sample steps_ahead uniformly in [min, max]. None means default [1, high_interval].
+        low_her_episode_timeaware_steps_ahead_range=(1, 10),
 
-        # low_her_future_timeaware=True,
-        # low_her_future_timeaware=False,
         # HER debug CSV (saved by HIRO callback): 0 disables periodic flush.
         low_her_debug_csv_interval_steps=1000,
         low_her_debug_csv_max_rows_per_flush=200,
         # Replay-buffer-side cap for pending HER debug records.
         low_her_debug_max_records=20000,
+        # Randomly keep only a fraction of relabel debug records (0~1).
+        low_her_debug_sample_prob=0.05,
 
         # use_off_policy_correction=True,
         use_off_policy_correction=False,

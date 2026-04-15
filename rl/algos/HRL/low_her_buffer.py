@@ -24,7 +24,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         On sampling:
         - with probability her_ratio, relabel goal in obs/next_obs
         - strategy="future" supports three modes:
-            * episode_timeaware: sample i in [1, high_interval], use achieved state at
+            * episode_timeaware: sample i in [min_steps, max_steps], use achieved state at
                 (same env, same episode, ep_step + i), and sync t_norm
             * segment_timeaware: sample a future achieved state only in current segment,
                 and sync t_norm
@@ -65,9 +65,11 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         her_ratio: float = 0.8,
         her_strategy: str = "future",
         her_future_mode: str | None = None,
+        her_episode_timeaware_steps_ahead_range: tuple[int, int] | list[int] | None = None,
         her_future_timeaware: bool = True,
         her_debug_enabled: bool = False,
         her_debug_max_records: int = 20000,
+        her_debug_sample_prob: float = 1.0,
         enable_her: bool = True,
     ):
         super().__init__(
@@ -107,10 +109,30 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         if self.her_future_mode not in {"episode_timeaware", "segment_timeaware", "segment_legacy"}:
             raise ValueError(f"Unknown her_future_mode: {self.her_future_mode}")
 
+        if her_episode_timeaware_steps_ahead_range is None:
+            self.her_episode_timeaware_min_steps_ahead = 1
+            self.her_episode_timeaware_max_steps_ahead = int(self.high_interval)
+        else:
+            if not isinstance(her_episode_timeaware_steps_ahead_range, (tuple, list)) or len(her_episode_timeaware_steps_ahead_range) != 2:
+                raise ValueError(
+                    "her_episode_timeaware_steps_ahead_range must be None or a 2-item tuple/list like (1, 8)"
+                )
+            min_steps = int(her_episode_timeaware_steps_ahead_range[0])
+            max_steps = int(her_episode_timeaware_steps_ahead_range[1])
+            min_steps = max(1, min_steps)
+            max_steps = min(int(self.high_interval), max_steps)
+            if max_steps < min_steps:
+                raise ValueError(
+                    f"Invalid her_episode_timeaware_steps_ahead_range after clamping: ({min_steps}, {max_steps})"
+                )
+            self.her_episode_timeaware_min_steps_ahead = min_steps
+            self.her_episode_timeaware_max_steps_ahead = max_steps
+
         # Keep legacy flag for backward compatibility in configs/checkpoints.
         self.her_future_timeaware = bool(her_future_timeaware)
         self.her_debug_enabled = bool(her_debug_enabled)
         self.her_debug_max_records = int(max(1, her_debug_max_records))
+        self.her_debug_sample_prob = float(np.clip(float(her_debug_sample_prob), 0.0, 1.0))
         self.enable_her = bool(enable_her)
 
         self.goal_start = int(1 + self.kin_flat_dim)
@@ -298,8 +320,14 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         return self._ego_next[int(r), int(c)].astype(np.float32, copy=True), int(r), int(c), steps_ahead
 
     def _get_future_goal_by_episode_time(self, env_i: int, ep_id: int, ep_step: int) -> tuple[np.ndarray, int, int, int] | None:
-        # Randomly choose i in [1, high_interval], then use same-env same-episode future step (ep_step + i).
-        i_steps = int(self.rng.integers(1, self.high_interval + 1))
+        # Randomly choose i in configured [min_steps, max_steps], then use
+        # same-env same-episode future step (ep_step + i).
+        i_steps = int(
+            self.rng.integers(
+                int(self.her_episode_timeaware_min_steps_ahead),
+                int(self.her_episode_timeaware_max_steps_ahead) + 1,
+            )
+        )
         target_key = (int(env_i), int(ep_id), int(ep_step + i_steps))
         loc = self._time_index.get(target_key)
         if loc is None:
@@ -370,6 +398,8 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         ego_now_all = self._ego_now[batch_inds, env_indices].astype(np.float32, copy=False)
         ego_next_all = self._ego_next[batch_inds, env_indices].astype(np.float32, copy=False)
         ego_start_ref_all = self._ego_start[batch_inds, env_indices].astype(np.float32, copy=True)
+        source_done_mask = dones.reshape(-1).astype(bool)
+        relabeled_done_mask = np.array(source_done_mask, copy=True)
         relabel_debug_pending: list[dict[str, Any]] = []
 
         for i in np.flatnonzero(her_mask):
@@ -433,6 +463,8 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                 g_new_abs, goal_row, goal_col, steps_ahead = goal_meta
             if g_new_abs is None:
                 continue
+            if int(steps_ahead) < 1:
+                continue
 
             # Keep HER goal semantics aligned with high-level goal_action_to_abs:
             # goal = [x*, y*, vx*, 0], i.e., target vy is always zero.
@@ -444,11 +476,17 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
 
             obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_now_all[i]).astype(np.float32)
             next_obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_next_all[i]).astype(np.float32)
+            relabeled_done_mask[i] = (int(steps_ahead) == 1)
             if relabeled_t_norm is not None:
                 obs_relabeled[i, 0] = np.float32(np.clip(relabeled_t_norm, 0.0, 1.0))
                 next_obs_relabeled[i, 0] = np.float32(np.clip(relabeled_t_norm + 1.0 / float(self.high_interval), 0.0, 1.0))
 
-            if self.her_debug_enabled and goal_row >= 0 and goal_col >= 0:
+            if (
+                self.her_debug_enabled
+                and goal_row >= 0
+                and goal_col >= 0
+                and self.rng.random() < self.her_debug_sample_prob
+            ):
                 src_row = int(batch_inds[i])
                 src_col = int(env_indices[i])
                 relabel_debug_pending.append(
@@ -465,7 +503,8 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                         "source_action": self._to_list(actions[i]),
                         "source_ego_abs": self._to_list(self._ego_now[src_row, src_col]),
                         "source_reward_stored": float(self.rewards[src_row, src_col]),
-                        "source_done": bool(dones[i, 0]),
+                        "source_done": bool(source_done_mask[i]),
+                        "relabeled_done": bool(relabeled_done_mask[i]),
                         "goal_row": int(goal_row),
                         "goal_col": int(goal_col),
                         "goal_seg_id": int(self._seg_id[int(goal_row), int(goal_col)]),
@@ -509,11 +548,11 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                 self.intrinsic_coef,
                 self.intrinsic_weights,
                 gamma=float(self.low_gamma),
-                is_terminal=dones.reshape(-1).astype(bool),
+                is_terminal=relabeled_done_mask,
             )
         else:
             r_goal = np.zeros(batch_size, dtype=np.float32)
-            terminal_mask = dones.reshape(-1).astype(bool)
+            terminal_mask = relabeled_done_mask
             if terminal_mask.any():
                 r_goal_term, _, _ = utils.intrinsic_reward_l2(
                     ego_rel_next[terminal_mask],
@@ -535,11 +574,13 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                 rec["reward_total_new"] = float(rewards[bi, 0])
                 self._her_debug_records.append(rec)
 
+        dones_relabeled = relabeled_done_mask.astype(dones.dtype, copy=False).reshape(-1, 1)
+
         data = (
             self._normalize_obs(obs_relabeled, env),
             actions,
             self._normalize_obs(next_obs_relabeled, env),
-            dones,
+            dones_relabeled,
             self._normalize_reward(rewards, env),
         )
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
