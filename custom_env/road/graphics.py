@@ -314,6 +314,77 @@ class RoadGraphics:
             for _to in road.network.graph[_from].keys():
                 for l in road.network.graph[_from][_to]:
                     LaneGraphics.display(l, surface)
+        RoadGraphics.display_highlight_regions(road, surface)
+        RoadGraphics.display_signal_indicator(road, surface)
+
+    @staticmethod
+    def display_highlight_regions(road: Road, surface: WorldSurface) -> None:
+        """Draw render-only highlighted lane regions from road.highlight_regions metadata."""
+        regions = getattr(road, "highlight_regions", None)
+        if not regions:
+            return
+
+        overlay = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+        for region in regions:
+            try:
+                lane_index = tuple(region["lane_index"])
+                lane = road.network.get_lane(lane_index)
+                s_start = float(region["s_start"])
+                s_end = float(region["s_end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            if s_end <= s_start:
+                continue
+
+            color = region.get("color", (255, 80, 80, 90))
+            if len(color) == 3:
+                color = (int(color[0]), int(color[1]), int(color[2]), 90)
+            else:
+                color = (int(color[0]), int(color[1]), int(color[2]), int(color[3]))
+
+            w_start = lane.width_at(s_start) / 2.0
+            w_end = lane.width_at(s_end) / 2.0
+
+            p1 = surface.vec2pix(lane.position(s_start, +w_start))
+            p2 = surface.vec2pix(lane.position(s_end, +w_end))
+            p3 = surface.vec2pix(lane.position(s_end, -w_end))
+            p4 = surface.vec2pix(lane.position(s_start, -w_start))
+            pygame.draw.polygon(overlay, color, [p1, p2, p3, p4], 0)
+
+        surface.blit(overlay, (0, 0))
+
+    @staticmethod
+    def display_signal_indicator(road: Road, surface: WorldSurface) -> None:
+        items = getattr(road, "signal_render_items", None)
+        if items is None:
+            # Backward compatibility: older payload used a single dict.
+            single = getattr(road, "signal_render_item", None)
+            items = [single] if single else []
+
+        if not items:
+            return
+
+        for item in items:
+            try:
+                pos = np.asarray(item["position"], dtype=float)
+                color = tuple(int(c) for c in item.get("color", (220, 70, 70)))
+                label = str(item.get("label", "0s"))
+                radius_m = float(item.get("radius_m", 1.2))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            center = surface.vec2pix(pos)
+            radius_px = max(surface.pix(radius_m), 6)
+
+            pygame.draw.circle(surface, color, center, radius_px)
+            pygame.draw.circle(surface, (30, 30, 30), center, radius_px, 1)
+
+            font_size = max(14, int(0.8 * radius_px) + 10)
+            font = pygame.font.Font(None, font_size)
+            text_surface = font.render(label, True, (245, 245, 245))
+            text_rect = text_surface.get_rect(center=(center[0], center[1] - radius_px - 10))
+            surface.blit(text_surface, text_rect)
 
     @staticmethod
     def display_traffic(
@@ -382,6 +453,8 @@ class RoadObjectGraphics:
         :param offscreen: whether the rendering should be done offscreen or not
         """
         o = object_
+        if getattr(o, "hidden", False):
+            return
         s = pygame.Surface(
             (surface.pix(o.LENGTH), surface.pix(o.LENGTH)), pygame.SRCALPHA
         )  # per-pixel alpha
