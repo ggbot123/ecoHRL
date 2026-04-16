@@ -1,13 +1,13 @@
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
-import scenarios.multi_lane  # 触发 __init__.py 里的 register
 import numpy as np
 import os
+import importlib
 import csv
 from datetime import datetime
 from typing import Any, Dict, Optional, Sequence, Tuple
 from util.plot_result import *
-from configs.conf import get_env_config, get_hiro_config
+from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 
 from rl.algos.ppo.ppo import PPO
 from rl.algos.sac.sac import SAC
@@ -44,6 +44,7 @@ def main(
     record_trajectory_episodes: Optional[Sequence[int]] = None,
     env_overrides: Optional[Dict[str, Any]] = None,
     enable_rendering: bool = True,
+    scenario_name: str = "multi_lane",
 ):
     algo = str(algo).lower()
 
@@ -90,13 +91,17 @@ def main(
         "warmup_render": False,
         "offscreen_rendering": enable_rendering,
     }
+    scenario_spec = get_scenario_spec(scenario_name)
+    importlib.import_module(str(scenario_spec["module"]))
+    env_id = str(scenario_spec["env_id"])
+
     if env_overrides:
         test_overrides.update(env_overrides)
     if not enable_rendering:
         test_overrides["show_trajectories"] = False
         test_overrides["warmup_render"] = False
         test_overrides["offscreen_rendering"] = False
-    env_config = get_env_config(test_overrides)
+    env_config = get_env_config_for_scenario(scenario_name, test_overrides)
 
     # Keep SAC evaluation safety behavior consistent with training.
     if algo == "sac" and bool(env_config.get("enable_sac_low_safety_filter", False)):
@@ -111,7 +116,7 @@ def main(
                     "lane_change_min_rear_ttc": float(hiro_cfg_for_sac.low_safety_filter.lane_change_min_rear_ttc),
                 }
             )
-            env_config = get_env_config(test_overrides)
+            env_config = get_env_config_for_scenario(scenario_name, test_overrides)
 
     # 视频录制触发器
     if record_episodes is None or len(record_episodes) == 0:
@@ -128,11 +133,7 @@ def main(
         trajectory_record_set = {int(ep_idx) for ep_idx in record_trajectory_episodes}
 
     render_mode = "rgb_array" if enable_rendering else None
-    base_env = gym.make(
-        "multi-lane-custom-v0",
-        render_mode=render_mode,
-        config=env_config,
-    )
+    base_env = gym.make(env_id, render_mode=render_mode, config=env_config)
     env = RecordVideo(base_env, video_folder=eval_dir, episode_trigger=trigger, name_prefix=f"{algo}") if enable_rendering else base_env
 
     # 加载模型

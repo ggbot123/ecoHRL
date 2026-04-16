@@ -896,6 +896,7 @@ class RuleBasedAgentWrapper:
         self.idx_y = _idx("y", 1)
         self.idx_vx = _idx("vx", 2)
         self.idx_vy = _idx("vy", 3)
+        self.goal_dim = 4
 
     def act(self, low_obs: np.ndarray, goal_phys: np.ndarray) -> np.ndarray:
         low_obs = np.asarray(low_obs, dtype=np.float32)
@@ -966,7 +967,9 @@ class RuleBasedAgentWrapper:
                 others_rel.append([float(d[self.idx_x]), float(d[self.idx_y]), float(d[self.idx_vx]), float(d[self.idx_vy])])
 
             others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
-            goal_rel = low_obs[i, 1 + self.n_veh_local * self.feat_dim :]
+            g0 = int(1 + self.n_veh_local * self.feat_dim)
+            g1 = int(g0 + self.goal_dim)
+            goal_rel = low_obs[i, g0:g1]
             ego_abs = (np.asarray(goal_phys[i], dtype=np.float32) - np.asarray(goal_rel, dtype=np.float32)).astype(np.float32)
             safe_a = self.controller.safety_filter_action(
                 ego_abs=ego_abs,

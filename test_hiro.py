@@ -1,6 +1,6 @@
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
-import scenarios.multi_lane  # 触发 __init__.py 里的 register
+import importlib
 
 import numpy as np
 import os
@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 from util.plot_result import *
 from util.hiro_utils import unique_path, load_hiro_models
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
-from configs.conf import get_env_config, get_hiro_config
+from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 
 
 def main(
@@ -26,6 +26,7 @@ def main(
     model_suffix: Optional[str] = "final",
     use_low_safety_layer: Optional[bool] = None,
     enable_rendering: bool = True,
+    scenario_name: str = "multi_lane",
 ):
     eval_root_dir = os.path.join(model_dir, "eval_results")
     os.makedirs(eval_root_dir, exist_ok=True)
@@ -95,13 +96,17 @@ def main(
         "warmup_render": False,  
         "offscreen_rendering": enable_rendering,
     }
+    scenario_spec = get_scenario_spec(scenario_name)
+    importlib.import_module(str(scenario_spec["module"]))
+    env_id = str(scenario_spec["env_id"])
+
     if env_overrides:
         test_overrides.update(env_overrides)
     if not enable_rendering:
         test_overrides["show_trajectories"] = False
         test_overrides["warmup_render"] = False
         test_overrides["offscreen_rendering"] = False
-    env_config = get_env_config(test_overrides)
+    env_config = get_env_config_for_scenario(scenario_name, test_overrides)
 
     if not record_episodes:
         def trigger(ep_id: int) -> bool: return False
@@ -114,7 +119,7 @@ def main(
         trajectory_record_set = {int(ep_idx) for ep_idx in record_trajectory_episodes}
 
     render_mode = "rgb_array" if enable_rendering else None
-    base_env = gym.make("multi-lane-custom-v0", render_mode=render_mode, config=env_config)
+    base_env = gym.make(env_id, render_mode=render_mode, config=env_config)
     env = RecordVideo(base_env, video_folder=eval_dir, episode_trigger=trigger, name_prefix="hiro") if enable_rendering else base_env
 
     high_model, low_model = load_hiro_models(

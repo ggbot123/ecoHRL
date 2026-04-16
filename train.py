@@ -12,17 +12,18 @@ warnings.filterwarnings(
 )
 import os
 import random
+import importlib
 from datetime import datetime
 import gymnasium as gym
 import numpy as np
 import torch as th
 
-import scenarios.multi_lane  # 注册 multi-lane-custom-v0
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
 from configs.conf import (
-    get_env_config,
+    get_env_config_for_scenario,
+    get_scenario_spec,
     get_ppo_kwargs,
     get_sac_kwargs,
     get_hiro_config,
@@ -47,13 +48,17 @@ def set_global_seed(seed: int) -> None:
     th.backends.cudnn.benchmark = False
 
 
-def make_env(env_overrides: dict | None = None, render_mode: str | None = None):
+def make_env(env_id: str, scenario_name: str, env_overrides: dict | None = None, render_mode: str | None = None):
     """Return an env constructor compatible with DummyVecEnv/SubprocVecEnv."""
     env_seed = int(master_rng.integers(0, 2**31 - 1))
+    scenario_module = str(get_scenario_spec(scenario_name)["module"])
 
     def _init():
-        cfg = get_env_config(env_overrides or {})
-        env = gym.make("multi-lane-custom-v0", render_mode=render_mode, config=cfg)
+        # On Windows spawn mode, each subprocess must import the scenario module
+        # to register gym env IDs in its own process.
+        importlib.import_module(scenario_module)
+        cfg = get_env_config_for_scenario(scenario_name, env_overrides or {})
+        env = gym.make(env_id, render_mode=render_mode, config=cfg)
         env = Monitor(env)
         env.reset(seed=env_seed)
         return env
@@ -76,12 +81,17 @@ def main(
     hiro_low_target_entropy: str | float = "auto",
     hiro_low_target_entropy_scale: float | None = 0.5,
     hiro_low_sac_impl: str | None = None,
+    scenario_name: str = "multi_lane",
 ) -> None:
     global master_rng
     set_global_seed(MASTER_SEED)
     master_rng = np.random.default_rng(MASTER_SEED)
 
     algo = algo.lower()
+    scenario_spec = get_scenario_spec(scenario_name)
+    scenario_module = str(scenario_spec["module"])
+    env_id = str(scenario_spec["env_id"])
+    importlib.import_module(scenario_module)
 
     if run_name is None:
         time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -93,6 +103,7 @@ def main(
     os.makedirs(save_dir, exist_ok=True)
 
     print(f"[MAIN] algo={algo}")
+    print(f"[MAIN] scenario={scenario_name}, env_id={env_id}")
     print(f"[MAIN] log_dir={log_dir}")
     print(f"[MAIN] save_dir={save_dir}")
 
@@ -102,9 +113,9 @@ def main(
 
     #### ================ Train-time overrides (optional) ================ ####
     env_overrides = {
-        "initial_lane_id": "random",
+        # "initial_lane_id": "random",
         # "initial_lane_id": 0,
-        # "initial_lane_id": 1,
+        "initial_lane_id": 1,
         # "initial_lane_id": 2,
         # "PERCEPTION_DISTANCE": 200,
         # "observation": {
@@ -123,8 +134,8 @@ def main(
 
     if algo == "ppo":
         ppo_kwargs = get_ppo_kwargs(log_dir=log_dir, seed=MASTER_SEED)
-        env_fns = [make_env(env_overrides, render_mode=render_mode) for _ in range(n_envs)]
-        eval_env_fn = make_env(env_overrides, render_mode=render_mode)
+        env_fns = [make_env(env_id, scenario_name, env_overrides, render_mode=render_mode) for _ in range(n_envs)]
+        eval_env_fn = make_env(env_id, scenario_name, env_overrides, render_mode=render_mode)
         train_ppo(
             env_fns=env_fns,
             eval_env_fn=eval_env_fn,
@@ -147,7 +158,7 @@ def main(
         )
 
         # Optional: reuse HIRO low safety filter constraints in SAC via conf switch.
-        cfg_for_sac = get_env_config(sac_env_overrides)
+        cfg_for_sac = get_env_config_for_scenario(scenario_name, sac_env_overrides)
         if bool(cfg_for_sac.get("enable_sac_low_safety_filter", False)):
             hiro_cfg_for_sac: HIROConfig = get_hiro_config()
             if hiro_cfg_for_sac.low_safety_filter is not None:
@@ -164,8 +175,8 @@ def main(
             else:
                 print("[SAC] enable_sac_low_safety_filter=True，但 HIRO low_safety_filter 为 None，跳过")
 
-        env_fns = [make_env(sac_env_overrides, render_mode=render_mode) for _ in range(n_envs)]
-        eval_env_fn = make_env(sac_env_overrides, render_mode=render_mode)
+        env_fns = [make_env(env_id, scenario_name, sac_env_overrides, render_mode=render_mode) for _ in range(n_envs)]
+        eval_env_fn = make_env(env_id, scenario_name, sac_env_overrides, render_mode=render_mode)
         train_sac(
             env_fns=env_fns,
             eval_env_fn=eval_env_fn,
@@ -212,9 +223,9 @@ def main(
         print(f"[HIRO] Low pretrained: {hiro_cfg.low_pretrained_path}")
 
         if render_mode is not None:
-            env = DummyVecEnv([make_env(env_overrides, render_mode=render_mode) for _ in range(n_envs)])
+            env = DummyVecEnv([make_env(env_id, scenario_name, env_overrides, render_mode=render_mode) for _ in range(n_envs)])
         else:
-            env = SubprocVecEnv([make_env(env_overrides, render_mode=render_mode) for _ in range(n_envs)])
+            env = SubprocVecEnv([make_env(env_id, scenario_name, env_overrides, render_mode=render_mode) for _ in range(n_envs)])
 
         train_hiro(
             env=env,
@@ -244,53 +255,39 @@ if __name__ == "__main__":
     #     n_envs=8,
     #     run_name=f"ppo_1e7_lane1_seed2"
     # )
-    main(
-        algo="sac",
-        log_root="./logs/current",
-        total_timesteps=10_000_000,
-        eval_freq=10_000,
-        save_freq=50_000,
-        n_envs=8,
-        # run_name=f"sac_260402_withPrior_randomlane"
-        # run_name=f"sac_260403_withPrior_SL_randomlane"
-        # run_name=f"sac_260403_withConstPrior_SLv2_randomlane"
-        # run_name=f"sac_260403_withConstPrior_SL_randomlane"
-        run_name=f"sac_260403_base_SLv2_randomlane"
-    )
     # main(
-    #     algo="hiro",
+    #     algo="sac",
     #     log_root="./logs/current",
-    #     # total_timesteps=20000,
     #     total_timesteps=10_000_000,
     #     eval_freq=10_000,
     #     save_freq=50_000,
     #     n_envs=8,
-    #     # render=True,
-    #     # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
-    #     hiro_low_pretrained_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
-    #     # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane0/hiro_low_final.zip",
-    #     # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane2/hiro_low_final.zip",
-    #     # hiro_low_pretrained_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
-    #     hiro_low_target_entropy="auto",
-    #     hiro_low_target_entropy_scale=1,
-
-    #     # run_name=f"hiro_260331_highonly_reachableUniformLane1_Rainbow_amax3_dmin15_10_randomlane",
-    #     run_name=f"hiro_260402_highonly_UniformLane1_Rainbow_amax3_dmin15_10_randomlane",
-    #     # run_name=f"hiro_260401_highonly_reachableUniform_amax3_dmin15_10_lane0",
-    #     # run_name=f"hiro_260401_highonly_reachableUniform_amax3_dmin15_10_lane2",
-    #     # run_name=f"hiro_260401_highonly_UniformLane1_Rainbow_randomLane",
-    #     # run_name=f"hiro_260401_lowonly_Uniform_lane0",
-    #     # run_name=f"hiro_260401_lowonly_Uniform_lane2",
-    #     # run_name=f"hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane2",
-    #     # run_name=f"hiro_260331_lowonly_reachableUniform_Rainbow_amax3_dmin15_10_randomLane",
-    #     # run_name=f"hiro_260323_lowonly_nearCruise_newSLv2_vio03_HER_reDim",
-    #     # run_name=f"hiro_260402_highonly_rule_accwithSL_randomLane",
-    #     # run_name=f"hiro_260331_highonly_rule_accwithSL_lane0",
-    #     # run_name=f"hiro_260331_highonly_rule_accwithSL_lane2",
-
-    #     # run_name=f"hiro_260319_highonly_pretrained_newSLv2_vio03_HER_reDim_lc15",
-    #     # run_name=f"hiro_260315_lowonly_uniform_RS_newSLv3_vioPenalty01_jerk01",
-    #     # run_name=f"hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2",
-    #     # run_name=f"hiro_260331_highonly_reachableGaussian_Rainbow_amax3_dmin15_10",
-    #     # run_name=f"hiro_debug",
+    #     # run_name=f"sac_260402_withPrior_randomlane"
+    #     # run_name=f"sac_260403_withPrior_SL_randomlane"
+    #     # run_name=f"sac_260403_withConstPrior_SLv2_randomlane"
+    #     # run_name=f"sac_260403_withConstPrior_SL_randomlane"
+    #     run_name=f"sac_260403_base_SLv2_randomlane",
+    #     scenario_name="multi_lane",
     # )
+    main(
+        algo="hiro",
+        log_root="./logs/current",
+        # total_timesteps=20000,
+        total_timesteps=10_000_000,
+        eval_freq=10_000,
+        save_freq=50_000,
+        n_envs=8,
+        # render=True,
+        # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane0/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane2/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
+        hiro_low_target_entropy="auto",
+        hiro_low_target_entropy_scale=1,
+
+        # run_name=f"hiro_260416_lowonly_reUni_Rainbow_amax3_dmin15_10_Lane1",
+        run_name=f"hiro_260416_lowonly_reUni_amax3_dmin15_10_newEnv",
+        # scenario_name="multi_lane",
+        scenario_name="multi_lane_stop_to_int",
+    )

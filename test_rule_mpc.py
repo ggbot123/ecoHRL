@@ -7,6 +7,7 @@ import cvxpy as cp
 import gymnasium as gym
 import numpy as np
 from gymnasium.wrappers import RecordVideo
+import importlib
 
 try:
     from tqdm.auto import tqdm
@@ -14,8 +15,7 @@ except Exception:
     def tqdm(iterable, *args, **kwargs):
         return iterable
 
-import scenarios.multi_lane  # Trigger environment registration
-from configs.conf import get_env_config
+from configs.conf import get_env_config_for_scenario, get_scenario_spec
 from custom_env.vehicle.behavior import IDMVehicle
 from rl.algos.HRL.rule_based import RuleBasedController
 from util.hiro_utils import unique_path
@@ -272,6 +272,7 @@ def main(
     lane_strategy: str = "right_bias",
     use_low_safety_layer: bool = False,
     enable_rendering: bool = True,
+    scenario_name: str = "multi_lane",
 ):
     eval_root_dir = os.path.join(model_dir, "eval_results")
     os.makedirs(eval_root_dir, exist_ok=True)
@@ -305,11 +306,14 @@ def main(
     }
     if env_overrides:
         test_overrides.update(env_overrides)
+    scenario_spec = get_scenario_spec(scenario_name)
+    importlib.import_module(str(scenario_spec["module"]))
+    env_id = str(scenario_spec["env_id"])
     if not enable_rendering:
         test_overrides["show_trajectories"] = False
         test_overrides["warmup_render"] = False
         test_overrides["offscreen_rendering"] = False
-    env_config = get_env_config(test_overrides)
+    env_config = get_env_config_for_scenario(scenario_name, test_overrides)
 
     if not record_episodes:
         def trigger(ep_id: int) -> bool:
@@ -321,7 +325,7 @@ def main(
             return ep_id in record_set
 
     render_mode = "rgb_array" if enable_rendering else None
-    base_env = gym.make("multi-lane-custom-v0", render_mode=render_mode, config=env_config)
+    base_env = gym.make(env_id, render_mode=render_mode, config=env_config)
     env = RecordVideo(base_env, video_folder=eval_dir, episode_trigger=trigger, name_prefix="rule_mpc") if enable_rendering else base_env
 
     controller = RuleMPCController(

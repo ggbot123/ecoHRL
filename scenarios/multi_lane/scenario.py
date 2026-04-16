@@ -166,6 +166,14 @@ class MultiLaneEnv(AbstractEnv):
         self._spawn_background(self.config["spawn_probability"] * (sim_freq / pol_freq))    # TODO: 完善增车策略，现在是按policy_freq集总生成，不是按simu_freq生成
 
         return obs, reward, terminated, truncated, info
+
+    def get_hiro_signal_features(self) -> tuple[float, float]:
+        """Return (is_green, remaining_seconds) for HIRO observation.
+
+        Base multi-lane scenario has no traffic light control.
+        Use fixed sentinel values to indicate "no signal": (-1, -1).
+        """
+        return -1.0, -1.0
     
     # ----------------- RL task 定义 ----------------- #
     def _reward(self, action: Action) -> float:

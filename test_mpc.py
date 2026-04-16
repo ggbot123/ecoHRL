@@ -1,6 +1,6 @@
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
-import scenarios.multi_lane  # Trigger registration
+import importlib
 
 import numpy as np
 import os
@@ -13,7 +13,7 @@ from util.hiro_utils import load_hiro_high_model, unique_path
 
 from rl.utils import utils
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
-from configs.conf import get_env_config, get_hiro_config
+from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 
 
 def main(
@@ -22,6 +22,7 @@ def main(
     record_episodes: Optional[Sequence[int]] = None,
     env_overrides: Optional[Dict[str, Any]] = None,
     high_model_dir: Optional[str] = None,
+    scenario_name: str = "multi_lane",
 ):
     eval_dir = os.path.join(model_dir, "eval_results")
     os.makedirs(eval_dir, exist_ok=True)
@@ -51,7 +52,10 @@ def main(
     }
     if env_overrides:
         test_overrides.update(env_overrides)
-    env_config = get_env_config(test_overrides)
+    scenario_spec = get_scenario_spec(scenario_name)
+    importlib.import_module(str(scenario_spec["module"]))
+    env_id = str(scenario_spec["env_id"])
+    env_config = get_env_config_for_scenario(scenario_name, test_overrides)
 
     if not record_episodes:
         def trigger(ep_id: int) -> bool: return False
@@ -60,7 +64,7 @@ def main(
         def trigger(ep_id: int) -> bool: return ep_id in record_set
 
     # 1. Create Environment
-    base_env = gym.make("multi-lane-custom-v0", render_mode="rgb_array", config=env_config)
+    base_env = gym.make(env_id, render_mode="rgb_array", config=env_config)
 
     # Define and clear video/result directory
     video_dir = os.path.join(model_dir, "goal_distribution_mpc")

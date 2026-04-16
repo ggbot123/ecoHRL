@@ -58,7 +58,7 @@ SCENARIO_OVERRIDES_BY_ENV_ID: Dict[str, Dict[str, Any]] = {
         "start_lane_id": 2,
         "start_longitudinal": 0.0,
         "target_lane_id": 0,
-        "target_longitudinal": 400.0,
+        "goal_longitudinal": 400.0,
         "intersection_length": 50.0,
         # Movement-role lane mapping (lane ids). Any unlisted lanes default to straight.
         "movement_lanes": {
@@ -78,6 +78,8 @@ SCENARIO_OVERRIDES_BY_ENV_ID: Dict[str, Dict[str, Any]] = {
             {"left": 37.0},      # 12s green + 3s yellow
         ],
         "signal_cycle_offset": 0.0,
+        "align_ego_spawn_to_signal_offset": True,
+        "episode_start_phase_offset": 0.0,
     },
     "multi-lane-custom-v0": {
         "initial_lane_id": "random",
@@ -184,11 +186,11 @@ def compute_straight_queue_length(env: gym.Env, speed_threshold: float = 0.8) ->
     if getattr(base_env, "road", None) is None:
         return 0.0
 
-    target_fn = getattr(base_env, "_target_longitudinal", None)
-    if callable(target_fn):
-        stop_x = float(target_fn())
+    goal_fn = getattr(base_env, "_goal_longitudinal", None)
+    if callable(goal_fn):
+        stop_x = float(goal_fn())
     else:
-        stop_x = float(base_env.config.get("target_longitudinal", base_env.config.get("goal_longitudinal", 0.0)))
+        stop_x = float(base_env.config.get("goal_longitudinal", 0.0))
 
     straight_lane_ids = _get_straight_lane_ids(base_env)
     if not straight_lane_ids:

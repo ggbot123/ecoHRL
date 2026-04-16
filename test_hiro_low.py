@@ -1,6 +1,7 @@
 import os
 import csv
 import json
+import importlib
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -8,9 +9,7 @@ import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 
-import scenarios.multi_lane  # 触发 __init__.py 里的 register
-
-from configs.conf import get_env_config, get_hiro_config
+from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 from rl.algos.sac.sac import SAC
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.HRL.goal_samplers import UniformGoalSampler
@@ -531,6 +530,7 @@ def main(
     q_sa_points_per_axis: int = 51,
     random_neighbors_batch_size: int = 0,
     random_neighbors_seed: int = 0,
+    scenario_name: str = "multi_lane",
     _is_subrun: bool = False,
 ):
     run_out_dir = out_dir
@@ -586,6 +586,7 @@ def main(
                 q_sa_a1_min=q_sa_a1_min,
                 q_sa_a1_max=q_sa_a1_max,
                 q_sa_points_per_axis=q_sa_points_per_axis,
+                scenario_name=scenario_name,
                 _is_subrun=True,
             )
         return
@@ -625,7 +626,11 @@ def main(
     if env_overrides:
         test_overrides.update(env_overrides)
 
-    env_config = get_env_config(test_overrides)
+    scenario_spec = get_scenario_spec(scenario_name)
+    importlib.import_module(str(scenario_spec["module"]))
+    env_id = str(scenario_spec["env_id"])
+
+    env_config = get_env_config_for_scenario(scenario_name, test_overrides)
     n_local = int(env_config.get("observation", {}).get("vehicles_count_local", 1))
     if len(neighbors_state) > max(0, n_local - 1):
         raise ValueError(
@@ -633,7 +638,7 @@ def main(
         )
     if len(goal_phys) < 4:
         raise ValueError("goal_phys 需要至少包含 [x, y, vx, vy] 四个元素。")
-    env = gym.make("multi-lane-custom-v0", render_mode=None, config=env_config)
+    env = gym.make(env_id, render_mode=None, config=env_config)
 
     obs0, _ = env.reset(seed=seed)
     base_env, ego, neighbors = setup_env_with_state(env, ego_state, neighbors_state)
@@ -678,6 +683,14 @@ def main(
         ego_sub_local = runner._ego_sub(kin_local)
         t_norm_local = np.array([runner.c / float(runner.hi)], dtype=np.float32)
         goal_rel_local = (runner.goal_phys - ego_sub_local).astype(np.float32)
+        signal_local = np.array([1.0, 0.0], dtype=np.float32)
+        signal_fn = getattr(env.unwrapped, "get_hiro_signal_features", None)
+        if callable(signal_fn):
+            try:
+                sig_color, sig_remain = signal_fn()
+                signal_local = np.array([1.0 if float(sig_color) > 0.5 else 0.0, float(sig_remain)], dtype=np.float32)
+            except Exception:
+                signal_local = np.array([1.0, 0.0], dtype=np.float32)
         local_kin_flat_local = np.asarray(kin_flat_local[0, :runner.local_kin_flat_dim], dtype=np.float32).copy()
 
         if bool(getattr(runner.cfg, "mask_ego_position_in_low_obs", False)):
@@ -687,7 +700,7 @@ def main(
                 local_kin_flat_local[idx_x_local] = 0.0
                 local_kin_flat_local[idx_y_local] = 0.0
 
-        return np.concatenate([t_norm_local, local_kin_flat_local, goal_rel_local]).astype(np.float32)
+        return np.concatenate([t_norm_local, local_kin_flat_local, goal_rel_local, signal_local]).astype(np.float32)
 
     def _record_q_sa_for_step(step_idx: int, low_obs_state: np.ndarray, action_ref: np.ndarray, chosen_action: Optional[np.ndarray] = None):
         nonlocal q_sa_a0_mesh_ref, q_sa_a1_mesh_ref

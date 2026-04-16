@@ -215,16 +215,69 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "comfort_acc_weight": 1.0,
     "comfort_jerk_weight": 0.1,
 
-    "lane_change_reward": -1.0,
-    # "lane_change_reward": -0.5,
+    # "lane_change_reward": -1.0,
+    "lane_change_reward": -0.5,
     
-    # RuleBasedController compute_action strategy:
-    # "target_speed_lane" | "goal_x_accel" | "idm_mobil"
+    # RuleBasedController compute_action strategy: "target_speed_lane" | "goal_x_accel" | "idm_mobil"
     "rule_based_compute_action_mode": "goal_x_accel",
 
     # SAC can optionally reuse HIRO low-safety-filter lane-change constraints.
     "enable_sac_low_safety_filter": True,
 }
+
+
+_SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
+    "multi_lane": {
+        "module": "scenarios.multi_lane",
+        "env_id": "multi-lane-custom-v0",
+        "env_overrides": {},
+    },
+    "multi_lane_stop_to_int": {
+        "module": "scenarios.multi_lane_stop_to_int",
+        "env_id": "multi-lane-stop-to-int-v0",
+        "env_overrides": {
+            "lanes_count": 3,
+            "spawn_probability": 0.05,
+            "start_lane_id": 2,
+            "start_longitudinal": 0.0,
+            "target_lane_id": 1,
+            "intersection_length": 50.0,
+            "movement_lanes": {
+                "straight": [0, 1, 2],
+            },
+            "background_vehicle_respect_movement_lanes": True,
+            "goal_longitudinal": 400.0,
+            "punctual_time_window": [30.0, 40.0],
+            "punctual_time_target": 35.0,
+            "signal_plan": [
+                {"straight": 63.0},
+                {"left": 37.0},
+            ],
+            "signal_cycle_offset": 0.0,
+            "align_ego_spawn_to_signal_offset": True,
+            "episode_start_phase_offset": 25.0,
+        },
+    },
+}
+
+
+def get_scenario_spec(scenario_name: str) -> Dict[str, Any]:
+    key = str(scenario_name).strip().lower()
+    if key not in _SCENARIO_SPECS:
+        supported = ", ".join(sorted(_SCENARIO_SPECS.keys()))
+        raise ValueError(f"Unknown scenario '{scenario_name}'. Supported: {supported}")
+    return deepcopy(_SCENARIO_SPECS[key])
+
+
+def get_env_config_for_scenario(
+    scenario_name: str,
+    overrides: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    spec = get_scenario_spec(scenario_name)
+    merged_overrides: Dict[str, Any] = deepcopy(spec.get("env_overrides", {}))
+    if overrides:
+        _deep_update(merged_overrides, overrides)
+    return get_env_config(merged_overrides)
 
 
 def get_env_config(overrides: Mapping[str, Any] | None = None) -> Dict[str, Any]:
@@ -286,20 +339,20 @@ def get_hiro_config():
         device="auto",
 
         # train_mode="joint",
-        train_mode="high_only",
-        # train_mode="low_only",
+        # train_mode="high_only",
+        train_mode="low_only",
 
         intrinsic_coef=intrinsic_coef,
         intrinsic_norm_ranges=intrinsic_norm_ranges,
         intrinsic_weights=intrinsic_weights,
         intrinsic_type=intrinsic_type,
 
-        goal_sampler=GoalSamplerConfig(
-            type="uniform",
-        ),
         # goal_sampler=GoalSamplerConfig(
-        #     type="reachable_uniform",
+        #     type="uniform",
         # ),
+        goal_sampler=GoalSamplerConfig(
+            type="reachable_uniform",
+        ),
         # goal_sampler=GoalSamplerConfig(
         #     type="reachable_gaussian",
         #     gaussian_mean_x_m=27.0,

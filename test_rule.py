@@ -1,6 +1,6 @@
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
-import scenarios.multi_lane  # Trigger registration
+import importlib
 
 import numpy as np
 import os
@@ -14,7 +14,7 @@ from rl.utils import utils
 from custom_env import utils as c_utils
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.HRL.rule_based import RuleBasedController
-from configs.conf import get_env_config, get_hiro_config
+from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 from custom_env.vehicle.controller import ControlledVehicle
 from custom_env.vehicle.behavior import NormalIDMVehicle
 from custom_env.road.road import LaneIndex
@@ -28,6 +28,7 @@ def main(
     env_overrides: Optional[Dict[str, Any]] = None,
     high_model_dir: Optional[str] = None,
     enable_rendering: bool = True,
+    scenario_name: str = "multi_lane",
 ):
     eval_root_dir = os.path.join(model_dir, "eval_results")
     os.makedirs(eval_root_dir, exist_ok=True)
@@ -64,11 +65,14 @@ def main(
     }
     if env_overrides:
         test_overrides.update(env_overrides)
+    scenario_spec = get_scenario_spec(scenario_name)
+    importlib.import_module(str(scenario_spec["module"]))
+    env_id = str(scenario_spec["env_id"])
     if not enable_rendering:
         test_overrides["show_trajectories"] = False
         test_overrides["warmup_render"] = False
         test_overrides["offscreen_rendering"] = False
-    env_config = get_env_config(test_overrides)
+    env_config = get_env_config_for_scenario(scenario_name, test_overrides)
 
     if not record_episodes:
         def trigger(ep_id: int) -> bool: return False
@@ -78,7 +82,7 @@ def main(
 
     # 1. Create Environment
     render_mode = "rgb_array" if enable_rendering else None
-    base_env = gym.make("multi-lane-custom-v0", render_mode=render_mode, config=env_config)
+    base_env = gym.make(env_id, render_mode=render_mode, config=env_config)
     
     env = RecordVideo(base_env, video_folder=eval_dir, episode_trigger=trigger, name_prefix="rule") if enable_rendering else base_env
 

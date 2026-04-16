@@ -224,9 +224,10 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._signal_controller: IntersectionSignalController | None = None
         self._signal_render_x = 0.0
         self._signal_render_y = 0.0
-        # Persistent signal clock across episodes (AbstractEnv.reset will reset self.time).
+        # Signal clock state. Episode start alignment is controlled by config.
         self._signal_time_global = 0.0
         self._signal_episode_base = 0.0
+        self._episodes_started = 0
 
     # ----------------- 配置 ----------------- #
     @classmethod
@@ -247,7 +248,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         lanes = int(self.config["lanes_count"])
         lane_w = float(StraightLane.DEFAULT_WIDTH)
         speed_limit = float(self.config["speed_limit"])
-        stop_x = max(float(self._target_longitudinal()), 0.0)
+        stop_x = max(float(self._goal_longitudinal()), 0.0)
         intersection_length = max(float(self.config.get("intersection_length", 50.0)), 1.0)
         road_total = max(float(self.config.get("road_length", stop_x + intersection_length)), 1.0)
 
@@ -336,21 +337,21 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         - 第一次 reset：建路 + 全局 warmup 交通流 + 插入 ego；
         - 后续 reset：保留现有路网和交通流，只移除旧 ego、清理一下车流，再插入新的 ego。
         """
+        first_reset = not getattr(self, "_did_global_warmup", False)
+        has_previous_episode = int(getattr(self, "_episodes_started", 0)) > 0
+
         # 每次都重置交通流，用于测试，以保证各个episode之间独立
         if self.config["warmup_each_episode"] is True:
             self._create_road()
             self.road.vehicles = []
             self.controlled_vehicles = []
-            self._signal_episode_base = float(self._signal_time_global)
             self._warmup(render=self.config.get("warmup_render", False))
         else:
-            first_reset = not getattr(self, "_did_global_warmup", False)
             if first_reset:
                 # ------- 第一次：建立路网 + 清空所有车辆 + 预热交通流 -------
                 self._create_road()
                 self.road.vehicles = []
                 self.controlled_vehicles = []
-                self._signal_episode_base = float(self._signal_time_global)
 
                 # 只跑环境车 warmup_time 秒
                 self._warmup(render=self.config.get("warmup_render", False))
@@ -368,10 +369,59 @@ class MultiLaneStopToIntEnv(AbstractEnv):
                 self._clear_virtual_stops()
                 self._clear_background()
 
-        # Episode local time self.time is reset by AbstractEnv; map it to persistent signal time.
+        # First episode: align to target offset (may be zero extra wait if already aligned).
+        # Later episodes: require the next target offset so start time is strictly after previous end.
+        self._advance_to_episode_start_offset(strict_next=has_previous_episode)
         self._signal_episode_base = float(self._signal_time_global)
         self._create_ego()
+        self._episodes_started += 1
         self._update_signal_virtual_stops(query_time=0.0)
+
+    def _advance_to_episode_start_offset(self, strict_next: bool) -> None:
+        """Keep background traffic evolving and align spawn time to configured signal phase offset."""
+        if not bool(self.config.get("align_ego_spawn_to_signal_offset", True)):
+            return
+        controller = getattr(self, "_signal_controller", None)
+        if controller is None:
+            return
+
+        cycle = float(sum(total for _, total in controller.signal_plan))
+        if cycle <= 1e-9:
+            return
+
+        target_tau = float(self.config.get("episode_start_phase_offset", 0.0)) % cycle
+        tau_now = (float(self._signal_time_global) + float(controller.cycle_offset)) % cycle
+        delta = (target_tau - tau_now) % cycle
+        if strict_next and delta <= 1e-9:
+            delta = cycle
+        if delta <= 1e-9:
+            return
+
+        self._simulate_background_for(delta)
+
+    def _simulate_background_for(self, seconds: float) -> None:
+        """Simulate road/background traffic for given wall-clock seconds without ego control."""
+        remain = max(float(seconds), 0.0)
+        if remain <= 0.0:
+            return
+
+        sim_freq = float(self.config["simulation_frequency"])
+        base_dt = 1.0 / sim_freq
+        base_spawn_p = float(self.config.get("spawn_probability", 0.0))
+
+        while remain > 1e-9:
+            dt = min(base_dt, remain)
+            self._update_signal_virtual_stops(query_time=None)
+            self._clear_background()
+            spawn_p = base_spawn_p * (dt / base_dt)
+            self._spawn_background(spawn_probability=spawn_p)
+            self.road.act()
+            self.road.step(dt)
+            self._signal_time_global += dt
+            remain -= dt
+
+        self._clear_background()
+        self._update_signal_virtual_stops(query_time=None)
 
     def _warmup(self, render: bool = False):
         """只跑环境车 warmup_time 秒，可以选择是否渲染出来看。"""
@@ -480,7 +530,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         ego = getattr(self, "vehicle", None)
         if ego is None:
             return False
-        stop_x = self._target_longitudinal()
+        stop_x = self._goal_longitudinal()
         dist = stop_x - float(ego.position[0])
         if dist <= 0.0:
             return True
@@ -568,6 +618,38 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             # red
             for lid in lane_ids:
                 self._ensure_virtual_stop(direction, lid)
+
+    def get_hiro_signal_features(self) -> tuple[float, float]:
+        """Return (is_green, remaining_seconds) for ego direction.
+
+        Color encoding: 0 for red/yellow, 1 for green.
+        Remaining semantics: for red add one yellow duration so red/yellow are
+        treated as one merged non-green stage.
+        """
+        controller = getattr(self, "_signal_controller", None)
+        if controller is None:
+            return 1.0, 0.0
+
+        t = float(getattr(self, "_signal_time_global", getattr(self, "time", 0.0)))
+        phase = controller.phase_at(t)
+
+        ego = getattr(self, "vehicle", None)
+        lane_id = None
+        if ego is not None:
+            li = getattr(ego, "lane_index", None)
+            if li is not None and len(li) >= 3:
+                lane_id = int(li[2])
+        direction = controller.lane_direction(lane_id)
+
+        state = str(phase.get(direction, {}).get("state", "green"))
+        remaining = float(phase.get(direction, {}).get("remaining", 0.0))
+        yellow = float(getattr(controller, "yellow", 3.0))
+
+        if state == "green":
+            return 1.0, max(remaining, 0.0)
+        if state == "red":
+            return 0.0, max(remaining + yellow, 0.0)
+        return 0.0, max(remaining, 0.0)
     
     # ----------------- RL task 定义 ----------------- #
     def _reward(self, action: Action) -> float:
@@ -601,7 +683,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         # ---------- 1) 进度奖励 ----------
         last_longi = getattr(self, "_last_longitudinal", longi)
         delta_s = max(longi - last_longi, 0.0)
-        target_long = self._target_longitudinal()
+        target_long = self._goal_longitudinal()
         route_length = max(target_long - self._start_longitudinal(), 1e-6)
         progress = np.clip(delta_s / route_length, 0.0, 1.0)
 
@@ -907,15 +989,15 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._arrival_time = None
 
     def _goal_reached(self) -> bool:
-        """在目标车道且 x >= target_longitudinal（默认路口前）"""
+        """在目标车道且 x >= goal_longitudinal（默认路口前）"""
         if self.vehicle.lane_index[2] != self._target_lane_id():
             return False
         return self._goal_longitudinal_reached()
     
     def _goal_longitudinal_reached(self) -> bool:
-        """x >= target_longitudinal（不要求在目标车道）"""
+        """x >= goal_longitudinal（不要求在目标车道）"""
         longi = float(self.vehicle.position[0])
-        return longi >= self._target_longitudinal()
+        return longi >= self._goal_longitudinal()
     
     def _punctual_factor(self, t: float) -> float:
         """根据到达时间 t 计算 [0,1] 上的准时性系数"""
@@ -960,7 +1042,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
     def _update_goal_highlight_regions(self):
         """Define render-only goal zone metadata (no physical road entity)."""
-        target_x = self._target_longitudinal()
+        target_x = self._goal_longitudinal()
         length = 10.0
         half_len = max(length, 0.1) * 0.5
         x0 = target_x - half_len
@@ -1033,10 +1115,10 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         # Stop is fixed at x=0 for this scenario.
         return 0.0
 
-    def _target_longitudinal(self) -> float:
+    def _goal_longitudinal(self) -> float:
         cfg = self.config
         default_target = float(cfg.get("road_length", 500.0)) - float(cfg.get("intersection_buffer", 20.0))
-        return float(cfg.get("target_longitudinal", cfg.get("goal_longitudinal", default_target)))
+        return float(cfg.get("goal_longitudinal", default_target))
 
     def _target_lane_id(self) -> int:
         cfg = self.config

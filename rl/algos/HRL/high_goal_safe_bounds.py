@@ -132,9 +132,16 @@ class HighGoalSafeBoundsCalculator:
         kin_flat = np.asarray(high_obs_np[:, 1:], dtype=np.float32)
         total_dim = int(kin_flat.shape[1])
         if total_dim % self.feat_dim != 0:
-            raise ValueError(
-                f"high_obs kinematics dim {total_dim} is not divisible by feat_dim {self.feat_dim}"
-            )
+            # Backward/forward compatibility:
+            # high_obs may append 2-dim signal features at tail:
+            # [t_remaining] + [kinematics_flat] + [signal_color, signal_remaining].
+            if total_dim > 2 and (total_dim - 2) % self.feat_dim == 0:
+                kin_flat = kin_flat[:, :-2]
+                total_dim = int(kin_flat.shape[1])
+            else:
+                raise ValueError(
+                    f"high_obs kinematics dim {total_dim} is not divisible by feat_dim {self.feat_dim}"
+                )
         n_veh = total_dim // self.feat_dim
         return kin_flat.reshape(high_obs_np.shape[0], n_veh, self.feat_dim)
 

@@ -39,6 +39,8 @@ class HIROPolicyRunner:
         self.last_action_post_safety = np.zeros(0, dtype=np.float32)
         self.last_goal_action = np.zeros(0, dtype=np.float32)
         self.high_goal_safe_bounds: Optional[HighGoalSafeBoundsCalculator] = None
+        self.punctual_time_target = 0.0
+        self.goal_longitudinal_default = 0.0
 
     def init_from_env(self, env, obs0: np.ndarray, intrinsic_coef: float):
         keep = ("x", "y", "vx", "vy")
@@ -48,6 +50,8 @@ class HIROPolicyRunner:
         self.local_kin_flat_dim = self.n_veh_local * self.feat_dim
         self.ego_dim = int(len(self.ego_feature_idx))
         cfg = getattr(env.unwrapped, "config", getattr(env, "config", {}))
+        self.punctual_time_target = float(cfg.get("punctual_time_target", cfg.get("duration", 0.0)))
+        self.goal_longitudinal_default = float(cfg.get("goal_longitudinal", cfg.get("road_length", 0.0)))
         lanes, lane_w = int(cfg["lanes_count"]), float(cfg.get("lane_width", 4.0))
         self.lane_center_ys = (np.arange(lanes, dtype=np.float32) * lane_w).astype(np.float32)
         self.dt = 1.0 / float(cfg.get("policy_frequency", 10.0))
@@ -170,7 +174,8 @@ class HIROPolicyRunner:
 
     def _sample_goal(self, obs: np.ndarray, kin: np.ndarray, env=None):
         ego_sub = self._ego_sub(kin)
-        goal_action, _ = self.high_model.predict(np.asarray(obs, dtype=np.float32), deterministic=True)
+        high_obs = self._build_high_obs(np.asarray(obs, dtype=np.float32), env)
+        goal_action, _ = self.high_model.predict(high_obs, deterministic=True)
         goal_action = np.asarray(goal_action, dtype=np.float32).reshape(1, -1)
         self.last_goal_action = np.asarray(goal_action[0], dtype=np.float32).copy()
         goal_phys = utils.goal_action_to_abs(ego_sub[None, :], goal_action, self.lane_center_ys)
@@ -184,6 +189,41 @@ class HIROPolicyRunner:
             unwrapped = env.unwrapped
             if hasattr(unwrapped, "set_hiro_goal"):
                 unwrapped.set_hiro_goal(self.goal_phys)
+
+    def _get_signal_features(self, env) -> np.ndarray:
+        if env is None:
+            return np.array([-1.0, -1.0], dtype=np.float32)
+        base = getattr(env, "unwrapped", env)
+        fn = getattr(base, "get_hiro_signal_features", None)
+        if callable(fn):
+            try:
+                color, remain = fn()
+                return np.array([float(color), float(remain)], dtype=np.float32)
+            except Exception:
+                return np.array([-1.0, -1.0], dtype=np.float32)
+        return np.array([-1.0, -1.0], dtype=np.float32)
+
+    def _get_goal_longitudinal(self, env) -> float:
+        if env is None:
+            return float(self.goal_longitudinal_default)
+        base = getattr(env, "unwrapped", env)
+        fn = getattr(base, "_goal_longitudinal", None)
+        if callable(fn):
+            try:
+                return float(fn())
+            except Exception:
+                return float(self.goal_longitudinal_default)
+        return float(self.goal_longitudinal_default)
+
+    def _build_high_obs(self, obs: np.ndarray, env=None) -> np.ndarray:
+        arr = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+        t_remaining = (float(self.punctual_time_target) - arr[:, :1]).astype(np.float32)
+        kin_flat = np.asarray(arr[:, 1:], dtype=np.float32).copy()
+        ego_x = float(kin_flat[0, self.idx_x])
+        goal_x = self._get_goal_longitudinal(env)
+        kin_flat[0, self.idx_x] = float(goal_x - ego_x)
+        signal = self._get_signal_features(env).reshape(1, 2)
+        return np.concatenate([t_remaining, kin_flat, signal], axis=1).astype(np.float32)
 
     def act(self, env, obs: np.ndarray) -> np.ndarray:
         _, kin, kin_flat = self._split(obs)
@@ -200,6 +240,7 @@ class HIROPolicyRunner:
         ego_sub = self._ego_sub(kin)
         t_norm = np.array([self.c / float(self.hi)], dtype=np.float32)
         goal_rel = (self.goal_phys - ego_sub).astype(np.float32)
+        signal = self._get_signal_features(env)
         
         local_kin_flat = np.asarray(kin_flat[0, :self.local_kin_flat_dim], dtype=np.float32).copy()
 
@@ -210,7 +251,7 @@ class HIROPolicyRunner:
                 idx_y = int(self.feature_names.index("y"))
                 local_kin_flat[idx_x] = 0.0
                 local_kin_flat[idx_y] = 0.0
-        low_obs = np.concatenate([t_norm, local_kin_flat, goal_rel]).astype(np.float32)
+        low_obs = np.concatenate([t_norm, local_kin_flat, goal_rel, signal]).astype(np.float32)
         
         action, _ = self.low_model.predict(low_obs, deterministic=True)
         action = np.asarray(action, dtype=np.float32)

@@ -192,6 +192,9 @@ class HIROSAC:
         # ---- 从env中获取的必要变量 --- #
         env_cfg = env.get_attr("config", indices=0)[0]
         self.high_use_acc_only_comfort = bool(env_cfg.get("high_use_acc_only_comfort", True))
+        self.punctual_time_target = float(env_cfg.get("punctual_time_target", env_cfg.get("duration", 0.0)))
+        self.goal_longitudinal = float(env_cfg.get("goal_longitudinal", env_cfg.get("road_length", 0.0)))
+        self.ego_x_idx = int(self.feature_names.index("x"))
         # self.v_min, self.v_max = 8.0, float(env_cfg["speed_limit"])
         self.v_min, self.v_max = 0.0, float(env_cfg["speed_limit"])
         self.dt = 1.0 / float(env_cfg["policy_frequency"])
@@ -202,7 +205,8 @@ class HIROSAC:
         self.lane_center_ys = (np.arange(lanes, dtype=np.float32) * lane_w).astype(np.float32)
 
         # ----- 定义 Spaces -----  #
-        high_obs_dim = self.kin_flat_dim + 1
+        high_obs_dim = self.kin_flat_dim + 1 + 2
+        self.high_obs_dim = int(high_obs_dim)
         high_obs_space = gym.spaces.Box(-np.inf, np.inf, shape=(high_obs_dim,), dtype=np.float32)
 
         t_h = float(self.cfg.high_interval) * self.dt
@@ -250,7 +254,8 @@ class HIROSAC:
             vy_idx=int(self.feature_names.index("vy")),
         )
 
-        low_obs_dim = self.local_kin_flat_dim + self.ego_dim + 1
+        low_obs_dim = self.local_kin_flat_dim + self.ego_dim + 1 + 2
+        self.low_obs_dim = int(low_obs_dim)
         low_obs_space = gym.spaces.Box(-np.inf, np.inf, shape=(low_obs_dim,), dtype=np.float32)
         low_act_space = env.action_space
 
@@ -434,10 +439,52 @@ class HIROSAC:
     # ------------------------------------------------------------------
     # 内部工具函数：obs 处理
     # ------------------------------------------------------------------
-    def _build_high_obs(self, obs: np.ndarray) -> np.ndarray:
-        return np.asarray(obs, dtype=np.float32)
+    def _get_signal_features(self) -> np.ndarray:
+        """Get per-env traffic-signal features [is_green, remaining_seconds]."""
+        n = int(self.n_envs)
+        out = np.zeros((n, 2), dtype=np.float32)
+        out[:] = -1.0
 
-    def _build_low_obs(self, t_rel: np.ndarray, kin_flat: np.ndarray, kin: np.ndarray, goal_phys: np.ndarray) -> np.ndarray:
+        if not hasattr(self.env, "env_method"):
+            return out
+
+        try:
+            vals = self.env.env_method("get_hiro_signal_features")
+        except Exception:
+            return out
+
+        if vals is None:
+            return out
+        for i, v in enumerate(vals):
+            if i >= n:
+                break
+            try:
+                color, remain = v
+                out[i, 0] = float(color)
+                out[i, 1] = float(remain)
+            except Exception:
+                continue
+        return out
+
+    def _get_goal_longitudinal(self) -> np.ndarray:
+        """Get per-env goal x for constructing remaining-x high observation."""
+        n = int(self.n_envs)
+        # Avoid calling private env methods through wrappers (Monitor/OrderEnforcing)
+        # in SubprocVecEnv workers on Windows spawn mode.
+        return np.full((n,), float(self.goal_longitudinal), dtype=np.float32)
+
+    def _build_high_obs(self, obs: np.ndarray, signal_feat: np.ndarray) -> np.ndarray:
+        arr = np.asarray(obs, dtype=np.float32)
+        t_cur = arr[:, :1]
+        t_remaining = (float(self.punctual_time_target) - t_cur).astype(np.float32)
+        kin_flat = np.asarray(arr[:, 1:], dtype=np.float32).copy()
+        ego_x = kin_flat[:, self.ego_x_idx]
+        goal_x = self._get_goal_longitudinal()
+        kin_flat[:, self.ego_x_idx] = (goal_x - ego_x).astype(np.float32)
+        sig = np.asarray(signal_feat, dtype=np.float32).reshape(arr.shape[0], 2)
+        return np.concatenate([t_remaining, kin_flat, sig], axis=1).astype(np.float32)
+
+    def _build_low_obs(self, t_rel: np.ndarray, kin_flat: np.ndarray, kin: np.ndarray, goal_phys: np.ndarray, signal_feat: np.ndarray) -> np.ndarray:
         """
         低层观测 = t_norm + local_kin_flat + goal_rel
         接收绝对坐标系 goal_phys，根据当前 ego 状态计算 goal_rel
@@ -456,7 +503,8 @@ class HIROSAC:
             idx_y = int(self.feature_names.index("y"))
             local_kin_flat[:, idx_x] = 0.0
             local_kin_flat[:, idx_y] = 0.0
-        return np.concatenate([t_norm, np.asarray(local_kin_flat, dtype=np.float32), goal_rel], axis=1)
+        sig = np.asarray(signal_feat, dtype=np.float32).reshape(local_kin_flat.shape[0], 2)
+        return np.concatenate([t_norm, np.asarray(local_kin_flat, dtype=np.float32), goal_rel, sig], axis=1)
 
     def _low_target_action_filter(self, low_obs: np.ndarray, action: np.ndarray) -> np.ndarray:
         """
@@ -558,7 +606,7 @@ class HIROSAC:
         seg_id = np.zeros(n_envs, dtype=np.int64)
         seg_counter = 0
 
-        high_obs_start = np.zeros_like(obs, dtype=np.float32)
+        high_obs_start = np.zeros((n_envs, int(self.high_obs_dim)), dtype=np.float32)
         goal_action = np.zeros((n_envs, int(self.high_agent.action_space.shape[0])), dtype=np.float32)
         goal_buffer_action = np.zeros_like(goal_action)
         goal_phys = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
@@ -577,7 +625,7 @@ class HIROSAC:
         opc_enabled = bool(getattr(self, "use_off_policy_correction", False))
         if opc_enabled:
             low_act_dim = int(np.prod(env.action_space.shape))
-            low_obs_dim = int(1 + self.local_kin_flat_dim + self.ego_dim)
+            low_obs_dim = int(1 + self.local_kin_flat_dim + self.ego_dim + 2)
             opc_low_obs_seq = np.zeros((n_envs, hi, low_obs_dim), dtype=np.float32)
             opc_low_act_seq = np.zeros((n_envs, hi, low_act_dim), dtype=np.float32)
         else:
@@ -591,8 +639,9 @@ class HIROSAC:
         while self.total_timesteps < total_timesteps:
 
             # === 1.1 High Level Decision ===
-            high_obs = self._build_high_obs(obs)
-            _, kin, kin_flat = utils.split_time_kinematics(high_obs, self.n_veh, self.feat_dim)
+            signal_feat = self._get_signal_features()
+            high_obs = self._build_high_obs(obs, signal_feat)
+            _, kin, kin_flat = utils.split_time_kinematics(obs, self.n_veh, self.feat_dim)
 
             # step a high interval for required envs
             if need_high.any():
@@ -635,7 +684,7 @@ class HIROSAC:
                 need_high[idx] = False
 
             # === 1.2 Low Level Decision ===
-            low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys)
+            low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys, signal_feat)
             low_safety_clipped = np.zeros(n_envs, dtype=bool)
             
             if self.low_level_type == "rule_based":
@@ -670,8 +719,9 @@ class HIROSAC:
             done = np.asarray(done, dtype=bool)
 
             next_obs_tr = self._terminal_obs(next_obs, done, infos)
-            next_high_obs = self._build_high_obs(next_obs_tr)
-            _, kin_next, kin_flat_next = utils.split_time_kinematics(next_high_obs, self.n_veh, self.feat_dim)
+            signal_feat_next = self._get_signal_features()
+            next_high_obs = self._build_high_obs(next_obs_tr, signal_feat_next)
+            _, kin_next, kin_flat_next = utils.split_time_kinematics(next_obs_tr, self.n_veh, self.feat_dim)
 
             # === 1.3 Calculate Rewards ===
             r_components = [info.get("reward_components", {}) for info in infos]
@@ -723,7 +773,7 @@ class HIROSAC:
                 low_comp_sums.setdefault("safety_violation_penalty", np.zeros(n_envs, dtype=np.float32))[:] += (-safety_penalty)
 
             # === 1.4 Low Level Store & Train ===
-            next_low_obs = self._build_low_obs(c + 1, kin_flat_next, kin_next, goal_phys)
+            next_low_obs = self._build_low_obs(c + 1, kin_flat_next, kin_next, goal_phys, signal_feat_next)
             done_low = is_last_step.astype(np.bool_)
             ego_now_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
             ego_next_sub = utils.extract_ego_substate(kin_next, self.ego_feature_idx)
