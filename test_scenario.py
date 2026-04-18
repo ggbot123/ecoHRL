@@ -33,6 +33,7 @@ RENDER_MODE = "human"
 # RENDER_MODE = "rgb_array"
 FORCE_DISABLE_DUMMY_SDL = True
 EXPLICIT_RENDER_EACH_STEP = True
+EGO_HIGHLIGHT_COLOR = (255, 215, 0)  # Yellow
 
 
 # Common overrides used by compatible scenarios
@@ -41,7 +42,8 @@ COMMON_OVERRIDES: Dict[str, Any] = {
     # Keep a single warmup for the first reset, then continue across episodes.
     "warmup_each_episode": False,
     "show_trajectories": True,
-    "warmup_render": False,
+    # "warmup_render": False,
+    "warmup_render": True,
     "offscreen_rendering": False,
     "screen_width": 1800,
     "screen_height": 320,
@@ -79,7 +81,7 @@ SCENARIO_OVERRIDES_BY_ENV_ID: Dict[str, Dict[str, Any]] = {
         ],
         "signal_cycle_offset": 0.0,
         "align_ego_spawn_to_signal_offset": True,
-        "episode_start_phase_offset": 0.0,
+        "episode_start_phase_offset": 25.0,
     },
     "multi-lane-custom-v0": {
         "initial_lane_id": "random",
@@ -87,6 +89,16 @@ SCENARIO_OVERRIDES_BY_ENV_ID: Dict[str, Dict[str, Any]] = {
         "goal_longitudinal": 400.0,
     },
 }
+
+
+def _set_vehicle_color_yellow(vehicle) -> None:
+    """Best-effort ego highlight for renderer implementations that honor `color`."""
+    if vehicle is None:
+        return
+    try:
+        vehicle.color = EGO_HIGHLIGHT_COLOR
+    except Exception:
+        pass
 
 
 def register_scenario(module_path: str) -> None:
@@ -118,10 +130,12 @@ def switch_ego_to_idm(env: gym.Env) -> None:
         raise RuntimeError("Ego vehicle is not initialized after reset().")
 
     if isinstance(ego_old, IDMVehicle):
+        _set_vehicle_color_yellow(ego_old)
         return
 
     ego_new = NormalIDMVehicle.create_from(ego_old)
     ego_new.vid = getattr(ego_old, "vid", -1)
+    _set_vehicle_color_yellow(ego_new)
 
     try:
         idx = base_env.road.vehicles.index(ego_old)
@@ -137,6 +151,33 @@ def switch_ego_to_idm(env: gym.Env) -> None:
         base_env.action_type.controlled_vehicle = ego_new
     if getattr(base_env, "observation_type", None) is not None:
         base_env.observation_type.observer_vehicle = ego_new
+
+
+def _signal_cycle_length(base_env: gym.Env) -> float | None:
+    controller = getattr(base_env, "_signal_controller", None)
+    if controller is None:
+        return None
+    plan = getattr(controller, "signal_plan", None)
+    if not isinstance(plan, list) or not plan:
+        return None
+    return float(sum(total for _, total in plan))
+
+
+def _signal_phase_tau(base_env: gym.Env) -> float | None:
+    controller = getattr(base_env, "_signal_controller", None)
+    if controller is None:
+        return None
+    cycle = _signal_cycle_length(base_env)
+    if cycle is None or cycle <= 1e-9:
+        return None
+    t_global = float(getattr(base_env, "_signal_time_global", 0.0))
+    cycle_offset = float(getattr(controller, "cycle_offset", 0.0))
+    return float((t_global + cycle_offset) % cycle)
+
+
+def _phase_err_mod(a: float, b: float, cycle: float) -> float:
+    d = abs(a - b) % cycle
+    return float(min(d, cycle - d))
 
 
 def set_fixed_global_camera(env: gym.Env) -> None:
@@ -263,6 +304,12 @@ def run_n_episodes(
     cfg = build_env_config(env_id, env_overrides)
     # Ensure only the first reset triggers warmup in this run.
     cfg["warmup_each_episode"] = False
+
+    if env_id == "multi-lane-stop-to-int-v0":
+        # Explicitly enable fixed phase-aligned ego spawn in this test script.
+        cfg["align_ego_spawn_to_signal_offset"] = True
+        cfg.setdefault("episode_start_phase_offset", 0.0)
+
     sim_dt = 1.0 / float(cfg["policy_frequency"])
 
     env = gym.make(
@@ -281,6 +328,19 @@ def run_n_episodes(
             reset_seed = seed if ep_idx == 0 else None
             obs, info = env.reset(seed=reset_seed)
             switch_ego_to_idm(env)
+            base_env = env.unwrapped
+
+            # Optional sanity check: ego should be spawned at the configured phase offset.
+            if env_id == "multi-lane-stop-to-int-v0" and bool(cfg.get("align_ego_spawn_to_signal_offset", False)):
+                cycle = _signal_cycle_length(base_env)
+                tau = _signal_phase_tau(base_env)
+                target = float(cfg.get("episode_start_phase_offset", 0.0))
+                if cycle is not None and tau is not None:
+                    err = _phase_err_mod(tau, target % cycle, cycle)
+                    print(
+                        f"[phase] ep={ep_idx + 1} tau={tau:.3f}s target={(target % cycle):.3f}s "
+                        f"cycle={cycle:.3f}s err={err:.6f}s"
+                    )
 
             # Sample queue length at episode start.
             q0 = compute_straight_queue_length(env)
@@ -321,7 +381,6 @@ def run_n_episodes(
                 if sleep_s > 0.0:
                     time.sleep(sleep_s)
 
-            base_env = env.unwrapped
             final_lane = None
             if getattr(base_env, "vehicle", None) is not None:
                 lane_index = getattr(base_env.vehicle, "lane_index", None)

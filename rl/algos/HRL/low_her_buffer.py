@@ -33,6 +33,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
     _INFO_KEY_EGO_NOW = "low_ego_now"
     _INFO_KEY_EGO_NEXT = "low_ego_next"
     _INFO_KEY_R_EXT = "low_r_ext"
+    _INFO_KEY_SKIP_REPLAY = "skip_replay"
 
     def __init__(
         self,
@@ -94,6 +95,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         self._ego_now = np.zeros((self.buffer_size, self.n_envs, self.ego_dim), dtype=np.float32)
         self._ego_next = np.zeros((self.buffer_size, self.n_envs, self.ego_dim), dtype=np.float32)
         self._r_ext = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self._valid = np.zeros((self.buffer_size, self.n_envs), dtype=bool)
         self._seg_index: dict[int, dict[tuple[int, int], int]] = defaultdict(dict)
 
         self.rng = np.random.default_rng()
@@ -128,6 +130,18 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                         self._seg_index.pop(old_seg, None)
 
             info = infos[env_i] if env_i < len(infos) else {}
+            is_valid = not bool(info.get(self._INFO_KEY_SKIP_REPLAY, False))
+            self._valid[pos, env_i] = is_valid
+
+            if not is_valid:
+                self._seg_id[pos, env_i] = -1
+                self._t_in_seg[pos, env_i] = 0
+                self._ego_start[pos, env_i] = 0.0
+                self._ego_now[pos, env_i] = 0.0
+                self._ego_next[pos, env_i] = 0.0
+                self._r_ext[pos, env_i] = 0.0
+                continue
+
             self._seg_id[pos, env_i] = int(info.get(self._INFO_KEY_SEG_ID, -1))
             self._t_in_seg[pos, env_i] = int(info.get(self._INFO_KEY_T_IN_SEG, 0))
 
@@ -156,17 +170,23 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                 self._seg_index[new_seg][(pos, env_i)] = int(self._t_in_seg[pos, env_i])
 
     def _sample_batch_indices(self, batch_size: int) -> tuple[np.ndarray, np.ndarray]:
-        if self.optimize_memory_usage:
-            if self.full:
-                batch_inds = (self.rng.integers(1, self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
-            else:
-                batch_inds = self.rng.integers(0, self.pos, size=batch_size)
-        else:
-            upper_bound = self.buffer_size if self.full else self.pos
-            batch_inds = self.rng.integers(0, upper_bound, size=batch_size)
+        upper_bound = self.buffer_size if self.full else self.pos
+        if upper_bound <= 0:
+            raise RuntimeError("Replay buffer is empty")
 
-        env_indices = self.rng.integers(0, self.n_envs, size=batch_size)
-        return batch_inds.astype(np.int64), env_indices.astype(np.int64)
+        valid_mask = np.array(self._valid[:upper_bound], copy=True)
+        if self.optimize_memory_usage and self.full:
+            valid_mask[int(self.pos), :] = False
+
+        valid_pairs = np.argwhere(valid_mask)
+        if valid_pairs.shape[0] == 0:
+            raise RuntimeError("Replay buffer has no valid low-level transitions to sample")
+
+        picks = self.rng.integers(0, int(valid_pairs.shape[0]), size=batch_size)
+        chosen = valid_pairs[picks]
+        batch_inds = chosen[:, 0].astype(np.int64)
+        env_indices = chosen[:, 1].astype(np.int64)
+        return batch_inds, env_indices
 
     def _get_next_obs_at(self, row: int, col: int) -> np.ndarray:
         if self.optimize_memory_usage:

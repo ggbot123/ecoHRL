@@ -161,6 +161,12 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "initial_lane_id": "random",
     "warmup_time": 100.0,
     "warmup_each_episode": False,
+    # Defer long episode-start offset alignment into multiple lightweight env.step calls.
+    "inter_episode_as_steps": False,
+    # <= 0 means use one policy step duration (1 / policy_frequency).
+    "inter_episode_step_seconds": 0.0,
+    # Use zero observation during deferred inter-episode simulation steps.
+    "inter_episode_zero_obs": True,
     "ego_clear_radius": 20.0,
     # "ego_clear_radius": 10.0,
     # "ego_clear_radius": "auto",
@@ -256,6 +262,9 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
             "signal_cycle_offset": 0.0,
             "align_ego_spawn_to_signal_offset": True,
             "episode_start_phase_offset": 25.0,
+            "inter_episode_as_steps": True,
+            "inter_episode_step_seconds": 0.1,
+            "inter_episode_zero_obs": True,
         },
     },
 }

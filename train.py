@@ -286,8 +286,8 @@ if __name__ == "__main__":
         hiro_low_target_entropy="auto",
         hiro_low_target_entropy_scale=1,
 
-        # run_name=f"hiro_260416_lowonly_reUni_Rainbow_amax3_dmin15_10_Lane1",
-        run_name=f"hiro_260416_lowonly_reUni_amax3_dmin15_10_newEnv",
-        # scenario_name="multi_lane",
-        scenario_name="multi_lane_stop_to_int",
+        run_name=f"hiro_260416_lowonly_reUni_Rainbow_amax3_dmin15_10_Lane1",
+        # run_name=f"hiro_260416_lowonly_reUni_amax3_dmin15_10_newEnv",
+        scenario_name="multi_lane",
+        # scenario_name="multi_lane_stop_to_int",
     )

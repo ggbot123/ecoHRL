@@ -634,9 +634,11 @@ class HIROSAC:
             opc_low_act_seq = None
 
         callback.on_training_start(locals(), globals())
+        obs_skip_mask = np.zeros(n_envs, dtype=bool)
 
         # ========== 1. Main Loop ========== #
         while self.total_timesteps < total_timesteps:
+            active_obs_mask = ~obs_skip_mask
 
             # === 1.1 High Level Decision ===
             signal_feat = self._get_signal_features()
@@ -644,8 +646,9 @@ class HIROSAC:
             _, kin, kin_flat = utils.split_time_kinematics(obs, self.n_veh, self.feat_dim)
 
             # step a high interval for required envs
-            if need_high.any():
-                idx = np.flatnonzero(need_high)
+            need_high_now = need_high & active_obs_mask
+            if need_high_now.any():
+                idx = np.flatnonzero(need_high_now)
 
                 if high_policy is not None:
                     # Use custom high-level policy (e.g. random sampler)
@@ -685,13 +688,16 @@ class HIROSAC:
 
             # === 1.2 Low Level Decision ===
             low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys, signal_feat)
+            if obs_skip_mask.any():
+                low_obs[obs_skip_mask] = 0.0
             low_safety_clipped = np.zeros(n_envs, dtype=bool)
             
             if self.low_level_type == "rule_based":
                 low_action_raw = self.low_agent.act(low_obs, goal_phys)
                 low_action = self.low_agent.apply_safety_layer(low_obs, goal_phys, low_action_raw)
                 low_safety_clipped = np.any(np.abs(low_action - low_action_raw) > 1e-6, axis=1)
-                low_safety_clip_count += low_safety_clipped.astype(np.int32)
+                if active_obs_mask.any():
+                    low_safety_clip_count[active_obs_mask] += low_safety_clipped[active_obs_mask].astype(np.int32)
                 low_buffer_action = low_action.copy()
             elif self.low_level_type == "sac":
                 if train_low:
@@ -703,20 +709,38 @@ class HIROSAC:
                     low_action_raw = low_action.copy()
                     low_action = self.low_safety.apply_safety_layer(low_obs, goal_phys, low_action)
                     low_safety_clipped = np.any(np.abs(low_action - low_action_raw) > 1e-6, axis=1)
-                    low_safety_clip_count += low_safety_clipped.astype(np.int32)
+                    if active_obs_mask.any():
+                        low_safety_clip_count[active_obs_mask] += low_safety_clipped[active_obs_mask].astype(np.int32)
                     if self.low_sac_impl == "safety_sac" or self.low_sac_impl == "auto":
                         low_buffer_action = low_action.copy()
             else:
                 raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
-            if opc_enabled:
+            if obs_skip_mask.any():
+                low_action = np.asarray(low_action, dtype=np.float32)
+                low_buffer_action = np.asarray(low_buffer_action, dtype=np.float32)
+                low_action[obs_skip_mask] = 0.0
+                low_buffer_action[obs_skip_mask] = 0.0
+                low_safety_clipped[obs_skip_mask] = False
+
+            if opc_enabled and active_obs_mask.any():
                 # record (o_i, a_i) for off-policy correction
-                opc_low_obs_seq[np.arange(n_envs), c] = low_obs
-                opc_low_act_seq[np.arange(n_envs), c] = low_buffer_action
+                idx_active = np.flatnonzero(active_obs_mask)
+                opc_low_obs_seq[idx_active, c[idx_active]] = low_obs[idx_active]
+                opc_low_act_seq[idx_active, c[idx_active]] = low_buffer_action[idx_active]
 
             next_obs, reward_env, done, infos = env.step(low_action)
             reward_env = np.asarray(reward_env, dtype=np.float32)
             done = np.asarray(done, dtype=bool)
+            infos = list(infos) if isinstance(infos, (list, tuple)) else [{} for _ in range(n_envs)]
+            if len(infos) != n_envs:
+                infos = [{} for _ in range(n_envs)]
+            infos = [info if isinstance(info, dict) else {} for info in infos]
+
+            skip_replay_mask = np.asarray([bool(info.get("skip_replay", False)) for info in infos], dtype=bool)
+            replay_mask = ~skip_replay_mask
+            next_obs_is_dummy = np.asarray([bool(info.get("next_obs_is_dummy", False)) for info in infos], dtype=bool)
+            replay_count = int(np.sum(replay_mask))
 
             next_obs_tr = self._terminal_obs(next_obs, done, infos)
             signal_feat_next = self._get_signal_features()
@@ -729,65 +753,69 @@ class HIROSAC:
             # High-level reward policy switch:
             # True  -> replace mixed comfort (acc+jerk) with acc-only comfort contribution
             # False -> keep env extrinsic reward unchanged
+            replay_mask_f = replay_mask.astype(np.float32)
             if self.high_use_acc_only_comfort:
-                comfort_mixed = np.asarray([rc.get("comfort_reward", 0.0) for rc in r_components], dtype=np.float32)
+                comfort_mixed = np.asarray([rc.get("comfort_reward", 0.0) for rc in r_components], dtype=np.float32) * replay_mask_f
                 comfort_acc_only = np.asarray(
                     [rc.get("comfort_reward_acc_only_for_high", rc.get("comfort_reward", 0.0)) for rc in r_components],
                     dtype=np.float32,
-                )
-                high_ret += reward_env - comfort_mixed + comfort_acc_only
+                ) * replay_mask_f
+                high_ret += reward_env * replay_mask_f - comfort_mixed + comfort_acc_only
             else:
-                high_ret += reward_env
+                high_ret += reward_env * replay_mask_f
 
-            punctual = np.asarray([rc.get("punctual_reward", 0.0) for rc in r_components], dtype=np.float32)
-            low_reward_ext = reward_env - punctual
+            punctual = np.asarray([rc.get("punctual_reward", 0.0) for rc in r_components], dtype=np.float32) * replay_mask_f
+            low_reward_ext = reward_env * replay_mask_f - punctual
             if str(getattr(self.cfg, "intrinsic_type", "l2")).lower() == "huber_shaping":
-                progress = np.asarray([rc.get("progress_reward", 0.0) for rc in r_components], dtype=np.float32)
+                progress = np.asarray([rc.get("progress_reward", 0.0) for rc in r_components], dtype=np.float32) * replay_mask_f
                 low_reward_ext = low_reward_ext - progress
 
             safety_penalty_coef = float(getattr(self.cfg, "low_safety_violation_penalty", 0.0))
-            safety_penalty = np.where(low_safety_clipped, safety_penalty_coef, 0.0).astype(np.float32)
+            safety_penalty = np.where(replay_mask & low_safety_clipped, safety_penalty_coef, 0.0).astype(np.float32)
             low_reward_ext = low_reward_ext - safety_penalty
 
             # calculate intrinsic reward
-            is_last_step = (c == hi - 1) | done
+            is_last_step = ((c == hi - 1) | done) & replay_mask
             intrinsic, goal_err, intrinsic_unw = self._compute_intrinsic(kin, kin_next, goal_phys, ego_start, is_last_step)
+            intrinsic[~replay_mask] = 0.0
             if is_last_step.any():
                 idx_last = np.flatnonzero(is_last_step)
                 goal_err_all[idx_last] = goal_err[idx_last]
                 intrinsic_unweighted[idx_last] = intrinsic_unw[idx_last]
 
             low_reward_total = low_reward_ext + intrinsic
-            low_ret += low_reward_total
-            low_len += 1
+            if replay_mask.any():
+                low_ret[replay_mask] += low_reward_total[replay_mask]
+                low_len[replay_mask] += 1
 
             # record logs in callbacks
             for i, rc in enumerate(r_components):
+                if not replay_mask[i]:
+                    continue
                 for name, val in rc.items():
                     if name == "punctual_reward":
                         continue
                     low_comp_sums.setdefault(name, np.zeros(n_envs, dtype=np.float32))[i] += float(val)
             if is_last_step.any():
                 low_comp_sums.setdefault("intrinsic_reward", np.zeros(n_envs, dtype=np.float32))[is_last_step] += intrinsic[is_last_step]
-            if np.any(safety_penalty > 0.0):
-                low_comp_sums.setdefault("safety_violation_penalty", np.zeros(n_envs, dtype=np.float32))[:] += (-safety_penalty)
+            if np.any((safety_penalty > 0.0) & replay_mask):
+                low_comp_sums.setdefault("safety_violation_penalty", np.zeros(n_envs, dtype=np.float32))[replay_mask] += (-safety_penalty[replay_mask])
 
             # === 1.4 Low Level Store & Train ===
             next_low_obs = self._build_low_obs(c + 1, kin_flat_next, kin_next, goal_phys, signal_feat_next)
+            if next_obs_is_dummy.any():
+                next_low_obs[next_obs_is_dummy] = 0.0
             done_low = is_last_step.astype(np.bool_)
             ego_now_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
             ego_next_sub = utils.extract_ego_substate(kin_next, self.ego_feature_idx)
 
-            low_infos = infos
+            low_infos = [dict(info) for info in infos]
             if done_low.any():
-                low_infos = [dict(info) for info in infos]
                 for i in np.flatnonzero(done_low):
                     low_infos[i]["terminal_observation"] = next_low_obs[i]
 
             if train_low and self.low_level_type == "sac":
-                if low_infos is infos:
-                    low_infos = [dict(info) for info in infos]
-                for i in range(n_envs):
+                for i in np.flatnonzero(replay_mask):
                     low_infos[i]["low_seg_id"] = int(seg_id[i])
                     low_infos[i]["low_t_in_seg"] = int(c[i])
                     low_infos[i]["low_ego_start"] = np.asarray(ego_start[i], dtype=np.float32)
@@ -795,24 +823,26 @@ class HIROSAC:
                     low_infos[i]["low_ego_next"] = np.asarray(ego_next_sub[i], dtype=np.float32)
                     low_infos[i]["low_r_ext"] = float(low_reward_ext[i])
 
-            if train_low and self.low_level_type == "sac":
+            if train_low and self.low_level_type == "sac" and replay_mask.any():
+                reward_for_store = (low_reward_ext if self.low_use_her else low_reward_total).astype(np.float32)
                 self.low_agent.store_transition(
                     low_obs,
                     low_buffer_action,
                     next_low_obs,
-                    (low_reward_ext if self.low_use_her else low_reward_total).astype(np.float32),
+                    reward_for_store,
                     done_low,
                     low_infos,
                 )
-                self.low_agent.num_timesteps += n_envs
+                self.low_agent.num_timesteps += int(replay_count)
                 if self.low_level_type == "sac":
                     self.low_agent.train_if_needed()
 
-            self.total_timesteps += n_envs
+            self.total_timesteps += replay_count
 
-            callback.update_locals(locals())
-            if callback.on_step() is False:
-                break
+            if replay_count > 0:
+                callback.update_locals(locals())
+                if callback.on_step() is False:
+                    break
 
             # === 1.5. High Level Store & Train ===
             if done_low.any():
@@ -863,8 +893,9 @@ class HIROSAC:
 
                 c[idx_end] = 0
 
-            c[~done_low] += 1
+            c[replay_mask & (~done_low)] += 1
             obs = next_obs
+            obs_skip_mask = next_obs_is_dummy
         
         callback.on_training_end()
         print(f"[HIROSAC] 训练结束: env_steps={self.total_timesteps}")

@@ -228,6 +228,8 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._signal_time_global = 0.0
         self._signal_episode_base = 0.0
         self._episodes_started = 0
+        self._inter_episode_active = False
+        self._inter_episode_remaining = 0.0
 
     # ----------------- 配置 ----------------- #
     @classmethod
@@ -237,6 +239,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         cfg.setdefault("movement_lanes", None)
         cfg.setdefault("movement_behavior_probs", None)
         cfg.setdefault("background_vehicle_respect_movement_lanes", True)
+        cfg.setdefault("inter_episode_as_steps", False)
+        cfg.setdefault("inter_episode_step_seconds", 0.0)
+        cfg.setdefault("inter_episode_zero_obs", True)
         return cfg
 
     # ----------------- 建路 ----------------- #
@@ -339,6 +344,8 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         """
         first_reset = not getattr(self, "_did_global_warmup", False)
         has_previous_episode = int(getattr(self, "_episodes_started", 0)) > 0
+        self._inter_episode_active = False
+        self._inter_episode_remaining = 0.0
 
         # 每次都重置交通流，用于测试，以保证各个episode之间独立
         if self.config["warmup_each_episode"] is True:
@@ -370,30 +377,121 @@ class MultiLaneStopToIntEnv(AbstractEnv):
                 self._clear_background()
 
         # First episode: align to target offset (may be zero extra wait if already aligned).
-        # Later episodes: require the next target offset so start time is strictly after previous end.
+        # Later episodes: optionally defer long alignment into inter-episode dummy env.step calls.
+        if has_previous_episode and bool(self.config.get("inter_episode_as_steps", False)):
+            delta = self._compute_episode_start_offset_delta(strict_next=True)
+            if delta > 1e-9:
+                self._begin_inter_episode_phase(delta)
+                return
+
         self._advance_to_episode_start_offset(strict_next=has_previous_episode)
         self._signal_episode_base = float(self._signal_time_global)
         self._create_ego()
         self._episodes_started += 1
         self._update_signal_virtual_stops(query_time=0.0)
 
-    def _advance_to_episode_start_offset(self, strict_next: bool) -> None:
-        """Keep background traffic evolving and align spawn time to configured signal phase offset."""
+    def _compute_episode_start_offset_delta(self, strict_next: bool) -> float:
         if not bool(self.config.get("align_ego_spawn_to_signal_offset", True)):
-            return
+            return 0.0
         controller = getattr(self, "_signal_controller", None)
         if controller is None:
-            return
+            return 0.0
 
         cycle = float(sum(total for _, total in controller.signal_plan))
         if cycle <= 1e-9:
-            return
+            return 0.0
 
         target_tau = float(self.config.get("episode_start_phase_offset", 0.0)) % cycle
         tau_now = (float(self._signal_time_global) + float(controller.cycle_offset)) % cycle
         delta = (target_tau - tau_now) % cycle
         if strict_next and delta <= 1e-9:
             delta = cycle
+        return max(float(delta), 0.0)
+
+    def _inter_episode_step_seconds(self) -> float:
+        configured = float(self.config.get("inter_episode_step_seconds", 0.0))
+        if configured > 1e-9:
+            return configured
+        return 1.0 / float(self.config["policy_frequency"])
+
+    def _dummy_action(self):
+        shape = getattr(self.action_space, "shape", None)
+        if shape is not None:
+            return np.zeros(shape, dtype=np.float32)
+        return 0
+
+    def _dummy_observation(self) -> np.ndarray:
+        if not bool(self.config.get("inter_episode_zero_obs", True)):
+            return self.observation_type.observe()
+        shape = getattr(self.observation_space, "shape", None)
+        if shape is not None:
+            dtype = getattr(self.observation_space, "dtype", np.float32)
+            return np.zeros(shape, dtype=dtype)
+        obs = self.observation_type.observe()
+        return np.zeros_like(np.asarray(obs, dtype=np.float32))
+
+    def _begin_inter_episode_phase(self, seconds: float) -> None:
+        self._inter_episode_active = True
+        self._inter_episode_remaining = max(float(seconds), 0.0)
+
+        lane_id = self._start_lane_id()
+        lane_index = ("0", "1", int(lane_id))
+        lane = self.road.network.get_lane(lane_index)
+        position = lane.position(0.0, 0.0)
+        heading = lane.heading_at(0.0)
+
+        dummy = self.action_type.vehicle_class(self.road, position, heading, 0.0)
+        dummy.lane = lane
+        dummy.lane_index = lane_index
+        self.vehicle = dummy
+
+        self._last_speed = 0.0
+        self._last_acc = 0.0
+        self._last_longitudinal = 0.0
+        self._last_lane_id = int(lane_id)
+        self._has_arrived = False
+        self._arrival_time = None
+
+        self._update_signal_virtual_stops(query_time=0.0)
+
+    def _finish_inter_episode_phase(self) -> None:
+        self._inter_episode_active = False
+        self._inter_episode_remaining = 0.0
+        self.time = 0.0
+        self.steps = 0
+        self._signal_episode_base = float(self._signal_time_global)
+        self._create_ego()
+        self._episodes_started += 1
+        self._update_signal_virtual_stops(query_time=0.0)
+
+    def _step_inter_episode_dummy(self, action):
+        del action
+        chunk = min(self._inter_episode_step_seconds(), float(self._inter_episode_remaining))
+        if chunk > 1e-9:
+            self._simulate_background_for(chunk)
+            self._inter_episode_remaining = max(float(self._inter_episode_remaining - chunk), 0.0)
+
+        finished = bool(self._inter_episode_remaining <= 1e-9)
+        if finished:
+            self._finish_inter_episode_phase()
+            obs = self.observation_type.observe()
+        else:
+            obs = self._dummy_observation()
+
+        info = {
+            "speed": float(getattr(self.vehicle, "speed", 0.0)),
+            "crashed": bool(getattr(self.vehicle, "crashed", False)),
+            "action": self._dummy_action(),
+            "reward_components": {},
+            "inter_episode": True,
+            "skip_replay": True,
+            "next_obs_is_dummy": not finished,
+        }
+        return obs, 0.0, False, False, info
+
+    def _advance_to_episode_start_offset(self, strict_next: bool) -> None:
+        """Keep background traffic evolving and align spawn time to configured signal phase offset."""
+        delta = self._compute_episode_start_offset_delta(strict_next=strict_next)
         if delta <= 1e-9:
             return
 
@@ -466,6 +564,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
     # ----------------- RL step：在 AbstractEnv 的基础上维护车流 ----------------- #
     def step(self, action):
+        if bool(getattr(self, "_inter_episode_active", False)):
+            return self._step_inter_episode_dummy(action)
+
         # 在当前决策步生效的信号相位（供 _simulate 内 IDM 使用）
         dt = 1.0 / float(self.config["policy_frequency"])
         self._update_signal_virtual_stops(query_time=self.time + dt)
@@ -483,6 +584,18 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         weighted = getattr(self, "_last_weighted_rewards", None)
         if isinstance(info, dict) and weighted is not None:
             info["reward_components"] = dict(weighted)
+
+        next_obs_is_dummy = False
+        if bool(terminated or truncated) and bool(self.config.get("inter_episode_as_steps", False)):
+            pending = self._compute_episode_start_offset_delta(strict_next=True)
+            next_obs_is_dummy = bool(pending > 1e-9)
+            if isinstance(info, dict):
+                info["inter_episode_pending_seconds"] = float(max(pending, 0.0))
+
+        if isinstance(info, dict):
+            info["inter_episode"] = False
+            info["skip_replay"] = False
+            info["next_obs_is_dummy"] = bool(next_obs_is_dummy)
 
         sim_freq = float(self.config["simulation_frequency"])
         pol_freq = float(self.config["policy_frequency"])

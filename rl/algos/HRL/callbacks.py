@@ -287,6 +287,11 @@ class HIROLoggingCallback(BaseCallback):
         reward_env = np.asarray(loc.get("reward_env", 0.0), dtype=np.float32).reshape(-1)
         dones = np.asarray(loc.get("done", False), dtype=bool).reshape(-1)
         infos = loc.get("infos", [])
+        replay_mask = np.asarray(loc.get("replay_mask", np.ones_like(dones, dtype=bool)), dtype=bool).reshape(-1)
+        if replay_mask.size != dones.size:
+            replay_mask = np.ones_like(dones, dtype=bool)
+        if not replay_mask.any():
+            return True
 
         if self.mpc_fail_csv_path:
             fail_records = list(loc.get("mpc_fail_records", []) or [])
@@ -322,11 +327,13 @@ class HIROLoggingCallback(BaseCallback):
         # --- Update TB stats & Capture env 0 components ---
         rc_env0 = {}
         if reward_env.size:
-            self._ep_ret += reward_env
-            self._ep_len += 1
+            self._ep_ret[replay_mask] += reward_env[replay_mask]
+            self._ep_len[replay_mask] += 1
 
         if infos:
             for i, info in enumerate(infos):
+                if i >= replay_mask.size or not replay_mask[i]:
+                    continue
                 rc = info.get("reward_components", {})
                 for name, val in rc.items():
                     self._ep_comp_sums.setdefault(name, np.zeros_like(self._ep_ret))[i] += float(val)
@@ -338,7 +345,7 @@ class HIROLoggingCallback(BaseCallback):
             c = np.asarray(loc.get("c", []), dtype=np.int32).reshape(-1)
             low_obs = np.asarray(loc.get("low_obs", []), dtype=np.float32)
             if c.size and low_obs.size and low_obs.ndim == 2 and low_obs.shape[0] == c.size:
-                start_idx = np.flatnonzero(c == 0)
+                start_idx = np.flatnonzero((c == 0) & replay_mask)
                 if self.low_obs_csv_env0_only:
                     start_idx = start_idx[start_idx == 0]
 
@@ -446,7 +453,7 @@ class HIROLoggingCallback(BaseCallback):
 
         # --- CSV Logs (Low Level Step) ---
         # Record only if active and not yet done with first interval
-        if self.csv_active and not self.csv_low_traj_recorded:
+        if self.csv_active and not self.csv_low_traj_recorded and replay_mask.size > 0 and replay_mask[0]:
             low_obs = loc.get("low_obs")[0]
             low_action = loc.get("low_action")[0]
             low_reward = loc.get("low_reward_total")[0]
@@ -474,8 +481,9 @@ class HIROLoggingCallback(BaseCallback):
             self._append_csv(self.low_csv_path, row)
 
         # --- Episode End Logic ---
-        if dones.any():
-            idx = np.flatnonzero(dones)
+        dones_real = dones & replay_mask
+        if dones_real.any():
+            idx = np.flatnonzero(dones_real)
             self._episode_counter += int(idx.size)
             
             # Only log environment-level stats if high_logger exists
@@ -566,6 +574,11 @@ class HIROLowEpisodeTrajectoryCallback(BaseCallback):
         c = np.asarray(loc.get("c", []), dtype=np.int32).reshape(-1)
         if c.size == 0:
             return True
+        replay_mask = np.asarray(loc.get("replay_mask", np.ones_like(c, dtype=bool)), dtype=bool).reshape(-1)
+        if replay_mask.size != c.size:
+            replay_mask = np.ones_like(c, dtype=bool)
+        if not replay_mask.any():
+            return True
 
         low_obs = np.asarray(loc.get("low_obs", []), dtype=np.float32)
         low_action = np.asarray(loc.get("low_action", []), dtype=np.float32)
@@ -591,7 +604,7 @@ class HIROLowEpisodeTrajectoryCallback(BaseCallback):
         if low_obs.ndim != 2 or low_obs.shape[0] != n_envs:
             return True
 
-        idx_start = np.flatnonzero(c == 0)
+        idx_start = np.flatnonzero((c == 0) & replay_mask)
         for i in idx_start:
             ii = int(i)
             self._ep_ret[ii] = 0.0
@@ -614,6 +627,8 @@ class HIROLowEpisodeTrajectoryCallback(BaseCallback):
 
         for i in range(n_envs):
             ii = int(i)
+            if not replay_mask[ii]:
+                continue
             r_tot = float(low_reward_total[ii]) if low_reward_total.size > ii else 0.0
             self._ep_ret[ii] += r_tot
             self._ep_len[ii] += 1
@@ -636,7 +651,7 @@ class HIROLowEpisodeTrajectoryCallback(BaseCallback):
             }
             self._episode_steps[ii].append(row)
 
-        idx_end = np.flatnonzero(done_low)
+        idx_end = np.flatnonzero(done_low & replay_mask)
         if idx_end.size:
             for j in idx_end:
                 jj = int(j)
