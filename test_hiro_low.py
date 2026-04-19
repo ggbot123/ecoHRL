@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
+from stable_baselines3.common.buffers import ReplayBuffer
 
 import scenarios.multi_lane  # 触发 __init__.py 里的 register
 
@@ -639,8 +640,16 @@ def main(
     base_env, ego, neighbors = setup_env_with_state(env, ego_state, neighbors_state)
     obs0 = base_env.observation_type.observe()
 
-    low_model = SAC.load(low_model_path)
     hiro_cfg = get_hiro_config()
+    low_model = SAC.load(
+        low_model_path,
+        # Inference does not need HER replay buffer; this keeps loading compatible
+        # with checkpoints saved before HiROLowHERReplayBuffer required high_interval.
+        custom_objects={
+            "replay_buffer_class": ReplayBuffer,
+            "replay_buffer_kwargs": {},
+        },
+    )
 
     runner = HIROPolicyRunner(
         _DummyHigh(),
@@ -1138,26 +1147,26 @@ if __name__ == "__main__":
     #    - 可选 case_id 列作为输出目录名）
 
     main(
-        low_model_path="./models/hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03/hiro_low_final.zip",
-        # low_model_path="./models/hiro_260321_lowonly_reachableUniform_newSLv2_vio03_HER_reDim_amax3_dmin0/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03/hiro_low_final.zip",
+        low_model_path="./models/hiro_260415_lowonly_reUni_fixedHERv2_amax3_dmin15_10/hiro_low_final.zip",
         # low_model_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
         steps=25,
-        ego_state=[0.0, 4.0, 10.0, 0.0],
-        neighbors_state=[
-            [30.0, 4.0, 10.0, 0.0],
-            [60.0, 8.0, 12.0, 0.0],
-            [30.0, 0.0, 10.0, 0.0],
-            [5.0, 8.0, 15.0, 0.0],
-        ],
-        goal_phys=[30, 4, 10, 0],
-        # ego_state=[0.000000, 8.000000, 12.320744, 0],
+        # ego_state=[0.0, 4.0, 10.0, 0.0],
         # neighbors_state=[
-        #     [33.611660, 0, 12.699497, 0.000000],
-        #     [55.454609, 4, 12.963794, 0.000000],
-        #     [73.182320, 8, 12.303981, 0.000000],
-        #     [85.691025, 0, 13.218258, 0.000000],
+        #     [30.0, 4.0, 10.0, 0.0],
+        #     [60.0, 8.0, 12.0, 0.0],
+        #     [30.0, 0.0, 10.0, 0.0],
+        #     [5.0, 8.0, 15.0, 0.0],
         # ],
-        # goal_phys=[31.408527, 8, 0, 0.000000],
+        # goal_phys=[20, 4, 0, 0],
+        ego_state=[0.000000, 8.000000, 12.320744, 0],
+        neighbors_state=[
+            [13.611660, 0, 12.699497, 0.000000],
+            [35.454609, 4, 12.963794, 0.000000],
+            [53.182320, 8, 12.303981, 0.000000],
+            [65.691025, 0, 13.218258, 0.000000],
+        ],
+        goal_phys=[31.408527, 8, 0, 0.000000],
         # batch_cases_csv="low_test_cases.csv",
         # batch_cases_csv="low_test_cases_debug.csv",
         use_low_safety_layer=True,

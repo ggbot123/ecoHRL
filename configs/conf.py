@@ -215,8 +215,8 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "comfort_acc_weight": 1.0,
     "comfort_jerk_weight": 0.1,
 
-    # "lane_change_reward": -1.0,
-    "lane_change_reward": -0.5,
+    "lane_change_reward": -1.0,
+    # "lane_change_reward": -0.5,
     
     # RuleBasedController compute_action strategy:
     # "target_speed_lane" | "goal_x_accel" | "idm_mobil"
@@ -286,8 +286,8 @@ def get_hiro_config():
         device="auto",
 
         # train_mode="joint",
-        # train_mode="high_only",
-        train_mode="low_only",
+        train_mode="high_only",
+        # train_mode="low_only",
 
         intrinsic_coef=intrinsic_coef,
         intrinsic_norm_ranges=intrinsic_norm_ranges,
@@ -336,8 +336,8 @@ def get_hiro_config():
         # - "segment_legacy": legacy same-segment future relabeling without t_norm relabel
         # low_her_future_mode="segment_timeaware",
         low_her_future_mode="episode_timeaware",
-        # Only for episode_timeaware: sample steps_ahead uniformly in [min, max]. None means default [1, high_interval].
-        low_her_episode_timeaware_steps_ahead_range=(1, 10),
+        # low_her_episode_timeaware_steps_ahead_range=(1, 10),
+        low_her_episode_timeaware_steps_ahead_range=None,
 
         # HER debug CSV (saved by HIRO callback): 0 disables periodic flush.
         low_her_debug_csv_interval_steps=1000,
@@ -367,7 +367,7 @@ def get_hiro_config():
         # high_goal_safe_front_dmin=0.0,
         # high_goal_safe_lane_change_rear_dmin=0.0,
         high_goal_safe_min_goal_x_span=0,
-        high_goal_safe_enable_goal_vx_bounds=True,
+        high_goal_safe_enable_goal_vx_bounds=False,
 
         low_safety_violation_penalty=0.3,
 

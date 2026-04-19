@@ -131,8 +131,22 @@ class SafeGoalActor(Actor):
             z_base = mean_actions + std * th.randn_like(mean_actions)
 
         y_base = th.tanh(z_base)
-        k = self._segment_index_from_action(y_base[:, 1])
-        valid_sel = safe_stats["valid_k"][idx, k]
+        k_base = self._segment_index_from_action(y_base[:, 1])
+        valid_k = safe_stats["valid_k"]
+        valid_sel_base = valid_k[idx, k_base]
+        feasible_any = th.any(valid_k, dim=1)
+
+        # If selected segment is infeasible, reroute to the nearest feasible segment.
+        seg_m = th.as_tensor([-2.0 / 3.0, 0.0, 2.0 / 3.0], dtype=mean_actions.dtype, device=mean_actions.device)
+        seg_r = th.as_tensor([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=mean_actions.dtype, device=mean_actions.device)
+        y1_base = y_base[:, 1]
+        dist_to_center = th.abs(y1_base[:, None] - seg_m[None, :])
+        inf = th.full_like(dist_to_center, 1e9)
+        dist_masked = th.where(valid_k, dist_to_center, inf)
+        k_fallback = th.argmin(dist_masked, dim=1)
+        use_fallback = (~valid_sel_base) & feasible_any
+        k = th.where(use_fallback, k_fallback, k_base)
+        valid_sel = valid_k[idx, k]
 
         m2_sel = safe_stats["m2"][idx, k]
         r2_sel = safe_stats["r2"][idx, k]
@@ -148,6 +162,14 @@ class SafeGoalActor(Actor):
 
         y = y_base.clone()
         y[:, 0] = th.where(valid_sel, a0_safe, y_base[:, 0])
+
+        # For rerouted rows, map dim-1 latent sample into the selected feasible segment.
+        t1 = th.tanh(z_base[:, 1])
+        m1_sel = seg_m[k]
+        r1_sel = seg_r[k]
+        r1_safe = th.clamp(r1_sel, min=eps)
+        a1_safe = m1_sel + r1_sel * t1
+        y[:, 1] = th.where(use_fallback, a1_safe, y_base[:, 1])
 
         has_safe_vx = bool(safe_stats.get("has_safe_vx", False)) and mean_actions.shape[1] >= 3
         if has_safe_vx:
@@ -171,6 +193,16 @@ class SafeGoalActor(Actor):
         if has_safe_vx:
             dim_mask_other[:, 2] = False
         log_prob_other = self._log_prob_base_with_mask(mean_actions, log_std, z_base, y_base, eps, dim_mask_other)
+
+        # Replace dim-1 base contribution only for rerouted rows.
+        dim_mask_1 = th.zeros_like(mean_actions, dtype=th.bool)
+        dim_mask_1[:, 1] = True
+        log_prob_dim1_base = self._log_prob_base_with_mask(mean_actions, log_std, z_base, y_base, eps, dim_mask_1)
+        normalized1 = (z_base[:, 1] - mean_actions[:, 1]) / std[:, 1]
+        log_gauss1 = -0.5 * (normalized1.pow(2) + LOG_2PI) - log_std[:, 1]
+        log_det1 = th.log(r1_safe) + th.log(1.0 - t1.pow(2) + eps)
+        log_prob_dim1_safe = log_gauss1 - log_det1
+        log_prob_other = log_prob_other + th.where(use_fallback, log_prob_dim1_safe - log_prob_dim1_base, th.zeros_like(log_prob_dim1_base))
 
         dim_mask_0 = th.zeros_like(mean_actions, dtype=th.bool)
         dim_mask_0[:, 0] = True
