@@ -1451,13 +1451,15 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
     保存 HIRO Goal 可视化快照 (Vector Graphics version).
     使用 Matplotlib 直接绘制道路和车辆，获得清晰的矢量图/高分辨率位图，
     """
+    import itertools
     import matplotlib.transforms as transforms
     import matplotlib.cm as cm
     import matplotlib.colors as mcolors
     
     # 1. Directory Structure: separated by episode
-    # Clear output folder once at the beginning of a run
-    base_debug_dir = os.path.join(model_dir, "debug", folder_name)
+    # Save directly under the run directory (e.g., eval_results/<datetime>/goal_distribution)
+    # and clear output folder once at the beginning of a run
+    base_debug_dir = os.path.join(model_dir, folder_name)
     if int(ep_idx) == 1 and int(step) == 0:
         if os.path.exists(base_debug_dir):
             shutil.rmtree(base_debug_dir)
@@ -1473,12 +1475,28 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
 
     # 获取感知范围
     p_dist = getattr(base_env, "PERCEPTION_DISTANCE", 200.0)
-    if p_dist is None: p_dist = 200.0
+    if p_dist is None:
+        p_dist = 200.0
     p_dist = float(p_dist)
+
+    # 视野窗口配置：仅显示 ego 前方/后方指定范围，可通过 config 开关关闭
+    use_focus_window = bool(base_env.config.get("goal_snapshot_use_focus_window", True))
+    front_dist = float(base_env.config.get("goal_snapshot_front_distance", 200.0))
+    back_dist = float(base_env.config.get("goal_snapshot_back_distance", 50.0))
+
+    forward = np.array([np.cos(float(ego.heading)), np.sin(float(ego.heading))], dtype=np.float32)
+
+    def _in_focus_window(pos_xy: np.ndarray) -> bool:
+        if not use_focus_window:
+            return True
+        rel = np.asarray(pos_xy, dtype=np.float32) - np.asarray(ego.position, dtype=np.float32)
+        longi = float(np.dot(rel, forward))
+        return (-back_dist <= longi <= front_dist)
     
     # 获取范围内车辆
     # close_vehicles_to 返回按距离排序的车辆列表 (不含 ego)
     neighbors = road.close_vehicles_to(ego, p_dist)
+    neighbors = [v for v in neighbors if _in_focus_window(v.position)]
     
     # 确定哪些是 "Local Prob" (Observation 内的车辆)
     # runner.n_veh_local 是观察空间中包含的邻车数量
@@ -1490,7 +1508,9 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
     all_draw_vehs = [ego] + neighbors
 
     # 2. Setup Plot
-    fig, ax = plt.subplots(figsize=(15, 3))
+    fig_w = float(base_env.config.get("goal_snapshot_fig_width", 15.0))
+    fig_h = float(base_env.config.get("goal_snapshot_fig_height", 3.0))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     
     # 3. Draw Road Planes
     lanes = road.network.lanes_list()
@@ -1526,7 +1546,71 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
         ys.append(y0)
         ys.append(y1)
         
-    # 4. Draw Vehicles
+    # 4. Draw History (ego + observed neighbors)
+    show_history = bool(base_env.config.get("goal_snapshot_show_history", True))
+    hist_duration = float(base_env.config.get("goal_snapshot_history_duration", 2.0))
+    hist_frequency = float(base_env.config.get("goal_snapshot_history_frequency", 3.0))
+    sim_frequency = float(base_env.config.get("simulation_frequency", 15.0))
+    hist_len = max(int(sim_frequency * max(hist_duration, 0.0)), 1)
+    hist_stride = max(int(sim_frequency / max(hist_frequency, 1e-6)), 1)
+
+    if show_history:
+        trail_vehicles = [ego] + [v for v in neighbors if v in local_neighbors_set]
+        for hv in trail_vehicles:
+            hist = getattr(hv, "history", None)
+            if not hist:
+                continue
+            sampled = list(itertools.islice(hist, 0, hist_len, hist_stride))
+            if len(sampled) < 2:
+                continue
+            sampled = list(reversed(sampled))
+            hist_xy = np.asarray([s.position for s in sampled], dtype=np.float32)
+            if hist_xy.ndim != 2 or hist_xy.shape[1] < 2:
+                continue
+            if use_focus_window:
+                mask = [bool(_in_focus_window(p)) for p in hist_xy]
+                if not any(mask):
+                    continue
+                hist_xy = hist_xy[np.asarray(mask, dtype=bool)]
+                if hist_xy.shape[0] < 2:
+                    continue
+
+            if hv is ego:
+                trail_color = '#ff6b6b'
+                trail_alpha = 0.75
+                trail_lw = 2.0
+                trail_z = 4
+            else:
+                trail_color = '#66c2ff'
+                trail_alpha = 0.5
+                trail_lw = 1.4
+                trail_z = 3
+            ax.plot(hist_xy[:, 0], hist_xy[:, 1], color=trail_color, linewidth=trail_lw, alpha=trail_alpha, zorder=trail_z)
+
+    # 5. Draw Bus Stop
+    for obj in getattr(road, "objects", []):
+        obj_name = type(obj).__name__.lower()
+        if "busstop" not in obj_name and "bus_stop" not in obj_name:
+            continue
+        if not _in_focus_window(getattr(obj, "position", np.zeros(2, dtype=np.float32))):
+            continue
+        l_obj = float(getattr(obj, "LENGTH", 10.0))
+        w_obj = float(getattr(obj, "WIDTH", 3.0))
+        rect_obj = patches.Rectangle(
+            (-l_obj / 2.0, -w_obj / 2.0),
+            l_obj,
+            w_obj,
+            facecolor='#d8c3a5',
+            edgecolor='#8d6e63',
+            linewidth=1.2,
+            alpha=0.95,
+            zorder=2,
+        )
+        t_obj = transforms.Affine2D().rotate(float(getattr(obj, "heading", 0.0))).translate(float(obj.position[0]), float(obj.position[1])) + ax.transData
+        rect_obj.set_transform(t_obj)
+        ax.add_patch(rect_obj)
+
+    # 6. Draw Vehicles
     # 动态 Colorbar Range: 使用 HIRO High-Level Output 绝对速度范围 [0, speed_limit]
     # 索引获取: init_kinematics_meta 中 keep = ("x", "y", "vx", "vy")
     sx, sy, svx, svy = runner.ego_start[:4]
@@ -1534,7 +1618,11 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
     # 获取速度上限 (默认 30 m/s，如果 config 中未定义)
     speed_limit = float(base_env.config.get("speed_limit", 30.0))
     norm = mcolors.Normalize(vmin=0.0, vmax=speed_limit)
-    cmap = cm.get_cmap('jet') # 使用区分度高的色谱
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        'speed_red_to_green',
+        ['#d73027', '#fdae61', '#1a9850'],
+        N=256,
+    )
     
     for v in all_draw_vehs:
         # Color Logic
@@ -1565,45 +1653,32 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
         rect.set_transform(t)
         ax.add_patch(rect)
 
-    # 5. Draw Goal & Range
+    # 7. Draw Goal
     # Unpack first 4 elements: x, y, vx, vy
     gx, gy, gvx, gvy = runner.goal_phys[:4]
-    
+
+    goal_marker_size = float(base_env.config.get("goal_snapshot_goal_marker_size", 24.0))
+    show_prev_goal = bool(base_env.config.get("goal_snapshot_show_prev_goal", False))
+    prev_goal_marker_size = float(base_env.config.get("goal_snapshot_prev_goal_marker_size", 18.0))
+
     # Draw Goal (Dot with color by Absolute Speed)
     goal_color = cmap(norm(gvx))
-    ax.scatter([gx], [gy], c=[goal_color], marker='o', s=50, linewidth=1.5, edgecolors='white', zorder=10)
+    ax.scatter([gx], [gy], c=[goal_color], marker='o', s=goal_marker_size, linewidth=1.2, edgecolors='white', zorder=10)
     
     # Draw Previous Goal (Transparent Dot)
-    if prev_goal_phys is not None and len(prev_goal_phys) >= 4:
+    if show_prev_goal and prev_goal_phys is not None and len(prev_goal_phys) >= 4:
          px, py, pvx, pvy = prev_goal_phys[:4]
          if pvx != 0 or px != 0: # 简单过滤初始全0的情况
             p_color = cmap(norm(pvx))
-            ax.scatter([px], [py], c=[p_color], marker='o', s=50, linewidth=1.5, edgecolors='white', zorder=9, alpha=0.5)
+            ax.scatter([px], [py], c=[p_color], marker='o', s=prev_goal_marker_size, linewidth=1.0, edgecolors='white', zorder=9, alpha=0.45)
 
-    # Calculate Average Acceleration Req
-    # Acc = Delta V / Duration
-    pol_freq = float(base_env.config.get("policy_frequency", 10.0))
-    dt = 1.0 / pol_freq
-    hi_steps = getattr(runner, "hi", 10)
-    duration = max(hi_steps * dt, 1e-3)
-    avg_acc = (gvx - svx) / duration
-    
-    # Draw Range Box
-    x_range = runner.norm_ranges[0]
-    y_range = runner.norm_ranges[1]
-    box_min_x = sx + x_range[0]
-    box_max_x = sx + x_range[1]
-    box_min_y = sy + y_range[0]
-    box_max_y = sy + y_range[1]
-    w_box = box_max_x - box_min_x
-    h_box = box_max_y - box_min_y
-    rect_range = patches.Rectangle((box_min_x, box_min_y), w_box, h_box,
-                                   linewidth=2, edgecolor='lime', facecolor='none', linestyle='--', zorder=8)
-    ax.add_patch(rect_range)
-
-    # 6. View Settings
-    x_min = ego.position[0] - p_dist
-    x_max = ego.position[0] + p_dist
+    # 8. View Settings
+    if use_focus_window:
+        x_min = float(ego.position[0]) - back_dist
+        x_max = float(ego.position[0]) + front_dist
+    else:
+        x_min = float(ego.position[0]) - p_dist
+        x_max = float(ego.position[0]) + p_dist
     ax.set_xlim(x_min, x_max)
     
     if ys:
@@ -1616,17 +1691,22 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
     ax.set_aspect('equal')
     ax.axis('off')
 
-    # Add Colorbar
-    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax, aspect=30, shrink=0.8, pad=0.02)
-    cbar.set_label('Speed [m/s]', fontsize=10)
-    
-    # Add Title with Goal Info
-    title_str = f"Ep {ep_idx} Step {step}\nGoal V: {gvx:.1f} m/s | Avg Acc Req: {avg_acc:.2f} m/s²"
-    if intrinsic_reward is not None:
-        title_str += f"\nLast Int. Reward: {intrinsic_reward:.4f}"
-    plt.title(title_str)
+    # Right-top annotation: current simulation time and ego longitudinal position
+    pol_freq = float(base_env.config.get("policy_frequency", 10.0))
+    t_now = float(getattr(base_env, "time", (float(step) / max(pol_freq, 1e-6))))
+    x_ego = float(ego.position[0])
+    ax.text(
+        0.99,
+        0.98,
+        f"t={t_now:.1f}s, x_ego={x_ego:.1f}m",
+        transform=ax.transAxes,
+        ha='right',
+        va='top',
+        fontsize=20,
+        color='black',
+        bbox=dict(facecolor='white', alpha=0.55, edgecolor='none', boxstyle='round,pad=0.25'),
+        zorder=20,
+    )
     
     save_path = os.path.join(debug_dir, f"step{step:05d}.png")
     plt.tight_layout()

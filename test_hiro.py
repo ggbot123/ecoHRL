@@ -71,8 +71,8 @@ def main(
         return ((n + 1.0) * 0.5 * float(dx_high - dx_low) + float(dx_low)).astype(np.float32)
 
     test_overrides: Dict[str, Any] = {
-        "initial_lane_id": 1,
-        # "initial_lane_id": "random",
+        # "initial_lane_id": 1,
+        "initial_lane_id": "random",
         # "PERCEPTION_DISTANCE": 200,
         # "observation": {
         #     "vehicles_count": 20,
@@ -94,6 +94,18 @@ def main(
         "show_trajectories": enable_rendering,
         "warmup_render": False,  
         "offscreen_rendering": enable_rendering,
+        # Goal-distribution snapshot controls
+        "goal_snapshot_use_focus_window": True,
+        "goal_snapshot_front_distance": 100.0,
+        "goal_snapshot_back_distance": 50.0,
+        "goal_snapshot_show_history": True,
+        "goal_snapshot_history_duration": 2.0,
+        "goal_snapshot_history_frequency": 3.0,
+        "goal_snapshot_goal_marker_size": 24.0,
+        "goal_snapshot_show_prev_goal": False,
+        "goal_snapshot_prev_goal_marker_size": 18.0,
+        "goal_snapshot_fig_width": 15.0,
+        "goal_snapshot_fig_height": 3.0,
     }
     if env_overrides:
         test_overrides.update(env_overrides)
@@ -486,6 +498,18 @@ def main(
             runner.step_end(done)
             obs = obs_next
 
+        if enable_rendering:
+            # Save the terminal frame snapshot for each episode.
+            save_goal_snapshot(
+                env,
+                runner,
+                ep,
+                steps,
+                eval_dir,
+                prev_goal_phys=prev_goal_phys,
+                intrinsic_reward=last_intrinsic_viz,
+            )
+
         n_low_intervals = len(low_interval_rets) or 1
         low_ext_mean = low_ext_ret / float(n_low_intervals)
         low_int_mean = low_int_ret / float(n_low_intervals)
@@ -717,8 +741,8 @@ if __name__ == "__main__":
         # model_dir="./models/hiro_260120_joint_safetyLayer_noOpc_rewShaping",
         model_dir="./models",
         # high_model_dir="./models/hiro_260401_highonly_UniformLane1_Rainbow_randomLane",
-        high_model_dir="./models/hiro_260329_highonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10",
-        # high_model_dir="./models/hiro_260331_highonly_reachableUniformLane1_Rainbow_amax3_dmin15_10_randomlane",
+        # high_model_dir="./models/hiro_260329_highonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10",
+        high_model_dir="./models/hiro_260331_highonly_reachableUniformLane1_Rainbow_amax3_dmin15_10_randomlane",
         # high_model_dir="./models/hiro_260319_highonly_pretrained_newSLv2_vio03_HER_reDim_lc10",
         # high_model_dir="./models/hiro_test_260211_highonly_pretrained_vmin0",
 
@@ -728,7 +752,7 @@ if __name__ == "__main__":
         # low_model_dir="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping",
         # model_suffix="step_6400000",
         use_low_safety_layer=True,
-        episodes=10, 
+        episodes=300, 
         # record_episodes=[],
         # record_trajectory_episodes=[],
         record_episodes=[i for i in range(1, 11)],
