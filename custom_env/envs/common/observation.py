@@ -261,9 +261,7 @@ class KinematicObservation(ObservationType):
             if front is None:
                 return out
             front_s = float(lane.local_coordinates(front.position)[0])
-            ego_len = float(getattr(ego, "LENGTH", getattr(ego, "length", 5.0)))
-            front_len = float(getattr(front, "LENGTH", getattr(front, "length", 5.0)))
-            distance = max(front_s - ego_s - 0.5 * (ego_len + front_len), 0.0)
+            distance = max(front_s - ego_s, 0.0)
 
             heading = float(lane.heading_at(ego_s))
             lane_dir = np.array([np.cos(heading), np.sin(heading)], dtype=np.float32)

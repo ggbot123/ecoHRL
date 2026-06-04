@@ -22,7 +22,7 @@ class VirtualVehicle:
 
     def lane_distance_to(self, other: "VirtualVehicle") -> float:
         # Assume road axis aligned with +x
-        return float(other.position[0] - self.position[0] - self.length)
+        return float(other.position[0] - self.position[0])
 
 
 class RuleBasedController:
@@ -1092,8 +1092,8 @@ class RuleBasedAgentWrapper:
             "goal_x_accel_follow",
             "follow_goal_x_accel",
         }
-        self.follow_enter_gap = float(env_cfg.get("rule_follow_enter_gap", 13.0))
-        self.follow_release_gap = float(env_cfg.get("rule_follow_release_gap", 18.0))
+        self.follow_enter_gap = float(env_cfg.get("rule_follow_enter_gap", 18.0))
+        self.follow_release_gap = float(env_cfg.get("rule_follow_release_gap", 23.0))
         self.follow_enter_ttc = float(env_cfg.get("rule_follow_enter_ttc", 2.0))
         self.follow_release_ttc = float(env_cfg.get("rule_follow_release_ttc", 4.0))
         self.follow_max_acc = float(env_cfg.get("rule_follow_max_acc", 0.0))
@@ -1144,11 +1144,7 @@ class RuleBasedAgentWrapper:
         distance, ttc = decoded
         closing = 0.0 if ttc >= self.front_ttc_range - 1e-6 else distance / max(ttc, 1e-6)
         rel_vx = -max(float(closing), 0.0)
-        # Existing vehicle observations use center-to-center relative x, while
-        # the extra front feature is a bumper-to-bumper gap. Convert it before
-        # feeding the legacy rule/safety code, which was tuned on center dx.
-        center_dx = float(distance) + float(getattr(self.controller, "LENGTH", 5.0))
-        synthetic = np.array([[center_dx, 0.0, rel_vx, 0.0]], dtype=np.float32)
+        synthetic = np.array([[float(distance), 0.0, rel_vx, 0.0]], dtype=np.float32)
         base = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
         return np.concatenate([base, synthetic], axis=0)
 
@@ -1158,7 +1154,7 @@ class RuleBasedAgentWrapper:
         ego_vx: float,
         extra: np.ndarray,
     ) -> tuple[float | None, float | None]:
-        """Return nearest same-lane front bumper gap and TTC for follow-mode."""
+        """Return nearest same-lane front center distance and TTC for follow-mode."""
         best_gap: float | None = None
         best_ttc: float | None = None
 
@@ -1166,7 +1162,7 @@ class RuleBasedAgentWrapper:
             dx, dy, dvx, _dvy = [float(v) for v in row]
             if dx <= 0.0 or abs(dy) > self.follow_same_lane_dy:
                 continue
-            gap = max(dx - float(getattr(self.controller, "LENGTH", 5.0)), 0.0)
+            gap = max(dx, 0.0)
             closing = max(-dvx, 0.0)
             ttc = gap / max(closing, 1e-6) if closing > 1e-6 else self.front_ttc_range
             if best_gap is None or gap < best_gap:
