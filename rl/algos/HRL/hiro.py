@@ -124,11 +124,19 @@ class SB3AgentWrapper:
 
 @dataclass
 class LowSafetyFilterConfig:
-    type: str = "mpc_constraints"  # "legacy" | "mpc_constraints"
+    type: str = "mpc_constraints"  # "legacy" | "mpc_constraints" | "RSS" | "legacy_mpc_max"
     lane_change_min_front_gap: float = 15.0
     lane_change_min_rear_gap: float = 10.0
     lane_change_min_front_ttc: float = 3.0
     lane_change_min_rear_ttc: float = 2.0
+    safe_gap_d_min: float = 6.0
+    safe_gap_tau: float = 0.6
+    safe_gap_b_ego: float = 3.0
+    safe_gap_b_front: float = 3.0
+    safe_gap_comfort_decel: float = -3.0
+    safe_gap_emergency_decel: float = -5.0
+    safe_gap_emergency_ttc: float = 1.0
+    safe_gap_emergency_distance: float = 10.0
 
 
 @dataclass
@@ -166,6 +174,7 @@ class HIROConfig:
     high_goal_safe_front_dmin: float = 0.0
     high_goal_safe_lane_change_rear_dmin: float = 0.0
     high_goal_safe_min_goal_x_span: float = 0.0
+    high_obs_use_signal_features: bool = True
 
 
 class HIROSAC:
@@ -176,14 +185,18 @@ class HIROSAC:
         self.total_timesteps = 0
         self.n_envs = int(env.num_envs)
 
-        # ---- 用一次 reset 的 obs 初始化 Kinematics 元信息 ----
-        obs0 = env.reset()
-        obs0_flat = np.asarray(obs0[0], dtype=np.float32).reshape(-1)
+        # ---- 初始化 Kinematics 元信息 ----
+        # Avoid a metadata reset: scenarios may update episode counters in reset().
+        obs_shape = getattr(env.observation_space, "shape", None)
+        if obs_shape is None:
+            raise ValueError("HIROSAC requires a flat Box observation space.")
+        obs0_flat = np.zeros(int(np.prod(obs_shape)), dtype=np.float32)
         keep_features = ("x", "y", "vx", "vy")  # ego 子状态中参与 HIRO goal 的特征
         (self.n_veh, self.n_veh_local, self.feat_dim, self.feature_names, self.ego_feature_idx) = \
             utils.init_kinematics_meta(env, obs0_flat, keep_features)
         self.kin_flat_dim = int(self.n_veh * self.feat_dim)
         self.local_kin_flat_dim = int(self.n_veh_local * self.feat_dim)
+        self.obs_extra_dim = int(max(0, int(np.prod(obs_shape)) - (1 + self.kin_flat_dim)))
         self.ego_dim = len(self.ego_feature_idx)
         self._intrinsic_norm_ranges = np.asarray(self.cfg.intrinsic_norm_ranges, dtype=np.float32)
         w = getattr(self.cfg, "intrinsic_weights", None)
@@ -205,7 +218,7 @@ class HIROSAC:
         self.lane_center_ys = (np.arange(lanes, dtype=np.float32) * lane_w).astype(np.float32)
 
         # ----- 定义 Spaces -----  #
-        high_obs_dim = self.kin_flat_dim + 1 + 2
+        high_obs_dim = self.kin_flat_dim + self.obs_extra_dim + 1 + 2
         self.high_obs_dim = int(high_obs_dim)
         high_obs_space = gym.spaces.Box(-np.inf, np.inf, shape=(high_obs_dim,), dtype=np.float32)
 
@@ -222,6 +235,8 @@ class HIROSAC:
 
         action_cfg = env_cfg.get("action", {})
         accel_range = action_cfg.get("acceleration_range", [-5.0, 5.0])
+        self._acc_min = float(accel_range[0])
+        self._acc_max = float(accel_range[1])
         default_max_accel = float(max(abs(float(accel_range[0])), abs(float(accel_range[1]))))
         use_custom_kin = bool(getattr(self.cfg, "high_goal_safe_use_custom_kinematics", False))
         if use_custom_kin:
@@ -254,7 +269,7 @@ class HIROSAC:
             vy_idx=int(self.feature_names.index("vy")),
         )
 
-        low_obs_dim = self.local_kin_flat_dim + self.ego_dim + 1 + 2
+        low_obs_dim = self.local_kin_flat_dim + self.obs_extra_dim + self.ego_dim + 1
         self.low_obs_dim = int(low_obs_dim)
         low_obs_space = gym.spaces.Box(-np.inf, np.inf, shape=(low_obs_dim,), dtype=np.float32)
         low_act_space = env.action_space
@@ -305,6 +320,7 @@ class HIROSAC:
                     dict(
                         feat_dim=int(self.feat_dim),
                         kin_flat_dim=int(self.local_kin_flat_dim),
+                        obs_extra_dim=int(self.obs_extra_dim),
                         ego_feature_idx=list(self.ego_feature_idx),
                         intrinsic_coef=float(self.cfg.intrinsic_coef),
                         intrinsic_norm_ranges=np.asarray(self.cfg.intrinsic_norm_ranges, dtype=np.float32),
@@ -363,21 +379,24 @@ class HIROSAC:
             policy_kwargs["goal_safe_eps"] = float(getattr(self.cfg, "high_goal_safe_eps", 1e-6))
             high_sac_kwargs["policy_kwargs"] = policy_kwargs
 
-        if self.use_off_policy_correction:
+        q_debug_cfg = high_sac_kwargs.get("q_replay_debug", {}) or {}
+        q_debug_enabled = bool(q_debug_cfg.get("enabled", False)) if isinstance(q_debug_cfg, dict) else False
+        if self.use_off_policy_correction or q_debug_enabled:
             rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
             rb_kwargs.update(
                 dict(
                     max_seq_len=int(self.cfg.high_interval),
                     kin_flat_dim=int(self.local_kin_flat_dim),
+                    obs_extra_dim=int(self.obs_extra_dim),
                     low_action_dim=int(np.prod(low_act_space.shape)),
                     feat_dim=int(self.feat_dim),
                     ego_feature_idx=list(self.ego_feature_idx),
                     lane_center_ys=self.lane_center_ys,
                     high_interval=int(self.cfg.high_interval),
-                    low_policy=self.low_agent.policy,
+                    low_policy=self.low_agent.policy if self.use_off_policy_correction else None,
                 )
             )
-            rb_kwargs["enable_off_policy_correction"] = True
+            rb_kwargs["enable_off_policy_correction"] = bool(self.use_off_policy_correction)
             high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
 
         high_pretrained_path = getattr(self.cfg, "high_pretrained_path", None)
@@ -445,6 +464,9 @@ class HIROSAC:
         out = np.zeros((n, 2), dtype=np.float32)
         out[:] = -1.0
 
+        if not bool(getattr(self.cfg, "high_obs_use_signal_features", True)):
+            return out
+
         if not hasattr(self.env, "env_method"):
             return out
 
@@ -477,14 +499,22 @@ class HIROSAC:
         arr = np.asarray(obs, dtype=np.float32)
         t_cur = arr[:, :1]
         t_remaining = (float(self.punctual_time_target) - t_cur).astype(np.float32)
-        kin_flat = np.asarray(arr[:, 1:], dtype=np.float32).copy()
+        kin_flat = np.asarray(arr[:, 1 : 1 + self.kin_flat_dim], dtype=np.float32).copy()
+        extra = np.asarray(arr[:, 1 + self.kin_flat_dim : 1 + self.kin_flat_dim + self.obs_extra_dim], dtype=np.float32)
         ego_x = kin_flat[:, self.ego_x_idx]
         goal_x = self._get_goal_longitudinal()
         kin_flat[:, self.ego_x_idx] = (goal_x - ego_x).astype(np.float32)
         sig = np.asarray(signal_feat, dtype=np.float32).reshape(arr.shape[0], 2)
-        return np.concatenate([t_remaining, kin_flat, sig], axis=1).astype(np.float32)
+        return np.concatenate([t_remaining, kin_flat, extra, sig], axis=1).astype(np.float32)
 
-    def _build_low_obs(self, t_rel: np.ndarray, kin_flat: np.ndarray, kin: np.ndarray, goal_phys: np.ndarray, signal_feat: np.ndarray) -> np.ndarray:
+    def _build_low_obs(
+        self,
+        t_rel: np.ndarray,
+        kin_flat: np.ndarray,
+        kin: np.ndarray,
+        goal_phys: np.ndarray,
+        obs_extra: np.ndarray | None = None,
+    ) -> np.ndarray:
         """
         低层观测 = t_norm + local_kin_flat + goal_rel
         接收绝对坐标系 goal_phys，根据当前 ego 状态计算 goal_rel
@@ -493,6 +523,13 @@ class HIROSAC:
         ego_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
         goal_rel = (np.asarray(goal_phys, dtype=np.float32) - ego_sub).astype(np.float32)
         local_kin_flat = np.asarray(kin_flat[:, :self.local_kin_flat_dim], dtype=np.float32).copy()
+        if self.obs_extra_dim > 0:
+            if obs_extra is None:
+                extra = np.zeros((local_kin_flat.shape[0], self.obs_extra_dim), dtype=np.float32)
+            else:
+                extra = np.asarray(obs_extra, dtype=np.float32).reshape(local_kin_flat.shape[0], self.obs_extra_dim)
+        else:
+            extra = np.zeros((local_kin_flat.shape[0], 0), dtype=np.float32)
 
         # Mask ego absolute position in low_obs
         mask_ego_pos = bool(getattr(self.cfg, "mask_ego_position_in_low_obs", False))
@@ -503,8 +540,7 @@ class HIROSAC:
             idx_y = int(self.feature_names.index("y"))
             local_kin_flat[:, idx_x] = 0.0
             local_kin_flat[:, idx_y] = 0.0
-        sig = np.asarray(signal_feat, dtype=np.float32).reshape(local_kin_flat.shape[0], 2)
-        return np.concatenate([t_norm, np.asarray(local_kin_flat, dtype=np.float32), goal_rel, sig], axis=1)
+        return np.concatenate([t_norm, np.asarray(local_kin_flat, dtype=np.float32), extra, goal_rel], axis=1)
 
     def _low_target_action_filter(self, low_obs: np.ndarray, action: np.ndarray) -> np.ndarray:
         """
@@ -523,7 +559,8 @@ class HIROSAC:
         _, kin, _ = utils.split_time_kinematics(kin_slice, self.n_veh_local, self.feat_dim)
         ego_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
 
-        goal_rel = low_obs[:, 1 + self.local_kin_flat_dim : 1 + self.local_kin_flat_dim + self.ego_dim]
+        goal_start = 1 + self.local_kin_flat_dim + self.obs_extra_dim
+        goal_rel = low_obs[:, goal_start : goal_start + self.ego_dim]
         goal_phys = (ego_sub + goal_rel).astype(np.float32)
 
         return self.low_safety.apply_safety_layer(low_obs, goal_phys, action)
@@ -618,6 +655,23 @@ class HIROSAC:
         low_len = np.zeros(n_envs, dtype=np.int32)
         low_safety_clip_count = np.zeros(n_envs, dtype=np.int32)
         low_comp_sums: dict[str, np.ndarray] = {}
+        high_comp_keys = [
+            "collision_reward",
+            "progress_reward",
+            "speed_ref_aux_reward",
+            "comfort_reward_for_high",
+            "lane_change_reward",
+            "punctual_reward",
+            "wrong_lane_terminal_penalty",
+        ]
+        high_comp_sums = {k: np.zeros(n_envs, dtype=np.float32) for k in high_comp_keys}
+        high_acc_min = np.full(n_envs, np.inf, dtype=np.float32)
+        high_acc_max = np.full(n_envs, -np.inf, dtype=np.float32)
+        high_acc_sum = np.zeros(n_envs, dtype=np.float32)
+        high_acc_abs_sum = np.zeros(n_envs, dtype=np.float32)
+        high_acc_count = np.zeros(n_envs, dtype=np.int32)
+        high_acc_hard_brake = np.zeros(n_envs, dtype=np.int32)
+        high_acc_hard_accel = np.zeros(n_envs, dtype=np.int32)
         goal_err_all = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
         intrinsic_unweighted = np.zeros(n_envs, dtype=np.float32)
 
@@ -625,7 +679,7 @@ class HIROSAC:
         opc_enabled = bool(getattr(self, "use_off_policy_correction", False))
         if opc_enabled:
             low_act_dim = int(np.prod(env.action_space.shape))
-            low_obs_dim = int(1 + self.local_kin_flat_dim + self.ego_dim + 2)
+            low_obs_dim = int(1 + self.local_kin_flat_dim + self.obs_extra_dim + self.ego_dim)
             opc_low_obs_seq = np.zeros((n_envs, hi, low_obs_dim), dtype=np.float32)
             opc_low_act_seq = np.zeros((n_envs, hi, low_act_dim), dtype=np.float32)
         else:
@@ -644,6 +698,7 @@ class HIROSAC:
             signal_feat = self._get_signal_features()
             high_obs = self._build_high_obs(obs, signal_feat)
             _, kin, kin_flat = utils.split_time_kinematics(obs, self.n_veh, self.feat_dim)
+            obs_extra = np.asarray(obs[:, 1 + self.kin_flat_dim : 1 + self.kin_flat_dim + self.obs_extra_dim], dtype=np.float32)
 
             # step a high interval for required envs
             need_high_now = need_high & active_obs_mask
@@ -676,6 +731,15 @@ class HIROSAC:
                 low_safety_clip_count[idx] = 0
                 for v in low_comp_sums.values():
                     v[idx] = 0.0
+                for v in high_comp_sums.values():
+                    v[idx] = 0.0
+                high_acc_min[idx] = np.inf
+                high_acc_max[idx] = -np.inf
+                high_acc_sum[idx] = 0.0
+                high_acc_abs_sum[idx] = 0.0
+                high_acc_count[idx] = 0
+                high_acc_hard_brake[idx] = 0
+                high_acc_hard_accel[idx] = 0
 
                 if opc_enabled:
                     opc_low_obs_seq[idx] = 0.0
@@ -687,7 +751,7 @@ class HIROSAC:
                 need_high[idx] = False
 
             # === 1.2 Low Level Decision ===
-            low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys, signal_feat)
+            low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys, obs_extra)
             if obs_skip_mask.any():
                 low_obs[obs_skip_mask] = 0.0
             low_safety_clipped = np.zeros(n_envs, dtype=bool)
@@ -740,15 +804,45 @@ class HIROSAC:
             skip_replay_mask = np.asarray([bool(info.get("skip_replay", False)) for info in infos], dtype=bool)
             replay_mask = ~skip_replay_mask
             next_obs_is_dummy = np.asarray([bool(info.get("next_obs_is_dummy", False)) for info in infos], dtype=bool)
+            inter_episode_mask = np.asarray([bool(info.get("inter_episode", False)) for info in infos], dtype=bool)
+            dummy_finished_mask = skip_replay_mask & inter_episode_mask & (~next_obs_is_dummy)
             replay_count = int(np.sum(replay_mask))
 
             next_obs_tr = self._terminal_obs(next_obs, done, infos)
             signal_feat_next = self._get_signal_features()
+            if bool(getattr(self.cfg, "high_obs_use_signal_features", True)) and done.any():
+                for i in np.flatnonzero(done):
+                    tsig = infos[i].get("terminal_signal_features")
+                    if tsig is None:
+                        continue
+                    try:
+                        sig_i = np.asarray(tsig, dtype=np.float32).reshape(-1)
+                        if sig_i.size >= 2:
+                            signal_feat_next[i, 0] = float(sig_i[0])
+                            signal_feat_next[i, 1] = float(sig_i[1])
+                    except Exception:
+                        continue
             next_high_obs = self._build_high_obs(next_obs_tr, signal_feat_next)
             _, kin_next, kin_flat_next = utils.split_time_kinematics(next_obs_tr, self.n_veh, self.feat_dim)
+            next_obs_extra = np.asarray(next_obs_tr[:, 1 + self.kin_flat_dim : 1 + self.kin_flat_dim + self.obs_extra_dim], dtype=np.float32)
 
             # === 1.3 Calculate Rewards ===
             r_components = [info.get("reward_components", {}) for info in infos]
+            physical_acc = np.zeros(n_envs, dtype=np.float32)
+            try:
+                acc_cmd = np.asarray(low_action, dtype=np.float32)
+                if acc_cmd.ndim == 2 and acc_cmd.shape[1] >= 2:
+                    physical_acc = acc_cmd[:, 1].astype(np.float32)
+                    scaled_mask = (physical_acc >= -1.0001) & (physical_acc <= 1.0001)
+                    physical_acc[scaled_mask] = (
+                        (physical_acc[scaled_mask] + 1.0)
+                        * 0.5
+                        * (float(self._acc_max) - float(self._acc_min))
+                        + float(self._acc_min)
+                    )
+                    physical_acc = np.clip(physical_acc, float(self._acc_min), float(self._acc_max))
+            except Exception:
+                physical_acc = np.zeros(n_envs, dtype=np.float32)
 
             # High-level reward policy switch:
             # True  -> replace mixed comfort (acc+jerk) with acc-only comfort contribution
@@ -763,6 +857,32 @@ class HIROSAC:
                 high_ret += reward_env * replay_mask_f - comfort_mixed + comfort_acc_only
             else:
                 high_ret += reward_env * replay_mask_f
+
+            if replay_mask.any():
+                for i, rc in enumerate(r_components):
+                    if not replay_mask[i]:
+                        continue
+                    high_comp_sums["collision_reward"][i] += float(rc.get("collision_reward", 0.0))
+                    high_comp_sums["progress_reward"][i] += float(rc.get("progress_reward", 0.0))
+                    high_comp_sums["speed_ref_aux_reward"][i] += float(rc.get("speed_ref_aux_reward", 0.0))
+                    if self.high_use_acc_only_comfort:
+                        high_comp_sums["comfort_reward_for_high"][i] += float(
+                            rc.get("comfort_reward_acc_only_for_high", rc.get("comfort_reward", 0.0))
+                        )
+                    else:
+                        high_comp_sums["comfort_reward_for_high"][i] += float(rc.get("comfort_reward", 0.0))
+                    high_comp_sums["lane_change_reward"][i] += float(rc.get("lane_change_reward", 0.0))
+                    high_comp_sums["punctual_reward"][i] += float(rc.get("punctual_reward", 0.0))
+                    high_comp_sums["wrong_lane_terminal_penalty"][i] += float(rc.get("wrong_lane_terminal_penalty", 0.0))
+                idx_replay = np.flatnonzero(replay_mask)
+                acc_replay = physical_acc[idx_replay]
+                high_acc_min[idx_replay] = np.minimum(high_acc_min[idx_replay], acc_replay)
+                high_acc_max[idx_replay] = np.maximum(high_acc_max[idx_replay], acc_replay)
+                high_acc_sum[idx_replay] += acc_replay
+                high_acc_abs_sum[idx_replay] += np.abs(acc_replay)
+                high_acc_count[idx_replay] += 1
+                high_acc_hard_brake[idx_replay] += (acc_replay <= -3.0).astype(np.int32)
+                high_acc_hard_accel[idx_replay] += (acc_replay >= 3.0).astype(np.int32)
 
             punctual = np.asarray([rc.get("punctual_reward", 0.0) for rc in r_components], dtype=np.float32) * replay_mask_f
             low_reward_ext = reward_env * replay_mask_f - punctual
@@ -802,7 +922,7 @@ class HIROSAC:
                 low_comp_sums.setdefault("safety_violation_penalty", np.zeros(n_envs, dtype=np.float32))[replay_mask] += (-safety_penalty[replay_mask])
 
             # === 1.4 Low Level Store & Train ===
-            next_low_obs = self._build_low_obs(c + 1, kin_flat_next, kin_next, goal_phys, signal_feat_next)
+            next_low_obs = self._build_low_obs(c + 1, kin_flat_next, kin_next, goal_phys, next_obs_extra)
             if next_obs_is_dummy.any():
                 next_low_obs[next_obs_is_dummy] = 0.0
             done_low = is_last_step.astype(np.bool_)
@@ -867,7 +987,29 @@ class HIROSAC:
                     self.high_agent.num_timesteps += int(idx_end.size)
                     for j in idx_end:
                         info_h = dict(infos[j])
+                        # SB3 off-policy store uses info["terminal_observation"] for done transitions;
+                        # ensure it matches high-level observation shape instead of raw env obs shape.
+                        if bool(done[j]):
+                            info_h["terminal_observation"] = np.asarray(next_high_obs[j], dtype=np.float32).copy()
                         info_h["high_interval_len"] = int(low_len[j])
+                        info_h["high_env_id"] = int(j)
+                        info_h["high_global_step"] = int(self.total_timesteps)
+                        info_h["high_segment_id"] = int(seg_id[j])
+                        info_h["high_components"] = {
+                            k: float(v[j])
+                            for k, v in high_comp_sums.items()
+                        }
+                        acc_n = max(int(high_acc_count[j]), 1)
+                        acc_min_j = float(high_acc_min[j]) if np.isfinite(high_acc_min[j]) else 0.0
+                        acc_max_j = float(high_acc_max[j]) if np.isfinite(high_acc_max[j]) else 0.0
+                        info_h["high_acc_stats"] = {
+                            "acc_min": acc_min_j,
+                            "acc_max": acc_max_j,
+                            "acc_mean": float(high_acc_sum[j] / acc_n),
+                            "acc_abs_mean": float(high_acc_abs_sum[j] / acc_n),
+                            "hard_brake_frac": float(high_acc_hard_brake[j] / acc_n),
+                            "hard_accel_frac": float(high_acc_hard_accel[j] / acc_n),
+                        }
                         if opc_enabled:
                             info_h["opc_low_obs_seq"] = opc_low_obs_seq[j, : int(low_len[j])].copy()
                             info_h["opc_low_act_seq"] = opc_low_act_seq[j, : int(low_len[j])].copy()
@@ -890,10 +1032,38 @@ class HIROSAC:
                 low_safety_clip_count[idx_end] = 0
                 for v in low_comp_sums.values():
                     v[idx_end] = 0.0
+                for v in high_comp_sums.values():
+                    v[idx_end] = 0.0
+                high_acc_min[idx_end] = np.inf
+                high_acc_max[idx_end] = -np.inf
+                high_acc_sum[idx_end] = 0.0
+                high_acc_abs_sum[idx_end] = 0.0
+                high_acc_count[idx_end] = 0
+                high_acc_hard_brake[idx_end] = 0
+                high_acc_hard_accel[idx_end] = 0
 
                 c[idx_end] = 0
 
             c[replay_mask & (~done_low)] += 1
+            if dummy_finished_mask.any():
+                idx_dummy_done = np.flatnonzero(dummy_finished_mask)
+                need_high[idx_dummy_done] = True
+                c[idx_dummy_done] = 0
+                high_ret[idx_dummy_done] = 0.0
+                low_ret[idx_dummy_done] = 0.0
+                low_len[idx_dummy_done] = 0
+                low_safety_clip_count[idx_dummy_done] = 0
+                for v in low_comp_sums.values():
+                    v[idx_dummy_done] = 0.0
+                for v in high_comp_sums.values():
+                    v[idx_dummy_done] = 0.0
+                high_acc_min[idx_dummy_done] = np.inf
+                high_acc_max[idx_dummy_done] = -np.inf
+                high_acc_sum[idx_dummy_done] = 0.0
+                high_acc_abs_sum[idx_dummy_done] = 0.0
+                high_acc_count[idx_dummy_done] = 0
+                high_acc_hard_brake[idx_dummy_done] = 0
+                high_acc_hard_accel[idx_dummy_done] = 0
             obs = next_obs
             obs_skip_mask = next_obs_is_dummy
         

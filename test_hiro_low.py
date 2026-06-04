@@ -629,6 +629,7 @@ def main(
     scenario_spec = get_scenario_spec(scenario_name)
     importlib.import_module(str(scenario_spec["module"]))
     env_id = str(scenario_spec["env_id"])
+    print(f"[LOW TEST] scenario={scenario_name}, env_id={env_id}")
 
     env_config = get_env_config_for_scenario(scenario_name, test_overrides)
     n_local = int(env_config.get("observation", {}).get("vehicles_count_local", 1))
@@ -678,19 +679,11 @@ def main(
     q_sa_a1_mesh_ref: Optional[np.ndarray] = None
 
     def _build_low_obs_for_q(obs_raw: np.ndarray) -> np.ndarray:
-        """Build low-level observation exactly as HIROPolicyRunner.act() does."""
+        """Build low_obs as [t_norm, local_kin_flat, goal_rel] (no signal dims)."""
         _, kin_local, kin_flat_local = runner._split(obs_raw)
         ego_sub_local = runner._ego_sub(kin_local)
         t_norm_local = np.array([runner.c / float(runner.hi)], dtype=np.float32)
         goal_rel_local = (runner.goal_phys - ego_sub_local).astype(np.float32)
-        signal_local = np.array([1.0, 0.0], dtype=np.float32)
-        signal_fn = getattr(env.unwrapped, "get_hiro_signal_features", None)
-        if callable(signal_fn):
-            try:
-                sig_color, sig_remain = signal_fn()
-                signal_local = np.array([1.0 if float(sig_color) > 0.5 else 0.0, float(sig_remain)], dtype=np.float32)
-            except Exception:
-                signal_local = np.array([1.0, 0.0], dtype=np.float32)
         local_kin_flat_local = np.asarray(kin_flat_local[0, :runner.local_kin_flat_dim], dtype=np.float32).copy()
 
         if bool(getattr(runner.cfg, "mask_ego_position_in_low_obs", False)):
@@ -700,7 +693,7 @@ def main(
                 local_kin_flat_local[idx_x_local] = 0.0
                 local_kin_flat_local[idx_y_local] = 0.0
 
-        return np.concatenate([t_norm_local, local_kin_flat_local, goal_rel_local, signal_local]).astype(np.float32)
+        return np.concatenate([t_norm_local, local_kin_flat_local, goal_rel_local]).astype(np.float32)
 
     def _record_q_sa_for_step(step_idx: int, low_obs_state: np.ndarray, action_ref: np.ndarray, chosen_action: Optional[np.ndarray] = None):
         nonlocal q_sa_a0_mesh_ref, q_sa_a1_mesh_ref
@@ -1151,26 +1144,26 @@ if __name__ == "__main__":
     #    - 可选 case_id 列作为输出目录名）
 
     main(
-        low_model_path="./models/hiro_260311_lowonly_uniform_RS_newSLv2_vioPenalty03/hiro_low_final.zip",
+        low_model_path="./models/hiro_260416_lowonly_reUni_amax3_dmin15_10_newEnv/hiro_low_final.zip",
         # low_model_path="./models/hiro_260321_lowonly_reachableUniform_newSLv2_vio03_HER_reDim_amax3_dmin0/hiro_low_final.zip",
         # low_model_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
         steps=25,
-        ego_state=[0.0, 4.0, 10.0, 0.0],
+        # ego_state=[0.0, 4.0, 10.0, 0.0],
+        # neighbors_state=[
+        #     [30.0, 4.0, 10.0, 0.0],
+        #     [60.0, 8.0, 12.0, 0.0],
+        #     [30.0, 0.0, 10.0, 0.0],
+        #     [5.0, 8.0, 15.0, 0.0],
+        # ],
+        # goal_phys=[20, 4, 10, 0],
+        ego_state=[0.0, 8.0, 10.0, 0.0],
         neighbors_state=[
             [30.0, 4.0, 10.0, 0.0],
             [60.0, 8.0, 12.0, 0.0],
             [30.0, 0.0, 10.0, 0.0],
-            [5.0, 8.0, 15.0, 0.0],
+            [25.0, 8.0, 15.0, 0.0],
         ],
-        goal_phys=[30, 4, 10, 0],
-        # ego_state=[0.000000, 8.000000, 12.320744, 0],
-        # neighbors_state=[
-        #     [33.611660, 0, 12.699497, 0.000000],
-        #     [55.454609, 4, 12.963794, 0.000000],
-        #     [73.182320, 8, 12.303981, 0.000000],
-        #     [85.691025, 0, 13.218258, 0.000000],
-        # ],
-        # goal_phys=[31.408527, 8, 0, 0.000000],
+        goal_phys=[25, 8, 0, 0],
         # batch_cases_csv="low_test_cases.csv",
         # batch_cases_csv="low_test_cases_debug.csv",
         use_low_safety_layer=True,
@@ -1220,6 +1213,8 @@ if __name__ == "__main__":
         lane_change_min_rear_gap=10.0,
         lane_change_min_front_ttc=3.0,
         lane_change_min_rear_ttc=2.0,
+        scenario_name="multi_lane_stop_to_int",
+        # scenario_name="multi_lane",
         # uniform_trials=1000,
         # uniform_metric_name="abs_dy",
         # uniform_metric_fn=_abs_dy_metric_fn,

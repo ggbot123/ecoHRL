@@ -24,6 +24,7 @@ class GoalMarker(Landmark):
         self.collidable = False  # Purely visual, no collision physics
 
 class BusStop(Obstacle):
+    affects_traffic = False
     """
     静态矩形公交站台，沿道路方向放置。
     length: 沿道路方向长度
@@ -239,6 +240,8 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         cfg.setdefault("movement_lanes", None)
         cfg.setdefault("movement_behavior_probs", None)
         cfg.setdefault("background_vehicle_respect_movement_lanes", True)
+        cfg.setdefault("enable_signal_virtual_stops", True)
+        cfg.setdefault("single_road_network", True)
         cfg.setdefault("inter_episode_as_steps", False)
         cfg.setdefault("inter_episode_step_seconds", 0.0)
         cfg.setdefault("inter_episode_zero_obs", True)
@@ -279,48 +282,67 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             )
 
         # Main forward road (ego direction)
-        for lane_id in range(lanes):
-            y = lane_id * lane_w
-            net.add_lane(
-                "0",
-                "1",
-                StraightLane(
-                    np.array([0.0, y]),
-                    np.array([approach_end, y]),
-                    line_types=_normal_line_types(lane_id),
-                    speed_limit=speed_limit,
-                ),
-            )
-            net.add_lane(
-                "1",
-                "2",
-                StraightLane(
-                    np.array([approach_end, y]),
-                    np.array([intersection_end, y]),
-                    line_types=_intersection_line_types(lane_id),
-                    speed_limit=speed_limit,
-                ),
-            )
-
-            if post_length > 1e-6:
+        if bool(self.config.get("single_road_network", True)):
+            for lane_id in range(lanes):
+                y = lane_id * lane_w
                 net.add_lane(
-                    "2",
-                    "3",
+                    "0",
+                    "1",
                     StraightLane(
-                        np.array([intersection_end, y]),
+                        np.array([0.0, y]),
                         np.array([road_total, y]),
                         line_types=_normal_line_types(lane_id),
                         speed_limit=speed_limit,
                     ),
                 )
+            # Render metadata remains in global x, while every physical lane is
+            # on one road id. This avoids segment-boundary blind spots.
+            self._main_segments = [("0", "1", 0.0, road_total)]
+        else:
+            for lane_id in range(lanes):
+                y = lane_id * lane_w
+                net.add_lane(
+                    "0",
+                    "1",
+                    StraightLane(
+                        np.array([0.0, y]),
+                        np.array([approach_end, y]),
+                        line_types=_normal_line_types(lane_id),
+                        speed_limit=speed_limit,
+                    ),
+                )
+                net.add_lane(
+                    "1",
+                    "2",
+                    StraightLane(
+                        np.array([approach_end, y]),
+                        np.array([intersection_end, y]),
+                        line_types=_intersection_line_types(lane_id),
+                        speed_limit=speed_limit,
+                    ),
+                )
 
-        # Store longitudinal segmentation metadata in global x.
-        self._main_segments = [
-            ("0", "1", 0.0, approach_end),
-            ("1", "2", approach_end, intersection_end),
-        ]
-        if post_length > 1e-6:
-            self._main_segments.append(("2", "3", intersection_end, road_total))
+                if post_length > 1e-6:
+                    net.add_lane(
+                        "2",
+                        "3",
+                        StraightLane(
+                            np.array([intersection_end, y]),
+                            np.array([road_total, y]),
+                            line_types=_normal_line_types(lane_id),
+                            speed_limit=speed_limit,
+                        ),
+                    )
+
+            # Store longitudinal segmentation metadata in global x.
+            self._main_segments = [
+                ("0", "1", 0.0, approach_end),
+                ("1", "2", approach_end, intersection_end),
+            ]
+            if post_length > 1e-6:
+                self._main_segments.append(("2", "3", intersection_end, road_total))
+        self._intersection_start_x = approach_end
+        self._intersection_end_x = intersection_end
         self._road_end_x = road_total
         self._signal_controller = IntersectionSignalController(self.config, lanes)
         self._signal_render_x = 0.5 * (approach_end + intersection_end)
@@ -434,7 +456,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._inter_episode_active = True
         self._inter_episode_remaining = max(float(seconds), 0.0)
 
-        lane_id = self._start_lane_id()
+        lane_id = self._initial_lane_id()
         lane_index = ("0", "1", int(lane_id))
         lane = self.road.network.get_lane(lane_index)
         position = lane.position(0.0, 0.0)
@@ -486,6 +508,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             "inter_episode": True,
             "skip_replay": True,
             "next_obs_is_dummy": not finished,
+            "env_diagnostics": self._env_diagnostics(),
         }
         return obs, 0.0, False, False, info
 
@@ -596,6 +619,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             info["inter_episode"] = False
             info["skip_replay"] = False
             info["next_obs_is_dummy"] = bool(next_obs_is_dummy)
+            info["env_diagnostics"] = self._env_diagnostics()
+            if bool(terminated or truncated):
+                info["terminal_signal_features"] = tuple(self.get_hiro_signal_features())
 
         sim_freq = float(self.config["simulation_frequency"])
         pol_freq = float(self.config["policy_frequency"])
@@ -605,6 +631,41 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._spawn_background(self.config["spawn_probability"] * (sim_freq / pol_freq))    # TODO: 完善增车策略，现在是按policy_freq集总生成，不是按simu_freq生成
 
         return obs, reward, terminated, truncated, info
+
+    def _env_diagnostics(self) -> dict:
+        bg = [v for v in self.road.vehicles if v not in self.controlled_vehicles]
+        valid = [v for v in bg if not getattr(v, "crashed", False)]
+        speeds = [
+            float(getattr(v, "speed", np.linalg.norm(getattr(v, "velocity", np.zeros(2)))))
+            for v in valid
+        ]
+        xs = [float(np.asarray(getattr(v, "position", [np.nan, np.nan]), dtype=float)[0]) for v in valid]
+        goal_x = float(self._goal_longitudinal())
+        near_goal_low = sum(1 for x, s in zip(xs, speeds) if goal_x - 40.0 <= x <= goal_x + 10.0 and s < 2.0)
+        ego_pos = np.asarray(getattr(self.vehicle, "position", [np.nan, np.nan]), dtype=float)
+        lane_index = getattr(self.vehicle, "lane_index", (None, None, -1))
+        signal_is_green, signal_remaining = self.get_hiro_signal_features()
+        return {
+            "time": float(getattr(self, "time", 0.0)),
+            "signal_time_global": float(getattr(self, "_signal_time_global", np.nan)),
+            "signal_episode_base": float(getattr(self, "_signal_episode_base", np.nan)),
+            "ego_x": float(ego_pos[0]),
+            "ego_y": float(ego_pos[1]),
+            "ego_speed": float(getattr(self.vehicle, "speed", 0.0)),
+            "ego_lane": int(lane_index[2]) if lane_index is not None and len(lane_index) >= 3 else -1,
+            "bg_count": int(len(bg)),
+            "bg_valid_count": int(len(valid)),
+            "bg_low_speed_1": int(sum(1 for s in speeds if s < 1.0)),
+            "bg_low_speed_2": int(sum(1 for s in speeds if s < 2.0)),
+            "bg_near_goal_low": int(near_goal_low),
+            "bg_min_speed": float(min(speeds)) if speeds else np.nan,
+            "bg_mean_speed": float(np.mean(speeds)) if speeds else np.nan,
+            "bg_max_x": float(max(xs)) if xs else np.nan,
+            "virtual_stop_count": int(len(getattr(self, "_virtual_stops", {}) or {})),
+            "signal_is_green": float(signal_is_green),
+            "signal_remaining": float(signal_remaining),
+            "inter_episode_active": float(bool(getattr(self, "_inter_episode_active", False))),
+        }
 
     def _update_signal_render_items(
         self,
@@ -659,7 +720,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         lane_index = ("0", "1", int(lane_id))
         lane = self.road.network.get_lane(lane_index)
-        stop_local = max(lane.length - 0.5, 0.0)
+        stop_local = float(np.clip(self._goal_longitudinal() - 0.5, 0.0, lane.length))
         pos = lane.position(stop_local, 0.0)
         heading = lane.heading_at(stop_local)
 
@@ -702,6 +763,15 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         groups = self._signal_controller.direction_lane_groups
 
         self._update_signal_render_items(phase)
+
+        if not bool(self.config.get("enable_signal_virtual_stops", True)):
+            for _, v in list(self._virtual_stops.items()):
+                try:
+                    self.road.objects.remove(v)
+                except ValueError:
+                    pass
+            self._virtual_stops = {}
+            return
 
         ego = getattr(self, "vehicle", None)
         ego_lane_id = None
@@ -849,6 +919,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             self._has_arrived = True
             self._arrival_time = self.time
             punctual = self._punctual_factor(self._arrival_time)
+        wrong_lane_terminal = float(self._goal_longitudinal_reached() and not self._goal_reached())
 
         self._last_speed = cur_speed
         self._last_acc = acc
@@ -862,6 +933,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             "comfort_reward_acc_only": comfort_acc_only,
             "lane_change_reward": lane_changed,
             "punctual_reward": punctual,
+            "wrong_lane_terminal_penalty": wrong_lane_terminal,
             "on_road_reward": float(self.vehicle.on_road),
         }
     
@@ -991,6 +1063,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         cfg = self.config
         min_gap = float(cfg.get("spawn_min_gap", 10.0))          # 纯空间
         min_t_headway = float(cfg.get("spawn_min_t_headway", 1.5))  # 车头时距
+        check_cutins = bool(cfg.get("spawn_check_adjacent_cutins", False))
+        cutin_front_gap = float(cfg.get("spawn_adjacent_cutin_front_gap", 15.0))
+        cutin_back_gap = float(cfg.get("spawn_adjacent_cutin_back_gap", 5.0))
         front_dist = None
 
         # 计算最近的前车距离
@@ -998,6 +1073,24 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             li = getattr(v, "lane_index", None)
             if li is None or len(li) < 3:
                 continue
+            if check_cutins:
+                target_li = getattr(v, "target_lane_index", None)
+                is_targeting_spawn_lane = (
+                    isinstance(target_li, tuple)
+                    and len(target_li) >= 3
+                    and target_li[0] == lane_index[0]
+                    and target_li[1] == lane_index[1]
+                    and target_li[2] == lane_index[2]
+                )
+                is_adjacent_lane = (
+                    li[0] == lane_index[0]
+                    and li[1] == lane_index[1]
+                    and abs(int(li[2]) - int(lane_index[2])) == 1
+                )
+                if is_targeting_spawn_lane and is_adjacent_lane:
+                    longi_cutin, _ = lane.local_coordinates(v.position)
+                    if -cutin_back_gap <= float(longi_cutin) <= cutin_front_gap:
+                        return False
             if li[0] != lane_index[0] or li[1] != lane_index[1] or li[2] != lane_index[2]:
                 continue
             longi, _ = lane.local_coordinates(v.position)
@@ -1053,7 +1146,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
     def _create_ego(self):
         cfg = self.config
-        lane_id = self._start_lane_id()
+        lane_id = self._initial_lane_id()
         lane_index = ("0", "1", int(lane_id))
         lane = self.road.network.get_lane(lane_index)
         ego_speed = self._sample_ego_speed()
@@ -1103,7 +1196,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
     def _goal_reached(self) -> bool:
         """在目标车道且 x >= goal_longitudinal（默认路口前）"""
-        if self.vehicle.lane_index[2] != self._target_lane_id():
+        if self.vehicle.lane_index[2] != self._goal_lane_id():
             return False
         return self._goal_longitudinal_reached()
     
@@ -1129,7 +1222,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         return 1.0 - 0.5 * d
     
     def _create_bus_stop(self):
-        lane_id = self._start_lane_id()
+        lane_id = self._initial_lane_id()
         lanes = int(self.config["lanes_count"])
         lane_index = ("0", "1", lane_id)
         lane = self.road.network.get_lane(lane_index)
@@ -1139,7 +1232,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         lane_half_width = getattr(lane, "width", 4.0) / 2.0
         margin = 0.5  # 车道右缘和站台中线之间留一点间隙
 
-        # Always place the stop on the outer side of the selected start lane.
+        # Always place the stop on the outer side of the selected initial lane.
         side_sign = 1.0 if (2 * lane_id) >= (lanes - 1) else -1.0
 
         lateral_center = side_sign * (lane_half_width + margin + bus_width / 2.0)
@@ -1163,8 +1256,29 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         lanes = int(self.config["lanes_count"])
 
         regions = []
-        lane_id = self._target_lane_id()
+        lane_id = self._goal_lane_id()
         segments = getattr(self, "_main_segments", [])
+
+        # Render-only intersection band. In single-road mode this preserves the
+        # visual cue without splitting the physical road network.
+        ix0 = float(getattr(self, "_intersection_start_x", target_x))
+        ix1 = float(getattr(self, "_intersection_end_x", target_x))
+        if ix1 > ix0:
+            for lane_idx in range(lanes):
+                for _from, _to, seg_start_x, seg_end_x in segments:
+                    overlap_start = max(ix0, seg_start_x)
+                    overlap_end = min(ix1, seg_end_x)
+                    if overlap_end <= overlap_start:
+                        continue
+                    regions.append(
+                        {
+                            "lane_index": (_from, _to, lane_idx),
+                            "s_start": float(overlap_start - seg_start_x),
+                            "s_end": float(max(overlap_end - seg_start_x, overlap_start - seg_start_x + 1e-3)),
+                            "color": (120, 120, 120, 45),
+                        }
+                    )
+
         for _from, _to, seg_start_x, seg_end_x in segments:
             overlap_start = max(x0, seg_start_x)
             overlap_end = min(x1, seg_end_x)
@@ -1206,7 +1320,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         _append_vertical_line(target_x)
 
         # Right stop line (intersection right boundary)
-        right_stop_x = None
+        right_stop_x = float(getattr(self, "_intersection_end_x", np.nan))
+        if not np.isfinite(right_stop_x):
+            right_stop_x = None
         for _from, _to, _, seg_end_x in segments:
             if _from == "1" and _to == "2":
                 right_stop_x = float(seg_end_x)
@@ -1216,9 +1332,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         self.road.highlight_regions = regions
 
-    def _start_lane_id(self) -> int:
+    def _initial_lane_id(self) -> int:
         cfg = self.config
-        lane_cfg = cfg.get("start_lane_id", int(cfg["lanes_count"]) - 1)
+        lane_cfg = cfg.get("initial_lane_id", "random")
         lanes = int(cfg["lanes_count"])
         if lane_cfg == "random":
             return int(self.np_random.integers(lanes))
@@ -1233,10 +1349,10 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         default_target = float(cfg.get("road_length", 500.0)) - float(cfg.get("intersection_buffer", 20.0))
         return float(cfg.get("goal_longitudinal", default_target))
 
-    def _target_lane_id(self) -> int:
+    def _goal_lane_id(self) -> int:
         cfg = self.config
         lanes = int(cfg["lanes_count"])
-        lane_id = int(cfg.get("target_lane_id", cfg.get("goal_lane_id", 0)))
+        lane_id = int(cfg["goal_lane_id"])
         return int(np.clip(lane_id, 0, lanes - 1))
 
     def set_hiro_goal(self, goal_phys: np.ndarray):

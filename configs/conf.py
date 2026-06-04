@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import os
-from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional, Union
+
+from util.config_utils import (
+    build_env_config,
+    build_env_config_for_scenario,
+    get_scenario_spec_from_specs,
+)
 
 
 # =========================
@@ -46,6 +51,7 @@ def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, An
             gamma=0.99,
             tau=0.005,
             learning_rate=3e-4,
+            learning_starts=2000,
             # learning_rate=1e-4,
             train_freq=(1, "step"),
             # train_freq=(4, "step"),
@@ -86,38 +92,6 @@ def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, An
     return sac_kwargs
 
 
-def _deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> Dict[str, Any]:
-    for k, v in src.items():
-        if isinstance(v, Mapping) and isinstance(dst.get(k), dict):
-            _deep_update(dst[k], v)
-        else:
-            dst[k] = v
-    return dst
-
-
-def _sync_observation_with_comfort_switch(cfg: Dict[str, Any]) -> None:
-    """Keep observation features consistent with comfort_use_jerk.
-
-    When jerk penalty is enabled, add ego acceleration feature so the process can stay Markovian.
-    When disabled, remove acceleration to keep legacy observation dimension.
-    """
-    use_jerk = bool(cfg.get("comfort_use_jerk", False))
-    obs_cfg = cfg.setdefault("observation", {})
-    features = list(obs_cfg.get("features", []))
-    features_range = dict(obs_cfg.get("features_range", {}))
-
-    if use_jerk:
-        if "acceleration" not in features:
-            features.append("acceleration")
-        features_range.setdefault("acceleration", [-5.0, 5.0])
-    else:
-        features = [f for f in features if f != "acceleration"]
-        features_range.pop("acceleration", None)
-
-    obs_cfg["features"] = features
-    obs_cfg["features_range"] = features_range
-
-
 # =========================
 # Environment config (MultiLaneEnv)
 # =========================
@@ -141,6 +115,9 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "speed_distribution": "Uniform",
     "spawn_min_gap": 10.0,
     "spawn_min_t_headway": 1.5,
+    "spawn_check_adjacent_cutins": False,
+    "spawn_adjacent_cutin_front_gap": 15.0,
+    "spawn_adjacent_cutin_back_gap": 5.0,
     "behavior_vehicle_types": [
         "custom_env.vehicle.behavior.NormalIDMVehicle",
         "custom_env.vehicle.behavior.AggressiveIDMVehicle",
@@ -163,10 +140,9 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "warmup_each_episode": False,
     # Defer long episode-start offset alignment into multiple lightweight env.step calls.
     "inter_episode_as_steps": False,
-    # <= 0 means use one policy step duration (1 / policy_frequency).
     "inter_episode_step_seconds": 0.0,
-    # Use zero observation during deferred inter-episode simulation steps.
     "inter_episode_zero_obs": True,
+    
     "ego_clear_radius": 20.0,
     # "ego_clear_radius": 10.0,
     # "ego_clear_radius": "auto",
@@ -174,6 +150,7 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
 
     # Observation / Action
     "PERCEPTION_DISTANCE": None,
+    "use_lane_slot_observation": False,
     "observation": {
         "type": "Kinematics",
         "vehicles_count": 5,
@@ -190,6 +167,9 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
         "include_obstacles": False,
         "include_time": True,
         "time_range": [0.0, 50.0],
+        "append_front_vehicle_features": True,
+        "front_vehicle_distance_range": 150.0,
+        "front_vehicle_ttc_range": 30.0,
     },
     "action": {
         "type": "ParamLaneAccelAction",
@@ -203,6 +183,8 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "punctual_time_window": [30.0, 40.0],
     "punctual_time_target": 35.0,
     "punctual_reward": 10.0,
+    # "wrong_lane_terminal_penalty": -5.0,
+    "wrong_lane_terminal_penalty": 0,
 
     # Termination
     "offroad_terminal": False,
@@ -221,11 +203,19 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "comfort_acc_weight": 1.0,
     "comfort_jerk_weight": 0.1,
 
-    # "lane_change_reward": -1.0,
-    "lane_change_reward": -0.5,
+    "lane_change_reward": -1.0,
+    # "lane_change_reward": -0.5,
     
-    # RuleBasedController compute_action strategy: "target_speed_lane" | "goal_x_accel" | "idm_mobil"
-    "rule_based_compute_action_mode": "goal_x_accel",
+    # RuleBasedController compute_action strategy: "target_speed_lane" | "goal_x_accel" | "goal_x_accel_follow" | "idm_mobil"
+    # "rule_based_compute_action_mode": "goal_x_accel",
+    "rule_based_compute_action_mode": "goal_x_accel_follow",
+    "rule_follow_mode_enabled": True,
+    "rule_follow_enter_gap": 12.0,
+    "rule_follow_release_gap": 15.0,
+    "rule_follow_enter_ttc": 2.0,
+    "rule_follow_release_ttc": 4.0,
+    "rule_follow_max_acc": 0.0,
+    "rule_follow_reset_on_high_interval": True,
 
     # SAC can optionally reuse HIRO low-safety-filter lane-change constraints.
     "enable_sac_low_safety_filter": True,
@@ -236,7 +226,12 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
     "multi_lane": {
         "module": "scenarios.multi_lane",
         "env_id": "multi-lane-custom-v0",
-        "env_overrides": {},
+        "env_overrides": {
+            "spawn_probability": 0.05,
+            "initial_lane_id": 2,
+            "goal_lane_id": 1,
+        },
+        "use_lane_slot_observation": False,
     },
     "multi_lane_stop_to_int": {
         "module": "scenarios.multi_lane_stop_to_int",
@@ -244,14 +239,21 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
         "env_overrides": {
             "lanes_count": 3,
             "spawn_probability": 0.05,
-            "start_lane_id": 2,
-            "start_longitudinal": 0.0,
-            "target_lane_id": 1,
+            # "spawn_probability": 0.07,
+            "behavior_lane_probs": [
+                [0.6, 0.3, 0.1],
+                [0.6, 0.3, 0.1],
+                [0.4, 0.3, 0.3],
+            ],
+            "initial_lane_id": 2,
+            "goal_lane_id": 1,
+            "single_road_network": True,
             "intersection_length": 50.0,
             "movement_lanes": {
                 "straight": [0, 1, 2],
             },
-            "background_vehicle_respect_movement_lanes": True,
+            "background_vehicle_respect_movement_lanes": False,
+            "start_longitudinal": 0.0,
             "goal_longitudinal": 400.0,
             "punctual_time_window": [30.0, 40.0],
             "punctual_time_target": 35.0,
@@ -259,34 +261,40 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
                 {"straight": 63.0},
                 {"left": 37.0},
             ],
+            "enable_signal_virtual_stops": True,
             "signal_cycle_offset": 0.0,
             "align_ego_spawn_to_signal_offset": True,
-            "episode_start_phase_offset": 25.0,
+            # "episode_start_phase_offset": 0.0,
+            "episode_start_phase_offset": 20.0,
             "inter_episode_as_steps": True,
             "inter_episode_step_seconds": 0.1,
             "inter_episode_zero_obs": True,
+            
+            "spawn_check_adjacent_cutins": True,
+            "spawn_adjacent_cutin_front_gap": 15.0,
+            "spawn_adjacent_cutin_back_gap": 5.0,
+
+            "use_lane_slot_observation": False,
+            # "use_lane_slot_observation": True,
         },
     },
 }
 
 
 def get_scenario_spec(scenario_name: str) -> Dict[str, Any]:
-    key = str(scenario_name).strip().lower()
-    if key not in _SCENARIO_SPECS:
-        supported = ", ".join(sorted(_SCENARIO_SPECS.keys()))
-        raise ValueError(f"Unknown scenario '{scenario_name}'. Supported: {supported}")
-    return deepcopy(_SCENARIO_SPECS[key])
+    return get_scenario_spec_from_specs(_SCENARIO_SPECS, scenario_name)
 
 
 def get_env_config_for_scenario(
     scenario_name: str,
     overrides: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    spec = get_scenario_spec(scenario_name)
-    merged_overrides: Dict[str, Any] = deepcopy(spec.get("env_overrides", {}))
-    if overrides:
-        _deep_update(merged_overrides, overrides)
-    return get_env_config(merged_overrides)
+    return build_env_config_for_scenario(
+        _MULTILANE_BASE_ENV_CONFIG,
+        _SCENARIO_SPECS,
+        scenario_name,
+        overrides,
+    )
 
 
 def get_env_config(overrides: Mapping[str, Any] | None = None) -> Dict[str, Any]:
@@ -295,11 +303,7 @@ def get_env_config(overrides: Mapping[str, Any] | None = None) -> Dict[str, Any]
     This function performs a deep-merge, so nested keys like observation/action can be overridden partially
     without losing required defaults (e.g. vehicles_count/features/include_time).
     """
-    cfg = deepcopy(_MULTILANE_BASE_ENV_CONFIG)
-    if overrides:
-        _deep_update(cfg, overrides)
-    _sync_observation_with_comfort_switch(cfg)
-    return cfg
+    return build_env_config(_MULTILANE_BASE_ENV_CONFIG, overrides)
 
 
 # =========================
@@ -348,20 +352,20 @@ def get_hiro_config():
         device="auto",
 
         # train_mode="joint",
-        # train_mode="high_only",
-        train_mode="low_only",
+        train_mode="high_only",
+        # train_mode="low_only",
 
         intrinsic_coef=intrinsic_coef,
         intrinsic_norm_ranges=intrinsic_norm_ranges,
         intrinsic_weights=intrinsic_weights,
         intrinsic_type=intrinsic_type,
 
-        # goal_sampler=GoalSamplerConfig(
-        #     type="uniform",
-        # ),
         goal_sampler=GoalSamplerConfig(
-            type="reachable_uniform",
+            type="uniform",
         ),
+        # goal_sampler=GoalSamplerConfig(
+        #     type="reachable_uniform",
+        # ),
         # goal_sampler=GoalSamplerConfig(
         #     type="reachable_gaussian",
         #     gaussian_mean_x_m=27.0,
@@ -381,12 +385,9 @@ def get_hiro_config():
         #     action=[25.0, 0.0, 10.0],
         # ),
 
-        low_level_type="sac",
-        # low_level_type="rule_based",
-
-        low_sac_impl="sac",
-        # low_sac_impl="safety_sac",
-        # low_sac_impl="auto",
+        low_level_type="rule_based",
+        # low_level_type="sac",
+        # low_sac_impl="sac",
 
         # low_use_her=False,
         low_use_her=True,
@@ -399,19 +400,15 @@ def get_hiro_config():
         use_low_safety_layer=True,
         # use_low_safety_layer=False,
 
-        # use_high_goal_safety_layer=False,
-        use_high_goal_safety_layer=True,
-        high_goal_safe_eps=1e-6,
+        use_high_goal_safety_layer=False,
+        # use_high_goal_safety_layer=True,
+        # high_goal_safe_eps=1e-6,
 
         high_goal_safe_use_custom_kinematics=True,
         high_goal_safe_max_accel=3.0,
         high_goal_safe_max_decel=3.0,
         high_goal_safe_front_dmin=15.0,
         high_goal_safe_lane_change_rear_dmin=10.0,
-        # high_goal_safe_front_dmin=10.0,
-        # high_goal_safe_lane_change_rear_dmin=8.0,
-        # high_goal_safe_front_dmin=0.0,
-        # high_goal_safe_lane_change_rear_dmin=0.0,
         high_goal_safe_min_goal_x_span=0,
 
         low_safety_violation_penalty=0.3,
@@ -426,20 +423,33 @@ def get_hiro_config():
             # lane_change_min_rear_ttc=0.0,
         ),
         # low_safety_filter=LowSafetyFilterConfig(
-        #     type="mpc_constraints",
-        #     lane_change_min_front_gap=10.0,
-        #     lane_change_min_rear_gap=8.0,
-        #     lane_change_min_front_ttc=3.0,
-        #     lane_change_min_rear_ttc=2.0,
+        #     type="RSS",
+        #     safe_gap_d_min=6.0,
+        #     safe_gap_tau=0.6,
+        #     safe_gap_b_ego=3.0,
+        #     safe_gap_b_front=3.0,
+        #     safe_gap_comfort_decel=-3.0,
+        #     safe_gap_emergency_decel=-5.0,
+        #     safe_gap_emergency_ttc=1.0,
+        #     safe_gap_emergency_distance=10.0,
         # ),
         # low_safety_filter=LowSafetyFilterConfig(
         #     type="legacy",
         # ),
+        # low_safety_filter=LowSafetyFilterConfig(
+        #     type="legacy_mpc_max",
+        #     lane_change_min_front_gap=15.0,
+        #     lane_change_min_rear_gap=10.0,
+        #     lane_change_min_front_ttc=3.0,
+        #     lane_change_min_rear_ttc=2.0,
+        # ),
 
         mask_ego_position_in_low_obs=True,
-        # mask_ego_position_in_low_obs=False,
         fixed_goal_vx=0.0,
         # fixed_goal_vx=None,
+
+        # high_obs_use_signal_features=False,
+        high_obs_use_signal_features=True,
     )
 
 def get_hiro_high_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
@@ -451,12 +461,25 @@ def get_hiro_high_sac_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
     numerics_guard = dict(kwargs.get("numerics_guard", {}) or {})
     numerics_guard["save_dir"] = run_log_dir
     kwargs["numerics_guard"] = numerics_guard
+    kwargs["q_replay_debug"] = dict(
+        enabled=True,
+        save_dir=run_log_dir,
+        file_name="q_replay_debug.csv",
+        target_q_lte=-20.0,
+        next_q_lte=-20.0,
+        max_rows_per_update=8,
+        max_total_rows=200_000,
+        period_updates=0,
+        record_full_obs=True,
+    )
     
     # Static config for HiROHighReplayBuffer
     kwargs["replay_buffer_kwargs"] = dict(
         n_candidates=20,
         noise_std=0.5,
         enable_off_policy_correction=True,
+        # In this task, the 50s episode timeout is a real failure/terminal
+        handle_timeout_termination=False,
     )
     return kwargs
 

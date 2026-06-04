@@ -497,6 +497,8 @@ class Road:
         s_front = s_rear = None
         v_front = v_rear = None
         for v in self.vehicles + self.objects:
+            if getattr(v, "affects_traffic", True) is False:
+                continue
             if v is not vehicle and not isinstance(
                 v, Landmark
             ):  # self.network.is_connected_road(v.lane_index,

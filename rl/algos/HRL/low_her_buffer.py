@@ -47,6 +47,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         *,
         feat_dim: int,
         kin_flat_dim: int,
+        obs_extra_dim: int,
         ego_feature_idx: List[int],
         intrinsic_coef: float,
         intrinsic_norm_ranges: np.ndarray,
@@ -70,6 +71,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
 
         self.feat_dim = int(feat_dim)
         self.kin_flat_dim = int(kin_flat_dim)
+        self.obs_extra_dim = int(obs_extra_dim)
         self.ego_feature_idx = np.asarray(ego_feature_idx, dtype=np.int32).reshape(-1)
         self.ego_dim = int(self.ego_feature_idx.size)
 
@@ -86,7 +88,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             raise ValueError(f"Unknown her_strategy: {self.her_strategy}")
         self.enable_her = bool(enable_her)
 
-        self.goal_start = int(1 + self.kin_flat_dim)
+        self.goal_start = int(1 + self.kin_flat_dim + self.obs_extra_dim)
         self.goal_end = int(self.goal_start + self.ego_dim)
 
         self._seg_id = np.full((self.buffer_size, self.n_envs), -1, dtype=np.int64)

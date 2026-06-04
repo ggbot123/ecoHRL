@@ -6,12 +6,14 @@ import numpy as np
 import os
 import csv
 import json
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from util.plot_result import *
 from util.hiro_utils import unique_path, load_hiro_models
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
+from rl.algos.HRL.goal_samplers import GoalSamplerConfig, get_goal_sampler
 from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 
 
@@ -25,6 +27,10 @@ def main(
     low_model_dir: Optional[str] = None,
     model_suffix: Optional[str] = "final",
     use_low_safety_layer: Optional[bool] = None,
+    use_goal_sampler_for_high: bool = False,
+    high_goal_sampler_type: Optional[str] = None,
+    high_goal_sampler_path: Optional[str] = None,
+    high_goal_sampler_deterministic: Optional[bool] = None,
     enable_rendering: bool = True,
     scenario_name: str = "multi_lane",
 ):
@@ -148,6 +154,50 @@ def main(
         use_low_safety_layer=use_low_safety_layer,
     )
 
+    if use_goal_sampler_for_high:
+        cfg_goal_sampler = getattr(hiro_cfg, "goal_sampler", GoalSamplerConfig(type="uniform"))
+        if isinstance(cfg_goal_sampler, GoalSamplerConfig):
+            sampler_cfg = cfg_goal_sampler
+        else:
+            sampler_cfg = GoalSamplerConfig(
+                type=str(getattr(cfg_goal_sampler, "type", "uniform")),
+                path=getattr(cfg_goal_sampler, "path", None),
+                device=str(getattr(cfg_goal_sampler, "device", "auto")),
+                deterministic=bool(getattr(cfg_goal_sampler, "deterministic", True)),
+                action=getattr(cfg_goal_sampler, "action", None),
+                gaussian_mean_x_m=float(getattr(cfg_goal_sampler, "gaussian_mean_x_m", 27.0)),
+                gaussian_half_range_m=float(getattr(cfg_goal_sampler, "gaussian_half_range_m", 5.0)),
+            )
+        if high_goal_sampler_type is not None:
+            sampler_cfg = replace(sampler_cfg, type=str(high_goal_sampler_type))
+        if high_goal_sampler_path is not None:
+            sampler_cfg = replace(sampler_cfg, path=str(high_goal_sampler_path))
+        if high_goal_sampler_deterministic is not None:
+            sampler_cfg = replace(sampler_cfg, deterministic=bool(high_goal_sampler_deterministic))
+
+        def _goal_bounds_fn(high_obs_batch: np.ndarray) -> Dict[str, np.ndarray]:
+            calc = getattr(runner, "high_goal_safe_bounds", None)
+            if calc is None:
+                raise RuntimeError("high_goal_safe_bounds is not initialized")
+            return calc.compute_np(np.asarray(high_obs_batch, dtype=np.float32))
+
+        def _goal_speed_fn(high_obs_batch: np.ndarray) -> np.ndarray:
+            arr = np.asarray(high_obs_batch, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            vx_idx_in_high_obs = 1 + int(getattr(runner, "idx_vx", 2))
+            if arr.shape[1] <= vx_idx_in_high_obs:
+                return np.zeros((arr.shape[0],), dtype=np.float32)
+            return np.maximum(arr[:, vx_idx_in_high_obs], 0.0).astype(np.float32)
+
+        high_policy = get_goal_sampler(
+            sampler_cfg,
+            action_space=high_model.action_space,
+            bounds_fn=_goal_bounds_fn,
+            speed_fn=_goal_speed_fn,
+        )
+        runner.high_policy = high_policy
+
     reward_keys_high = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "punctual_reward", "on_road_reward"]
     reward_keys_low = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "on_road_reward", "intrinsic_reward"]
     goal_lane_id = int(env_config.get("goal_lane_id", 2))
@@ -167,6 +217,11 @@ def main(
     lp = os.path.join(ld, f"hiro_low_{suffix}.zip")
     log(f"HIRO high          : {hp}")
     log(f"HIRO low           : {lp}")
+    if use_goal_sampler_for_high:
+        sampler_name = type(runner.high_policy).__name__ if runner.high_policy is not None else "None"
+        log(f"High policy source : goal sampler ({sampler_name})")
+    else:
+        log("High policy source : high model")
     log(f"Low safety layer   : {runner.use_low_safety_layer}")
     log(f"High interval      : {runner.hi}")
     log(f"Rendering enabled  : {enable_rendering}")
@@ -310,7 +365,7 @@ def main(
         trajectory_rows: list[Dict[str, Any]] = []
 
         def _build_low_obs_for_logging(obs_raw: np.ndarray) -> np.ndarray:
-            """Build low_obs exactly as HIROPolicyRunner.act() does for current step."""
+            """Build low_obs as [t_norm, local_kin_flat, goal_rel] (no signal dims)."""
             _, kin_local, kin_flat_local = runner._split(obs_raw)
             ego_sub_local = runner._ego_sub(kin_local)
             t_norm_local = np.array([runner.c / float(runner.hi)], dtype=np.float32)
@@ -751,11 +806,14 @@ if __name__ == "__main__":
         # high_model_dir="./models/hiro_260319_highonly_pretrained_newSLv2_vio03_HER_reDim_lc10",
         # high_model_dir="./models/hiro_test_260211_highonly_pretrained_vmin0",
 
-        # low_model_dir="./models/hiro_260325_lowonly_reachableUniformv2_Rainbow_dmin10_8",
+        # low_model_dir="./models/hiro_260416_lowonly_reUni_amax3_dmin15_10_newEnv",
         low_model_dir="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10",
         # low_model_dir="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2",
         # low_model_dir="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping",
         # model_suffix="step_6400000",
+        use_goal_sampler_for_high=True,
+        high_goal_sampler_type="reachable_uniform",
+        # high_goal_sampler_path="./models/your_high_model/hiro_high_final.zip",  # only for type="pretrained"
         use_low_safety_layer=True,
         episodes=300, 
         # record_episodes=[],
@@ -763,4 +821,6 @@ if __name__ == "__main__":
         record_episodes=[i for i in range(1, 11)],
         record_trajectory_episodes=[i for i in range(1, 11)],
         # enable_rendering=False,
+        scenario_name="multi_lane",
+        # scenario_name="multi_lane_stop_to_int",
     )

@@ -324,6 +324,7 @@ def main(
             ego_sub = utils.extract_ego_substate(kin_full, ego_feature_idx)[0]
             goal_rel = (np.asarray(goal_phys, dtype=np.float32) - ego_sub).astype(np.float32)
             local_kin_flat = np.asarray(kin_flat_full[0, : n_veh_local * feat_dim], dtype=np.float32)
+            # Keep low_obs format aligned with training/inference: [t_norm, local_kin_flat, goal_rel].
             low_obs = np.concatenate(
                 [np.array([t_norm], dtype=np.float32), local_kin_flat, goal_rel],
                 axis=0,

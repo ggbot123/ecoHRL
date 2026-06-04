@@ -57,6 +57,14 @@ class RuleBasedController:
                     "lane_change_min_rear_gap": getattr(low_safety_filter, "lane_change_min_rear_gap", None),
                     "lane_change_min_front_ttc": getattr(low_safety_filter, "lane_change_min_front_ttc", None),
                     "lane_change_min_rear_ttc": getattr(low_safety_filter, "lane_change_min_rear_ttc", None),
+                    "safe_gap_d_min": getattr(low_safety_filter, "safe_gap_d_min", None),
+                    "safe_gap_tau": getattr(low_safety_filter, "safe_gap_tau", None),
+                    "safe_gap_b_ego": getattr(low_safety_filter, "safe_gap_b_ego", None),
+                    "safe_gap_b_front": getattr(low_safety_filter, "safe_gap_b_front", None),
+                    "safe_gap_comfort_decel": getattr(low_safety_filter, "safe_gap_comfort_decel", None),
+                    "safe_gap_emergency_decel": getattr(low_safety_filter, "safe_gap_emergency_decel", None),
+                    "safe_gap_emergency_ttc": getattr(low_safety_filter, "safe_gap_emergency_ttc", None),
+                    "safe_gap_emergency_distance": getattr(low_safety_filter, "safe_gap_emergency_distance", None),
                 }
             sf_type = sf.get("type")
             if sf_type is not None:
@@ -66,6 +74,14 @@ class RuleBasedController:
                 "lane_change_min_rear_gap",
                 "lane_change_min_front_ttc",
                 "lane_change_min_rear_ttc",
+                "safe_gap_d_min",
+                "safe_gap_tau",
+                "safe_gap_b_ego",
+                "safe_gap_b_front",
+                "safe_gap_comfort_decel",
+                "safe_gap_emergency_decel",
+                "safe_gap_emergency_ttc",
+                "safe_gap_emergency_distance",
             ):
                 val = sf.get(key)
                 if val is not None:
@@ -318,6 +334,24 @@ class RuleBasedController:
                 dt=dt,
                 remaining_time=remaining_time,
             )
+        if self.low_safety_filter_type in {"legacy_mpc_max", "mpc_legacy_max"}:
+            return self._safety_filter_action_legacy_mpc_max(
+                ego_abs=ego_abs,
+                others_rel=others_rel,
+                goal_phys=goal_phys,
+                action=action,
+                dt=dt,
+                remaining_time=remaining_time,
+            )
+        if self.low_safety_filter_type in {"rss", "braking_distance", "safe_gap", "safe_gap_braking"}:
+            return self._safety_filter_action_rss(
+                ego_abs=ego_abs,
+                others_rel=others_rel,
+                goal_phys=goal_phys,
+                action=action,
+                dt=dt,
+                remaining_time=remaining_time,
+            )
 
         ego_abs = self._as_ego_abs4(ego_abs)
         goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
@@ -335,6 +369,66 @@ class RuleBasedController:
             ego_lane=ego_lane,
             ego_y=ego_y,
         )
+
+    def _safety_filter_action_legacy_mpc_max(
+        self,
+        ego_abs: np.ndarray,
+        others_rel: np.ndarray,
+        goal_phys: np.ndarray,
+        action: np.ndarray,
+        dt: float,
+        remaining_time: Optional[float] = None,
+    ) -> np.ndarray:
+        """Combine legacy and MPC constraints, using the larger acceleration upper bound."""
+        act = np.asarray(action, dtype=np.float32).reshape(-1)
+        if self.action_type != "ParamLaneAccelAction":
+            return self._safety_filter_action_legacy(
+                ego_abs=ego_abs,
+                others_rel=others_rel,
+                goal_phys=goal_phys,
+                action=act,
+                dt=dt,
+                remaining_time=remaining_time,
+            )
+
+        legacy_action = self._safety_filter_action_legacy(
+            ego_abs=ego_abs,
+            others_rel=others_rel,
+            goal_phys=goal_phys,
+            action=act,
+            dt=dt,
+            remaining_time=remaining_time,
+        )
+
+        ego_abs_arr = self._as_ego_abs4(ego_abs)
+        goal_phys_arr = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
+        ego_vel = np.asarray([float(ego_abs_arr[2]), float(ego_abs_arr[3])], dtype=np.float32)
+        goal_rel = (goal_phys_arr - ego_abs_arr).astype(np.float32)
+        ego_y = float(ego_abs_arr[1])
+        ego_lane = int(self.get_lane_index(ego_y))
+        mpc_action = self.safety_filter_action_relative(
+            ego_vel=ego_vel,
+            others_rel=others_rel,
+            goal_rel=goal_rel,
+            action=act,
+            dt=dt,
+            remaining_time=remaining_time,
+            ego_lane=ego_lane,
+            ego_y=ego_y,
+        )
+
+        lane_scalar = float(act[0])
+        legacy_allows_lane = abs(float(legacy_action[0]) - lane_scalar) <= 1e-6
+        mpc_allows_lane = abs(float(mpc_action[0]) - lane_scalar) <= 1e-6
+        if not (legacy_allows_lane or mpc_allows_lane):
+            lane_scalar = 0.0
+
+        acc_req = self._acc_norm_to_phys(float(act[1]))
+        acc_legacy = self._acc_norm_to_phys(float(legacy_action[1]))
+        acc_mpc = self._acc_norm_to_phys(float(mpc_action[1]))
+        acc_phys = min(float(acc_req), max(float(acc_legacy), float(acc_mpc)))
+        acc_phys = float(np.clip(acc_phys, self.acc_min, self.acc_max))
+        return np.array([lane_scalar, self._acc_phys_to_norm(acc_phys)], dtype=np.float32)
 
     def _collect_lane_rel_neighbors(
         self,
@@ -495,6 +589,112 @@ class RuleBasedController:
                 a_upper = min(a_upper, float(a_ttc))
 
         acc_phys = min(float(acc_phys_req), float(a_upper))
+        acc_phys = float(np.clip(acc_phys, self.acc_min, self.acc_max))
+        acc_norm = self._acc_phys_to_norm(acc_phys)
+        return np.array([lane_scalar, acc_norm], dtype=np.float32)
+
+    def _safe_gap_required(self, follower_vx: float, leader_vx: float) -> float:
+        d_min = float(self.config.get("safe_gap_d_min", 6.0))
+        tau = float(self.config.get("safe_gap_tau", 0.6))
+        b_ego = max(float(self.config.get("safe_gap_b_ego", 3.0)), 1e-6)
+        b_front = max(float(self.config.get("safe_gap_b_front", 3.0)), 1e-6)
+        fv = max(float(follower_vx), 0.0)
+        lv = max(float(leader_vx), 0.0)
+        return float(d_min + tau * fv + fv * fv / (2.0 * b_ego) - lv * lv / (2.0 * b_front))
+
+    def _safe_gap_status(self, distance: float, follower_vx: float, leader_vx: float) -> Tuple[bool, bool]:
+        d = float(distance)
+        closing = max(float(follower_vx) - float(leader_vx), 0.0)
+        ttc = float("inf") if closing <= 1e-6 else d / closing
+        required_gap = self._safe_gap_required(follower_vx, leader_vx)
+        emergency = (
+            d < float(self.config.get("safe_gap_emergency_distance", 10.0))
+            or ttc < float(self.config.get("safe_gap_emergency_ttc", 1.0))
+        )
+        return bool(d < required_gap), bool(emergency)
+
+    def _safety_filter_action_rss(
+        self,
+        ego_abs: np.ndarray,
+        others_rel: np.ndarray,
+        goal_phys: np.ndarray,
+        action: np.ndarray,
+        dt: float,
+        remaining_time: Optional[float] = None,
+    ) -> np.ndarray:
+        """RSS-style safety layer based on braking-distance safe gaps.
+
+        Current/target-lane front vehicles can cap longitudinal acceleration.
+        Target-lane front and rear vehicles can reject an unsafe lane change.
+        """
+        _ = goal_phys
+        _ = remaining_time
+
+        act = np.asarray(action, dtype=np.float32).reshape(-1)
+        if self.action_type != "ParamLaneAccelAction":
+            return act.astype(np.float32)
+
+        ego = self._as_ego_abs4(ego_abs)
+        ego_y = float(ego[1])
+        ego_vx = float(ego[2])
+        ego_lane = int(self.get_lane_index(ego_y))
+        ego_lane_clip = int(np.clip(ego_lane, 0, self.lanes_count - 1))
+
+        lane_scalar = float(act[0])
+        acc_phys_req = self._acc_norm_to_phys(float(act[1]))
+        dt_safe = max(float(dt), 1e-6)
+        acc_for_gate = float(np.clip(acc_phys_req, self.acc_min, self.acc_max))
+        ego_x_next = float(ego_vx * dt_safe + 0.5 * acc_for_gate * (dt_safe ** 2))
+
+        target_lane = self._scalar_to_lane(ego_lane_clip, lane_scalar)
+        lane_step = int(target_lane - ego_lane_clip)
+
+        if lane_step != 0:
+            front_t, rear_t = self._collect_lane_rel_neighbors(
+                others_rel,
+                lane_step,
+                ego_lane=ego_lane,
+                ego_y=ego_y,
+            )
+            lane_ok = True
+
+            if front_t is not None:
+                dx, _dy, dvx, _dvy = [float(v) for v in front_t]
+                front_vx = float(ego_vx + dvx)
+                d_front = float(dx + dvx * dt_safe - ego_x_next)
+                unsafe, emergency = self._safe_gap_status(d_front, ego_vx, front_vx)
+                if unsafe or emergency:
+                    lane_ok = False
+
+            if rear_t is not None:
+                dx, _dy, dvx, _dvy = [float(v) for v in rear_t]
+                rear_vx = float(ego_vx + dvx)
+                d_rear = float(ego_x_next - (dx + dvx * dt_safe))
+                unsafe, emergency = self._safe_gap_status(d_rear, rear_vx, ego_vx)
+                if unsafe or emergency:
+                    lane_ok = False
+
+            if not lane_ok:
+                lane_scalar = 0.0
+                lane_step = 0
+
+        acc_phys = float(acc_phys_req)
+        front, _rear = self._collect_lane_rel_neighbors(
+            others_rel,
+            lane_step,
+            ego_lane=ego_lane,
+            ego_y=ego_y,
+        )
+        if front is not None:
+            dx, _dy, dvx, _dvy = [float(v) for v in front]
+            front_vx = float(ego_vx + dvx)
+            d_front = float(dx + dvx * dt_safe - ego_x_next)
+            unsafe, emergency = self._safe_gap_status(d_front, ego_vx, front_vx)
+            if emergency:
+                acc_phys = min(acc_phys, float(self.config.get("safe_gap_emergency_decel", -5.0)))
+            elif unsafe:
+                acc_phys = min(acc_phys, float(self.config.get("safe_gap_comfort_decel", -3.0)))
+
         acc_phys = float(np.clip(acc_phys, self.acc_min, self.acc_max))
         acc_norm = self._acc_phys_to_norm(acc_phys)
         return np.array([lane_scalar, acc_norm], dtype=np.float32)
@@ -857,13 +1057,13 @@ class RuleBasedController:
         mode = self.compute_action_mode
         if mode in {"idm_mobil", "full"}:
             return self._compute_action_idm_mobil(ego_abs, others_rel, goal_phys, dt, remaining_time=remaining_time)
-        if mode in {"goal_x_accel", "const_accel_to_goal_x"}:
+        if mode in {"goal_x_accel", "const_accel_to_goal_x", "goal_x_accel_follow", "follow_goal_x_accel"}:
             return self._compute_action_goal_x_accel(ego_abs, others_rel, goal_phys, dt, remaining_time=remaining_time)
         if mode in {"target_speed_lane", "simple"}:
             return self._compute_action_target_speed_lane(ego_abs, others_rel, goal_phys, dt, remaining_time=remaining_time)
         raise ValueError(
             f"Unknown rule_based_compute_action_mode: {mode}. "
-            "Expected one of: idm_mobil, goal_x_accel, target_speed_lane"
+            "Expected one of: idm_mobil, goal_x_accel, goal_x_accel_follow, target_speed_lane"
         )
 
 
@@ -881,8 +1081,25 @@ class RuleBasedAgentWrapper:
         self.n_veh_local = int(obs_cfg.get("vehicles_count_local", obs_cfg.get("vehicles_count", 5)))
         self.feature_names = list(obs_cfg.get("features", ["presence", "x", "y", "vx", "vy", "acceleration"]))
         self.feat_dim = int(len(self.feature_names))
+        self.obs_extra_dim = 2 if bool(obs_cfg.get("append_front_vehicle_features", False)) else 0
+        self.obs_extra_normalize = bool(obs_cfg.get("normalize", False))
+        self.front_distance_range = float(obs_cfg.get("front_vehicle_distance_range", 150.0))
+        self.front_ttc_range = float(obs_cfg.get("front_vehicle_ttc_range", 30.0))
 
         self.controller = RuleBasedController(env_cfg, low_safety_filter=low_safety_filter)
+        mode = str(env_cfg.get("rule_based_compute_action_mode", "")).lower().strip()
+        self.follow_mode_enabled = bool(env_cfg.get("rule_follow_mode_enabled", False)) or mode in {
+            "goal_x_accel_follow",
+            "follow_goal_x_accel",
+        }
+        self.follow_enter_gap = float(env_cfg.get("rule_follow_enter_gap", 13.0))
+        self.follow_release_gap = float(env_cfg.get("rule_follow_release_gap", 18.0))
+        self.follow_enter_ttc = float(env_cfg.get("rule_follow_enter_ttc", 2.0))
+        self.follow_release_ttc = float(env_cfg.get("rule_follow_release_ttc", 4.0))
+        self.follow_max_acc = float(env_cfg.get("rule_follow_max_acc", 0.0))
+        self.follow_same_lane_dy = float(env_cfg.get("rule_follow_same_lane_dy", 0.5 * float(env_cfg.get("lane_width", 4.0))))
+        self.follow_reset_on_high_interval = bool(env_cfg.get("rule_follow_reset_on_high_interval", True))
+        self._follow_active = np.zeros(self.n_envs, dtype=bool)
 
         # feature indices
         def _idx(name: str, default: int) -> int:
@@ -897,6 +1114,118 @@ class RuleBasedAgentWrapper:
         self.idx_vx = _idx("vx", 2)
         self.idx_vy = _idx("vy", 3)
         self.goal_dim = 4
+
+    def _decode_front_extra(self, extra: np.ndarray) -> tuple[float, float] | None:
+        if self.obs_extra_dim < 2:
+            return None
+        vals = np.asarray(extra, dtype=np.float32).reshape(-1)
+        if vals.size < 2:
+            return None
+        distance = float(vals[0])
+        ttc = float(vals[1])
+        if self.obs_extra_normalize:
+            distance = 0.5 * (distance + 1.0) * max(self.front_distance_range, 1e-6)
+            ttc = 0.5 * (ttc + 1.0) * max(self.front_ttc_range, 1e-6)
+        distance = float(np.clip(distance, 0.0, max(self.front_distance_range, 1e-6)))
+        ttc = float(np.clip(ttc, 0.0, max(self.front_ttc_range, 1e-6)))
+        if distance >= self.front_distance_range - 1e-6 and ttc >= self.front_ttc_range - 1e-6:
+            return None
+        return distance, ttc
+
+    def _augment_others_with_front_extra(
+        self,
+        others_rel: np.ndarray,
+        ego_vx: float,
+        extra: np.ndarray,
+    ) -> np.ndarray:
+        decoded = self._decode_front_extra(extra)
+        if decoded is None:
+            return np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
+        distance, ttc = decoded
+        closing = 0.0 if ttc >= self.front_ttc_range - 1e-6 else distance / max(ttc, 1e-6)
+        rel_vx = -max(float(closing), 0.0)
+        # Existing vehicle observations use center-to-center relative x, while
+        # the extra front feature is a bumper-to-bumper gap. Convert it before
+        # feeding the legacy rule/safety code, which was tuned on center dx.
+        center_dx = float(distance) + float(getattr(self.controller, "LENGTH", 5.0))
+        synthetic = np.array([[center_dx, 0.0, rel_vx, 0.0]], dtype=np.float32)
+        base = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
+        return np.concatenate([base, synthetic], axis=0)
+
+    def _front_follow_metrics(
+        self,
+        others_rel: np.ndarray,
+        ego_vx: float,
+        extra: np.ndarray,
+    ) -> tuple[float | None, float | None]:
+        """Return nearest same-lane front bumper gap and TTC for follow-mode."""
+        best_gap: float | None = None
+        best_ttc: float | None = None
+
+        for row in np.asarray(others_rel, dtype=np.float32).reshape(-1, 4):
+            dx, dy, dvx, _dvy = [float(v) for v in row]
+            if dx <= 0.0 or abs(dy) > self.follow_same_lane_dy:
+                continue
+            gap = max(dx - float(getattr(self.controller, "LENGTH", 5.0)), 0.0)
+            closing = max(-dvx, 0.0)
+            ttc = gap / max(closing, 1e-6) if closing > 1e-6 else self.front_ttc_range
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best_ttc = ttc
+
+        decoded = self._decode_front_extra(extra)
+        if decoded is not None:
+            gap, ttc = decoded
+            if best_gap is None or gap < best_gap:
+                best_gap = float(gap)
+                best_ttc = float(ttc)
+
+        return best_gap, best_ttc
+
+    def _update_follow_active(self, env_i: int, gap: float | None, ttc: float | None, use_state: bool = True) -> bool:
+        if not self.follow_mode_enabled:
+            return False
+        if gap is None:
+            if use_state and 0 <= env_i < self._follow_active.size:
+                self._follow_active[env_i] = False
+            return False
+
+        if not use_state or env_i < 0 or env_i >= self._follow_active.size:
+            ttc_val = self.front_ttc_range if ttc is None else float(ttc)
+            return bool(gap <= self.follow_enter_gap or ttc_val <= self.follow_enter_ttc)
+
+        active = bool(self._follow_active[env_i])
+        ttc_val = self.front_ttc_range if ttc is None else float(ttc)
+        if active:
+            release = gap >= self.follow_release_gap and ttc_val >= self.follow_release_ttc
+            if release:
+                active = False
+        else:
+            enter = gap <= self.follow_enter_gap or ttc_val <= self.follow_enter_ttc
+            if enter:
+                active = True
+        self._follow_active[env_i] = active
+        return active
+
+    def _reset_follow_active_at_interval_start(self, env_i: int, t_norm: float, use_state: bool) -> None:
+        if (
+            not use_state
+            or not self.follow_reset_on_high_interval
+            or env_i < 0
+            or env_i >= self._follow_active.size
+        ):
+            return
+        if float(t_norm) <= 1e-6:
+            self._follow_active[env_i] = False
+
+    def _apply_follow_mode_cap(self, action: np.ndarray) -> np.ndarray:
+        safe = np.asarray(action, dtype=np.float32).reshape(-1).copy()
+        if safe.size < 2:
+            return safe
+        acc_phys = self.controller._acc_norm_to_phys(float(safe[1]))
+        acc_phys = min(acc_phys, self.follow_max_acc)
+        safe[1] = self.controller._acc_phys_to_norm(acc_phys)
+        return safe.astype(np.float32)
 
     def act(self, low_obs: np.ndarray, goal_phys: np.ndarray) -> np.ndarray:
         low_obs = np.asarray(low_obs, dtype=np.float32)
@@ -931,6 +1260,9 @@ class RuleBasedAgentWrapper:
                 others_rel.append([float(d[self.idx_x]), float(d[self.idx_y]), float(d[self.idx_vx]), float(d[self.idx_vy])])
 
             others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
+            extra_start = int(1 + self.n_veh_local * self.feat_dim)
+            extra = low_obs[i, extra_start : extra_start + self.obs_extra_dim]
+            others_rel_arr = self._augment_others_with_front_extra(others_rel_arr, float(ego_abs[2]), extra)
             a = self.controller.compute_action(ego_abs, others_rel_arr, goal_phys[i], self.dt, remaining_time=rem_time)
             actions.append(a)
 
@@ -943,10 +1275,12 @@ class RuleBasedAgentWrapper:
 
         kin_slice = low_obs[:, : 1 + self.n_veh_local * self.feat_dim]
         _, kin, _ = rl_utils.split_time_kinematics(kin_slice, self.n_veh_local, self.feat_dim)
+        use_follow_state = int(low_obs.shape[0]) == int(self.n_envs)
 
         safe_actions: List[np.ndarray] = []
         for i in range(int(low_obs.shape[0])):
             t_norm = float(low_obs[i, 0])
+            self._reset_follow_active_at_interval_start(i, t_norm, use_follow_state)
             rem_time = float(self.high_interval) * (1.0 - t_norm) * float(self.dt)
 
             ego_feat = kin[i, 0]
@@ -967,7 +1301,11 @@ class RuleBasedAgentWrapper:
                 others_rel.append([float(d[self.idx_x]), float(d[self.idx_y]), float(d[self.idx_vx]), float(d[self.idx_vy])])
 
             others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
-            g0 = int(1 + self.n_veh_local * self.feat_dim)
+            extra_start = int(1 + self.n_veh_local * self.feat_dim)
+            extra = low_obs[i, extra_start : extra_start + self.obs_extra_dim]
+            front_gap, front_ttc = self._front_follow_metrics(others_rel_arr, float(ego_vel[0]), extra)
+            others_rel_arr = self._augment_others_with_front_extra(others_rel_arr, float(ego_vel[0]), extra)
+            g0 = int(1 + self.n_veh_local * self.feat_dim + self.obs_extra_dim)
             g1 = int(g0 + self.goal_dim)
             goal_rel = low_obs[i, g0:g1]
             ego_abs = (np.asarray(goal_phys[i], dtype=np.float32) - np.asarray(goal_rel, dtype=np.float32)).astype(np.float32)
@@ -979,6 +1317,8 @@ class RuleBasedAgentWrapper:
                 dt=self.dt,
                 remaining_time=rem_time,
             )
+            if self._update_follow_active(i, front_gap, front_ttc, use_state=use_follow_state):
+                safe_a = self._apply_follow_mode_cap(safe_a)
             safe_actions.append(safe_a)
 
         return np.asarray(safe_actions, dtype=np.float32)

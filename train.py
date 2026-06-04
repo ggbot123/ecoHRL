@@ -34,6 +34,12 @@ from rl.algos.ppo.trainer import train_ppo
 from rl.algos.sac.trainer import train_sac
 from rl.algos.HRL.trainer import train_hiro
 from rl.algos.HRL.hiro import HIROConfig
+from util.train_video import (
+    env_index_set,
+    global_view_video_config,
+    validate_video_env_choice,
+    wrap_training_video_env,
+)
 
 MASTER_SEED = 42
 master_rng: np.random.Generator
@@ -48,7 +54,19 @@ def set_global_seed(seed: int) -> None:
     th.backends.cudnn.benchmark = False
 
 
-def make_env(env_id: str, scenario_name: str, env_overrides: dict | None = None, render_mode: str | None = None):
+def make_env(
+    env_id: str,
+    scenario_name: str,
+    env_overrides: dict | None = None,
+    render_mode: str | None = None,
+    record_video: bool = False,
+    record_video_global_view: bool = True,
+    video_folder: str | None = None,
+    video_name_prefix: str = "train",
+    video_episode_freq: int = 1,
+    record_video_scheduled: bool = True,
+    record_video_collision_episodes: bool = False,
+):
     """Return an env constructor compatible with DummyVecEnv/SubprocVecEnv."""
     env_seed = int(master_rng.integers(0, 2**31 - 1))
     scenario_module = str(get_scenario_spec(scenario_name)["module"])
@@ -58,9 +76,29 @@ def make_env(env_id: str, scenario_name: str, env_overrides: dict | None = None,
         # to register gym env IDs in its own process.
         importlib.import_module(scenario_module)
         cfg = get_env_config_for_scenario(scenario_name, env_overrides or {})
+        if record_video and record_video_global_view:
+            cfg.update(global_view_video_config())
+        cfg["_env_seed"] = env_seed
         env = gym.make(env_id, render_mode=render_mode, config=cfg)
+        raw_env = env.unwrapped
+        raw_env.np_random = np.random.default_rng(env_seed)
+        if hasattr(raw_env, "_np_random_seed"):
+            raw_env._np_random_seed = env_seed
+        if record_video:
+            env = wrap_training_video_env(
+                env,
+                video_folder=video_folder,
+                video_name_prefix=video_name_prefix,
+                video_episode_freq=video_episode_freq,
+                record_video_global_view=bool(record_video_global_view),
+                record_video_scheduled=bool(record_video_scheduled),
+                record_video_collision_episodes=bool(record_video_collision_episodes),
+            )
         env = Monitor(env)
-        env.reset(seed=env_seed)
+        if hasattr(env.action_space, "seed"):
+            env.action_space.seed(env_seed)
+        if hasattr(env.observation_space, "seed"):
+            env.observation_space.seed(env_seed)
         return env
 
     return _init
@@ -81,6 +119,16 @@ def main(
     hiro_low_target_entropy: str | float = "auto",
     hiro_low_target_entropy_scale: float | None = 0.5,
     hiro_low_sac_impl: str | None = None,
+    hiro_high_transition_csv_all: int = 1,
+    hiro_high_transition_csv_envs: str = "env0",
+    hiro_low_transition_detail_csv: bool = False,
+    hiro_low_transition_detail_envs: str = "env0",
+    record_video: bool = False,
+    record_video_envs: str = "env0",
+    record_video_global_view: bool = True,
+    video_episode_freq: int = 1,
+    record_video_collision_episodes: bool = False,
+    record_video_collision_envs: str = "all",
     scenario_name: str = "multi_lane",
 ) -> None:
     global master_rng
@@ -107,15 +155,25 @@ def main(
     print(f"[MAIN] log_dir={log_dir}")
     print(f"[MAIN] save_dir={save_dir}")
 
+    record_video_envs = validate_video_env_choice(record_video_envs, "record_video_envs")
+    record_video_collision_envs = validate_video_env_choice(record_video_collision_envs, "record_video_collision_envs")
+
     render_mode = "human" if bool(render) else None
-    if render_mode is not None and int(n_envs) != 1:
+    if record_video:
+        print(
+            f"[MAIN] record_video=True, envs={record_video_envs}, "
+            f"every {max(1, int(video_episode_freq))} episode(s)"
+        )
+        if bool(record_video_collision_episodes):
+            print(f"[MAIN] record collision episodes from {record_video_collision_envs}")
+    if bool(render) and int(n_envs) != 1:
         print(f"[MAIN] render=True 时建议 n_envs=1，当前 n_envs={n_envs}")
 
     #### ================ Train-time overrides (optional) ================ ####
     env_overrides = {
         # "initial_lane_id": "random",
         # "initial_lane_id": 0,
-        "initial_lane_id": 1,
+        # "initial_lane_id": 1,
         # "initial_lane_id": 2,
         # "PERCEPTION_DISTANCE": 200,
         # "observation": {
@@ -128,7 +186,7 @@ def main(
         #         "vy": [-10, 10],
         #     },
         # },
-        "goal_lane_id": 2,
+        # "goal_lane_id": 2,
     }
     #### ================================================================= ####
 
@@ -222,10 +280,35 @@ def main(
         print(f"[HIRO] High pretrained: {hiro_cfg.high_pretrained_path}")
         print(f"[HIRO] Low pretrained: {hiro_cfg.low_pretrained_path}")
 
-        if render_mode is not None:
-            env = DummyVecEnv([make_env(env_id, scenario_name, env_overrides, render_mode=render_mode) for _ in range(n_envs)])
+        video_dir = os.path.join(log_dir, "videos")
+        video_envs = env_index_set(record_video_envs, n_envs)
+        collision_video_envs = (
+            env_index_set(record_video_collision_envs, n_envs)
+            if bool(record_video_collision_episodes)
+            else set()
+        )
+        wrapped_video_envs = video_envs | collision_video_envs
+        hiro_env_render_mode = "rgb_array" if (bool(record_video) and bool(wrapped_video_envs)) else render_mode
+        env_fns = [
+            make_env(
+                env_id,
+                scenario_name,
+                env_overrides,
+                render_mode=hiro_env_render_mode,
+                record_video=bool(record_video) and i in wrapped_video_envs,
+                record_video_global_view=bool(record_video_global_view),
+                video_folder=os.path.join(video_dir, f"env{i}") if (bool(record_video) and i in wrapped_video_envs) else None,
+                video_name_prefix=f"train_env{i}",
+                video_episode_freq=video_episode_freq,
+                record_video_scheduled=i in video_envs,
+                record_video_collision_episodes=i in collision_video_envs,
+            )
+            for i in range(n_envs)
+        ]
+        if bool(render):
+            env = DummyVecEnv(env_fns)
         else:
-            env = SubprocVecEnv([make_env(env_id, scenario_name, env_overrides, render_mode=render_mode) for _ in range(n_envs)])
+            env = SubprocVecEnv(env_fns)
 
         train_hiro(
             env=env,
@@ -237,6 +320,38 @@ def main(
             cfg=hiro_cfg,
             save_name_prefix="hiro",
             seed=MASTER_SEED,
+            high_transition_csv_all=max(0, int(hiro_high_transition_csv_all)),
+            high_transition_csv_envs=hiro_high_transition_csv_envs,
+            low_transition_detail_csv=bool(hiro_low_transition_detail_csv),
+            low_transition_detail_envs=hiro_low_transition_detail_envs,
+            run_metadata={
+                "algo": algo,
+                "run_name": run_name,
+                "scenario_name": scenario_name,
+                "scenario_module": scenario_module,
+                "env_id": env_id,
+                "log_root": log_root,
+                "save_root": save_root,
+                "n_envs": int(n_envs),
+                "render": bool(render),
+                "master_seed": int(MASTER_SEED),
+                "train_time_env_overrides": env_overrides,
+                "hiro_high_pretrained_path": hiro_high_pretrained_path,
+                "hiro_low_pretrained_path": hiro_low_pretrained_path,
+                "hiro_low_target_entropy": hiro_low_target_entropy,
+                "hiro_low_target_entropy_scale": hiro_low_target_entropy_scale,
+                "hiro_low_sac_impl_arg": hiro_low_sac_impl,
+                "hiro_high_transition_csv_envs": hiro_high_transition_csv_envs,
+                "hiro_low_transition_detail_csv": bool(hiro_low_transition_detail_csv),
+                "hiro_low_transition_detail_envs": hiro_low_transition_detail_envs,
+                "record_video": bool(record_video),
+                "record_video_envs": record_video_envs,
+                "record_video_global_view": bool(record_video_global_view),
+                "video_episode_freq": int(video_episode_freq),
+                "record_video_collision_episodes": bool(record_video_collision_episodes),
+                "record_video_collision_envs": record_video_collision_envs,
+                "video_dir": video_dir if bool(record_video) else None,
+            },
         )
         env.close()
 
@@ -272,22 +387,39 @@ if __name__ == "__main__":
     main(
         algo="hiro",
         log_root="./logs/current",
-        # total_timesteps=20000,
         total_timesteps=10_000_000,
+        # total_timesteps=10_000_000,
         eval_freq=10_000,
         save_freq=50_000,
         n_envs=8,
         # render=True,
         # hiro_high_pretrained_path="./models/hiro_test_260211_highonly_pretrained_vmin0/hiro_high_final.zip",
         # hiro_low_pretrained_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
-        # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane0/hiro_low_final.zip",
-        # hiro_low_pretrained_path="./models/hiro_260331_lowonly_reachableUniform_amax3_dmin15_10_lane2/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260420_lowonly_Uni_newEnv_dep20_noSigFeat/hiro_low_final.zip",
+        # hiro_low_pretrained_path="./models/hiro_260420_lowonly_reUni_amax3_dmin15_10_newEnv_dep20_noSigFeat/hiro_low_final.zip",
         # hiro_low_pretrained_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
         hiro_low_target_entropy="auto",
         hiro_low_target_entropy_scale=1,
 
-        run_name=f"hiro_260416_lowonly_reUni_Rainbow_amax3_dmin15_10_Lane1",
-        # run_name=f"hiro_260416_lowonly_reUni_amax3_dmin15_10_newEnv",
-        scenario_name="multi_lane",
-        # scenario_name="multi_lane_stop_to_int",
+
+        # run_name=f"hiro_260604_highonly_rule_augObs_noSigFeat",
+        run_name=f"hiro_260604_highonly_ruleFollow_augObs_SigFeat",
+
+        # scenario_name="multi_lane",
+        scenario_name="multi_lane_stop_to_int",
+
+        hiro_high_transition_csv_all=True,
+        # hiro_high_transition_csv_envs="env0",
+        hiro_high_transition_csv_envs="all",
+
+        # hiro_low_transition_detail_csv=True,
+        hiro_low_transition_detail_csv=False,
+        hiro_low_transition_detail_envs="env0",
+
+        record_video=True,
+        record_video_envs="env0",
+        record_video_global_view=True,
+        video_episode_freq=20,
+        record_video_collision_episodes=False,
+        record_video_collision_envs="all",
     )

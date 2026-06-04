@@ -1,3 +1,6 @@
+import csv
+import json
+import os
 from typing import Any, ClassVar, Optional, TypeVar, Union
 
 import numpy as np
@@ -123,6 +126,7 @@ class SAC(OffPolicyAlgorithm):
         _init_setup_model: bool = True,
         safe_warmup_sampling: bool = False,
         numerics_guard: Optional[dict[str, Any]] = None,
+        q_replay_debug: Optional[dict[str, Any]] = None,
     ):
         super().__init__(
             policy,
@@ -162,9 +166,276 @@ class SAC(OffPolicyAlgorithm):
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
         self.safe_warmup_sampling = bool(safe_warmup_sampling)
         self.numerics_guard = SACNumericsGuard.from_dict(numerics_guard)
+        self.q_replay_debug = dict(q_replay_debug or {})
+        self.q_replay_debug_enabled = bool(self.q_replay_debug.get("enabled", False))
+        self.q_replay_debug_file = None
+        self.q_replay_debug_header_written = False
+        self.q_replay_debug_rows_written = 0
 
         if _init_setup_model:
             self._setup_model()
+
+    @staticmethod
+    def _json_array(x: Any, precision: int = 6) -> str:
+        arr = np.asarray(x, dtype=np.float32).reshape(-1)
+        return json.dumps([round(float(v), precision) for v in arr], separators=(",", ":"))
+
+    def _q_debug_cfg(self, key: str, default: Any) -> Any:
+        return self.q_replay_debug.get(key, default)
+
+    def _init_q_replay_debug_writer(self) -> None:
+        if self.q_replay_debug_file is not None:
+            return
+        save_dir = self._q_debug_cfg("save_dir", self.tensorboard_log)
+        if not save_dir:
+            self.q_replay_debug_enabled = False
+            return
+        os.makedirs(str(save_dir), exist_ok=True)
+        file_name = str(self._q_debug_cfg("file_name", "q_replay_debug.csv"))
+        self.q_replay_debug_file = os.path.join(str(save_dir), file_name)
+        if not os.path.exists(self.q_replay_debug_file):
+            header = [
+                "algo_update",
+                "gradient_step",
+                "rank",
+                "batch_row",
+                "buffer_index",
+                "env_id",
+                "global_step",
+                "segment_id",
+                "interval_len",
+                "target_q",
+                "reward",
+                "done",
+                "discount",
+                "next_q",
+                "next_log_prob",
+                "ent_coef",
+                "current_q_min",
+                "current_q_mean",
+                "td_error_min",
+                "td_error_mean",
+                "next_q1",
+                "next_q2",
+                "current_q1",
+                "current_q2",
+                "comp_collision_reward",
+                "comp_progress_reward",
+                "comp_speed_ref_aux_reward",
+                "comp_comfort_reward_for_high",
+                "comp_lane_change_reward",
+                "comp_punctual_reward",
+                "comp_wrong_lane_terminal_penalty",
+                "acc_min",
+                "acc_max",
+                "acc_mean",
+                "acc_abs_mean",
+                "hard_brake_frac",
+                "hard_accel_frac",
+                "ego_x",
+                "ego_y",
+                "ego_v",
+                "next_ego_x",
+                "next_ego_y",
+                "next_ego_v",
+                "action_scaled",
+                "action_env",
+                "original_action_scaled",
+                "next_action_scaled",
+                "obs",
+                "next_obs",
+            ]
+            with open(self.q_replay_debug_file, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(header)
+
+    def _unscale_debug_action(self, action_scaled: np.ndarray) -> np.ndarray:
+        action_scaled = np.asarray(action_scaled, dtype=np.float32)
+        try:
+            return np.asarray(self.policy.unscale_action(action_scaled), dtype=np.float32)
+        except Exception:
+            return action_scaled
+
+    def _extract_debug_ego(self, obs: np.ndarray) -> tuple[float, float, float]:
+        arr = np.asarray(obs, dtype=np.float32).reshape(-1)
+        # Flat high obs layout: [remaining_time, ego_presence, ego_x, ego_y, ego_vx, ego_vy, ...].
+        if arr.size >= 5:
+            return float(arr[2]), float(arr[3]), float(arr[4])
+        return 0.0, 0.0, 0.0
+
+    def _maybe_log_q_replay_debug(
+        self,
+        *,
+        gradient_step: int,
+        replay_data,
+        discounts: Any,
+        next_actions: th.Tensor,
+        next_log_prob: th.Tensor,
+        next_q_values: th.Tensor,
+        target_q_values_all: th.Tensor,
+        target_q_values: th.Tensor,
+        current_q_values_all: th.Tensor,
+        ent_coef: th.Tensor,
+    ) -> dict[str, float]:
+        if not self.q_replay_debug_enabled:
+            return {}
+
+        target_np = target_q_values.detach().cpu().numpy().reshape(-1)
+        next_q_np = next_q_values.detach().cpu().numpy().reshape(-1)
+        done_np = replay_data.dones.detach().cpu().numpy().reshape(-1)
+        reward_np = replay_data.rewards.detach().cpu().numpy().reshape(-1)
+        threshold = float(self._q_debug_cfg("target_q_lte", -20.0))
+        next_threshold = float(self._q_debug_cfg("next_q_lte", threshold))
+        low_mask = target_np <= threshold
+        next_low_mask = (done_np < 0.5) & (next_q_np <= next_threshold)
+        low_or_next = low_mask | next_low_mask
+
+        summary: dict[str, float] = {
+            "q_debug_low_target_frac": float(np.mean(low_mask)) if target_np.size else 0.0,
+            "q_debug_low_next_frac": float(np.mean(next_low_mask)) if target_np.size else 0.0,
+        }
+        if np.any(low_or_next):
+            summary["q_debug_low_reward_mean"] = float(np.mean(reward_np[low_or_next]))
+            summary["q_debug_low_done_frac"] = float(np.mean(done_np[low_or_next]))
+
+        sample_debug = getattr(self.replay_buffer, "last_sample_debug", None)
+        comp_names = [
+            "collision_reward",
+            "progress_reward",
+            "speed_ref_aux_reward",
+            "comfort_reward_for_high",
+            "lane_change_reward",
+            "punctual_reward",
+            "wrong_lane_terminal_penalty",
+        ]
+        if isinstance(sample_debug, dict) and np.any(low_or_next):
+            for name in comp_names:
+                key = f"comp_{name}"
+                if key in sample_debug:
+                    vals = np.asarray(sample_debug[key], dtype=np.float32).reshape(-1)
+                    if vals.size == low_or_next.size:
+                        summary[f"q_debug_low_comp_{name}"] = float(np.mean(vals[low_or_next]))
+            for name in ("acc_abs_mean", "hard_brake_frac", "hard_accel_frac"):
+                if name in sample_debug:
+                    vals = np.asarray(sample_debug[name], dtype=np.float32).reshape(-1)
+                    if vals.size == low_or_next.size:
+                        summary[f"q_debug_low_{name}"] = float(np.mean(vals[low_or_next]))
+
+        period = int(self._q_debug_cfg("period_updates", 0))
+        should_periodic = period > 0 and (int(self._n_updates) % period == 0)
+        if not (np.any(low_or_next) or should_periodic):
+            return summary
+
+        self._init_q_replay_debug_writer()
+        if self.q_replay_debug_file is None:
+            return summary
+
+        max_rows = int(self._q_debug_cfg("max_rows_per_update", 8))
+        max_rows = max(max_rows, 1)
+        max_total_rows = int(self._q_debug_cfg("max_total_rows", 200_000))
+        if max_total_rows > 0 and self.q_replay_debug_rows_written >= max_total_rows:
+            return summary
+        candidate = np.flatnonzero(low_or_next)
+        if candidate.size == 0:
+            candidate = np.arange(target_np.size)
+        order = candidate[np.argsort(target_np[candidate])[:max_rows]]
+        if max_total_rows > 0:
+            remaining = max_total_rows - self.q_replay_debug_rows_written
+            if remaining <= 0:
+                return summary
+            order = order[:remaining]
+
+        obs_np = replay_data.observations.detach().cpu().numpy()
+        next_obs_np = replay_data.next_observations.detach().cpu().numpy()
+        action_np = replay_data.actions.detach().cpu().numpy()
+        next_action_np = next_actions.detach().cpu().numpy()
+        next_log_np = next_log_prob.detach().cpu().numpy().reshape(-1)
+        target_all_np = target_q_values_all.detach().cpu().numpy()
+        current_all_np = current_q_values_all.detach().cpu().numpy()
+        td_np = current_all_np - target_np.reshape(-1, 1)
+        if isinstance(discounts, th.Tensor):
+            discount_np = discounts.detach().cpu().numpy().reshape(-1)
+        else:
+            discount_np = np.full_like(target_np, float(discounts), dtype=np.float32)
+
+        def meta(name: str, default: float | int = -1):
+            if isinstance(sample_debug, dict) and name in sample_debug:
+                return np.asarray(sample_debug[name]).reshape(-1)
+            return np.full((target_np.size,), default)
+
+        buffer_index = meta("batch_inds", -1)
+        env_id = meta("env_id", -1)
+        global_step = meta("global_step", -1)
+        segment_id = meta("segment_id", -1)
+        interval_len = meta("interval_len", 0)
+        original_actions = (
+            np.asarray(sample_debug.get("original_actions"), dtype=np.float32)
+            if isinstance(sample_debug, dict) and "original_actions" in sample_debug
+            else action_np
+        )
+
+        rows = []
+        ent_coef_val = float(ent_coef.detach().cpu().item()) if isinstance(ent_coef, th.Tensor) else float(ent_coef)
+        record_full_obs = bool(self._q_debug_cfg("record_full_obs", True))
+        for rank, i in enumerate(order):
+            ego_x, ego_y, ego_v = self._extract_debug_ego(obs_np[i])
+            next_ego_x, next_ego_y, next_ego_v = self._extract_debug_ego(next_obs_np[i])
+            comp_vals = []
+            for name in comp_names:
+                vals = meta(f"comp_{name}", 0.0)
+                comp_vals.append(float(vals[i]))
+            acc_vals = [float(meta(name, 0.0)[i]) for name in (
+                "acc_min",
+                "acc_max",
+                "acc_mean",
+                "acc_abs_mean",
+                "hard_brake_frac",
+                "hard_accel_frac",
+            )]
+            act_env = self._unscale_debug_action(action_np[i])
+            rows.append([
+                int(self._n_updates),
+                int(gradient_step),
+                int(rank),
+                int(i),
+                int(buffer_index[i]),
+                int(env_id[i]),
+                int(global_step[i]),
+                int(segment_id[i]),
+                int(interval_len[i]),
+                float(target_np[i]),
+                float(reward_np[i]),
+                float(done_np[i]),
+                float(discount_np[i]) if discount_np.size > i else float(discount_np[0]),
+                float(next_q_np[i]),
+                float(next_log_np[i]),
+                ent_coef_val,
+                float(np.min(current_all_np[i])),
+                float(np.mean(current_all_np[i])),
+                float(np.min(td_np[i])),
+                float(np.mean(td_np[i])),
+                float(target_all_np[i, 0]) if target_all_np.shape[1] > 0 else 0.0,
+                float(target_all_np[i, 1]) if target_all_np.shape[1] > 1 else 0.0,
+                float(current_all_np[i, 0]) if current_all_np.shape[1] > 0 else 0.0,
+                float(current_all_np[i, 1]) if current_all_np.shape[1] > 1 else 0.0,
+                *comp_vals,
+                *acc_vals,
+                ego_x,
+                ego_y,
+                ego_v,
+                next_ego_x,
+                next_ego_y,
+                next_ego_v,
+                self._json_array(action_np[i]),
+                self._json_array(act_env),
+                self._json_array(original_actions[i]),
+                self._json_array(next_action_np[i]),
+                self._json_array(obs_np[i]) if record_full_obs else "",
+                self._json_array(next_obs_np[i]) if record_full_obs else "",
+            ])
+        with open(self.q_replay_debug_file, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(rows)
+        self.q_replay_debug_rows_written += len(rows)
+        return summary
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -314,6 +585,19 @@ class SAC(OffPolicyAlgorithm):
 
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
+        target_q_means, target_q_absmaxs = [], []
+        target_q_stds, target_q_p05s, target_q_p95s = [], [], []
+        target_q_terminal_means, target_q_terminal_stds = [], []
+        target_q_nonterminal_means, target_q_nonterminal_stds = [], []
+        current_q_means, current_q_absmaxs = [], []
+        td_error_means, td_error_stds, td_error_absmaxs = [], [], []
+        done_batch_fracs = []
+        reward_means, reward_absmaxs = [], []
+        reward_stds = []
+        next_q_means, next_q_absmaxs = [], []
+        next_q_stds = []
+        log_prob_means, log_prob_absmaxs = [], []
+        q_replay_debug_summaries: dict[str, list[float]] = {}
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
@@ -360,11 +644,55 @@ class SAC(OffPolicyAlgorithm):
                 next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
                 # td error + entropy term
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * next_q_values
+                target_q_means.append(float(target_q_values.mean().detach().cpu().item()))
+                target_q_absmaxs.append(float(target_q_values.abs().max().detach().cpu().item()))
+                target_q_stds.append(float(target_q_values.std(unbiased=False).detach().cpu().item()))
+                target_q_p05s.append(float(th.quantile(target_q_values.reshape(-1), 0.05).detach().cpu().item()))
+                target_q_p95s.append(float(th.quantile(target_q_values.reshape(-1), 0.95).detach().cpu().item()))
+                done_mask = replay_data.dones.reshape(-1) > 0.5
+                done_batch_fracs.append(float(done_mask.float().mean().detach().cpu().item()))
+                target_flat = target_q_values.reshape(-1)
+                if bool(done_mask.any()):
+                    target_terminal = target_flat[done_mask]
+                    target_q_terminal_means.append(float(target_terminal.mean().detach().cpu().item()))
+                    target_q_terminal_stds.append(float(target_terminal.std(unbiased=False).detach().cpu().item()))
+                if bool((~done_mask).any()):
+                    target_nonterminal = target_flat[~done_mask]
+                    target_q_nonterminal_means.append(float(target_nonterminal.mean().detach().cpu().item()))
+                    target_q_nonterminal_stds.append(float(target_nonterminal.std(unbiased=False).detach().cpu().item()))
+                next_q_means.append(float(next_q_values.mean().detach().cpu().item()))
+                next_q_absmaxs.append(float(next_q_values.abs().max().detach().cpu().item()))
+                next_q_stds.append(float(next_q_values.std(unbiased=False).detach().cpu().item()))
 
             # Get current Q-values estimates for each critic network
             # using action from the replay buffer
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
             current_q_values_all = th.cat(current_q_values, dim=1)
+            current_q_means.append(float(current_q_values_all.mean().detach().cpu().item()))
+            current_q_absmaxs.append(float(current_q_values_all.abs().max().detach().cpu().item()))
+            reward_means.append(float(replay_data.rewards.mean().detach().cpu().item()))
+            reward_absmaxs.append(float(replay_data.rewards.abs().max().detach().cpu().item()))
+            reward_stds.append(float(replay_data.rewards.std(unbiased=False).detach().cpu().item()))
+            log_prob_means.append(float(log_prob.mean().detach().cpu().item()))
+            log_prob_absmaxs.append(float(log_prob.abs().max().detach().cpu().item()))
+            td_error = current_q_values_all - target_q_values.detach()
+            td_error_means.append(float(td_error.mean().detach().cpu().item()))
+            td_error_stds.append(float(td_error.std(unbiased=False).detach().cpu().item()))
+            td_error_absmaxs.append(float(td_error.abs().max().detach().cpu().item()))
+            q_debug_summary = self._maybe_log_q_replay_debug(
+                gradient_step=gradient_step,
+                replay_data=replay_data,
+                discounts=discounts,
+                next_actions=next_actions,
+                next_log_prob=next_log_prob.reshape(-1, 1),
+                next_q_values=next_q_values,
+                target_q_values_all=target_q_values_all,
+                target_q_values=target_q_values,
+                current_q_values_all=current_q_values_all,
+                ent_coef=ent_coef,
+            )
+            for key, value in q_debug_summary.items():
+                q_replay_debug_summaries.setdefault(key, []).append(float(value))
 
             # Compute critic loss
             critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
@@ -413,6 +741,34 @@ class SAC(OffPolicyAlgorithm):
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record("train/target_q_mean", np.mean(target_q_means))
+        self.logger.record("train/target_q_std", np.mean(target_q_stds))
+        self.logger.record("train/target_q_p05", np.mean(target_q_p05s))
+        self.logger.record("train/target_q_p95", np.mean(target_q_p95s))
+        self.logger.record("train/target_q_absmax", np.mean(target_q_absmaxs))
+        if target_q_terminal_means:
+            self.logger.record("train/target_q_terminal_mean", np.mean(target_q_terminal_means))
+            self.logger.record("train/target_q_terminal_std", np.mean(target_q_terminal_stds))
+        if target_q_nonterminal_means:
+            self.logger.record("train/target_q_nonterminal_mean", np.mean(target_q_nonterminal_means))
+            self.logger.record("train/target_q_nonterminal_std", np.mean(target_q_nonterminal_stds))
+        self.logger.record("train/current_q_mean", np.mean(current_q_means))
+        self.logger.record("train/current_q_absmax", np.mean(current_q_absmaxs))
+        self.logger.record("train/td_error_mean", np.mean(td_error_means))
+        self.logger.record("train/td_error_std", np.mean(td_error_stds))
+        self.logger.record("train/td_error_absmax", np.mean(td_error_absmaxs))
+        self.logger.record("train/done_batch_frac", np.mean(done_batch_fracs))
+        self.logger.record("train/reward_batch_mean", np.mean(reward_means))
+        self.logger.record("train/reward_batch_std", np.mean(reward_stds))
+        self.logger.record("train/reward_batch_absmax", np.mean(reward_absmaxs))
+        self.logger.record("train/next_q_mean", np.mean(next_q_means))
+        self.logger.record("train/next_q_std", np.mean(next_q_stds))
+        self.logger.record("train/next_q_absmax", np.mean(next_q_absmaxs))
+        self.logger.record("train/log_prob_mean", np.mean(log_prob_means))
+        self.logger.record("train/log_prob_absmax", np.mean(log_prob_absmaxs))
+        for key, values in q_replay_debug_summaries.items():
+            if values:
+                self.logger.record(f"train/{key}", np.mean(values))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 

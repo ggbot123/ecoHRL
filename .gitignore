@@ -2,6 +2,7 @@
 /logs
 /models
 /debug
+/videos
 *.csv
 /copy
 /gpt
@@ -10,3 +11,5 @@ env.yml
 *.pkl
 *.json
 *.png
+__pycache__/
+**/__pycache__/

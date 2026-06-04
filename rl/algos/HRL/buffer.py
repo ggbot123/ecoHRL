@@ -49,6 +49,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
         *,
         max_seq_len: int,
         kin_flat_dim: int,
+        obs_extra_dim: int,
         low_action_dim: int,
         feat_dim: int,
         ego_feature_idx: List[int],
@@ -75,6 +76,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
 
         self.max_seq_len = int(max_seq_len)
         self.kin_flat_dim = int(kin_flat_dim)
+        self.obs_extra_dim = int(obs_extra_dim)
         self.low_action_dim = int(low_action_dim)
         self.feat_dim = int(feat_dim)
         self.ego_feature_idx = np.asarray(ego_feature_idx, dtype=int).reshape(-1)
@@ -85,12 +87,38 @@ class HiROHighReplayBuffer(ReplayBuffer):
         self.n_candidates = int(n_candidates)
         self.noise_std = float(noise_std)
         self.enable_off_policy_correction = bool(enable_off_policy_correction)
-        self.low_obs_dim = int(1 + self.kin_flat_dim + self.ego_dim)
+        self.low_obs_dim = int(1 + self.kin_flat_dim + self.obs_extra_dim + self.ego_dim)
 
         # [buffer_size, max_seq_len, ...]
         self._opc_low_obs = np.zeros((self.buffer_size, self.max_seq_len, self.low_obs_dim), dtype=np.float32)
         self._opc_low_actions = np.zeros((self.buffer_size, self.max_seq_len, self.low_action_dim), dtype=np.float32)
         self._opc_seq_len = np.zeros((self.buffer_size,), dtype=np.int32)
+        self._debug_env_id = np.full((self.buffer_size,), -1, dtype=np.int32)
+        self._debug_global_step = np.full((self.buffer_size,), -1, dtype=np.int64)
+        self._debug_segment_id = np.full((self.buffer_size,), -1, dtype=np.int64)
+        self._debug_interval_len = np.zeros((self.buffer_size,), dtype=np.int32)
+        self._debug_comp_names = [
+            "collision_reward",
+            "progress_reward",
+            "speed_ref_aux_reward",
+            "comfort_reward_for_high",
+            "lane_change_reward",
+            "punctual_reward",
+            "wrong_lane_terminal_penalty",
+        ]
+        self._debug_components = {
+            name: np.zeros((self.buffer_size,), dtype=np.float32)
+            for name in self._debug_comp_names
+        }
+        self._debug_acc_stats = {
+            "acc_min": np.zeros((self.buffer_size,), dtype=np.float32),
+            "acc_max": np.zeros((self.buffer_size,), dtype=np.float32),
+            "acc_mean": np.zeros((self.buffer_size,), dtype=np.float32),
+            "acc_abs_mean": np.zeros((self.buffer_size,), dtype=np.float32),
+            "hard_brake_frac": np.zeros((self.buffer_size,), dtype=np.float32),
+            "hard_accel_frac": np.zeros((self.buffer_size,), dtype=np.float32),
+        }
+        self.last_sample_debug: Dict[str, Any] | None = None
 
         # Cache action bounds for faster clipping
         self._high_low = np.asarray(self.action_space.low, dtype=np.float32).reshape(1, 1, -1)
@@ -118,6 +146,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
 
         # Extras are provided through infos[0]
         info = infos[0] if isinstance(infos, list) and len(infos) > 0 else {}
+        self._store_debug_info(pos, info)
         seq_len = int(info.get(self._INFO_KEY_SEQ_LEN, 0))
         seq_len = max(0, min(seq_len, self.max_seq_len))
 
@@ -145,6 +174,46 @@ class HiROHighReplayBuffer(ReplayBuffer):
         if L < self.max_seq_len:
             self._opc_low_obs[pos, L:] = 0.0
             self._opc_low_actions[pos, L:] = 0.0
+
+    def _store_debug_info(self, pos: int, info: Dict[str, Any]) -> None:
+        self._debug_env_id[pos] = int(info.get("high_env_id", -1))
+        self._debug_global_step[pos] = int(info.get("high_global_step", -1))
+        self._debug_segment_id[pos] = int(info.get("high_segment_id", -1))
+        self._debug_interval_len[pos] = int(info.get("high_interval_len", 0))
+
+        comp = info.get("high_components", {})
+        if not isinstance(comp, dict):
+            comp = {}
+        for name in self._debug_comp_names:
+            self._debug_components[name][pos] = float(comp.get(name, 0.0))
+
+        acc = info.get("high_acc_stats", {})
+        if not isinstance(acc, dict):
+            acc = {}
+        for name, arr in self._debug_acc_stats.items():
+            arr[pos] = float(acc.get(name, 0.0))
+
+    def _build_sample_debug(
+        self,
+        batch_inds: np.ndarray,
+        original_actions: th.Tensor,
+        returned_actions: th.Tensor,
+    ) -> Dict[str, Any]:
+        inds = np.asarray(batch_inds, dtype=np.int64).reshape(-1)
+        debug: Dict[str, Any] = {
+            "batch_inds": inds.copy(),
+            "env_id": self._debug_env_id[inds].copy(),
+            "global_step": self._debug_global_step[inds].copy(),
+            "segment_id": self._debug_segment_id[inds].copy(),
+            "interval_len": self._debug_interval_len[inds].copy(),
+            "original_actions": original_actions.detach().cpu().numpy().astype(np.float32),
+            "returned_actions": returned_actions.detach().cpu().numpy().astype(np.float32),
+        }
+        for name, arr in self._debug_components.items():
+            debug[f"comp_{name}"] = arr[inds].copy()
+        for name, arr in self._debug_acc_stats.items():
+            debug[name] = arr[inds].copy()
+        return debug
 
     # ------------------------- low-level deterministic action -------------------------
     def _low_policy_deterministic(self, obs_tensor: th.Tensor, obs_np: np.ndarray | None = None) -> th.Tensor:
@@ -262,6 +331,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
         # Split low_obs into components
         t_norm = low_obs_seq[:, :, 0:1]  # (B, max_L, 1)
         kin_seq = low_obs_seq[:, :, 1 : 1 + self.kin_flat_dim]  # (B, max_L, kin_flat_dim)
+        extra_seq = low_obs_seq[:, :, 1 + self.kin_flat_dim : 1 + self.kin_flat_dim + self.obs_extra_dim]
 
         # Ego substate at each low-level step, extracted from kin_seq
         ego_full_seq = kin_seq[:, :, : self.feat_dim]  # (B, max_L, feat_dim)
@@ -273,7 +343,8 @@ class HiROHighReplayBuffer(ReplayBuffer):
         # Build candidate low-level obs: (B, n_cand, max_L, low_obs_dim)
         t_rep = np.broadcast_to(t_norm[:, None, :, :], (batch_size, n_cand, max_L, 1))
         kin_rep = np.broadcast_to(kin_seq[:, None, :, :], (batch_size, n_cand, max_L, self.kin_flat_dim))
-        low_obs_all = np.concatenate([t_rep, kin_rep, goal_rel], axis=-1).astype(np.float32)
+        extra_rep = np.broadcast_to(extra_seq[:, None, :, :], (batch_size, n_cand, max_L, self.obs_extra_dim))
+        low_obs_all = np.concatenate([t_rep, kin_rep, extra_rep, goal_rel], axis=-1).astype(np.float32)
 
         low_obs_all_flat = low_obs_all.reshape(batch_size * n_cand * max_L, self.low_obs_dim)
 
@@ -298,9 +369,11 @@ class HiROHighReplayBuffer(ReplayBuffer):
         samples = self._get_samples(batch_inds, env=env)
 
         if not self.enable_off_policy_correction:
+            self.last_sample_debug = self._build_sample_debug(batch_inds, samples.actions, samples.actions)
             return samples
 
         corrected_actions = self._apply_off_policy_correction(batch_inds, samples)
+        self.last_sample_debug = self._build_sample_debug(batch_inds, samples.actions, corrected_actions)
 
         return ReplayBufferSamples(
             observations=samples.observations,

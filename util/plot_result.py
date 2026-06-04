@@ -1458,7 +1458,7 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
     
     # 1. Directory Structure: separated by episode
     # Save directly under the run directory (e.g., eval_results/<datetime>/goal_distribution)
-    # and clear output folder once at the beginning of a run
+    # and clear output folder once at the beginning of a run.
     base_debug_dir = os.path.join(model_dir, folder_name)
     if int(ep_idx) == 1 and int(step) == 0:
         if os.path.exists(base_debug_dir):

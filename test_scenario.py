@@ -5,28 +5,23 @@ from typing import Any, Dict
 
 import gymnasium as gym
 import numpy as np
+from gymnasium.wrappers import RecordVideo
 
-from configs.conf import get_env_config
+from configs.conf import get_env_config_for_scenario, get_scenario_spec
 from custom_env.vehicle.behavior import IDMVehicle, NormalIDMVehicle
 
 
 # =========================
 # In-code runtime selection
 # =========================
-# Choose which scenario package to import (for gym register side-effect)
-SCENARIO_MODULE = "scenarios.multi_lane_stop_to_int"
-# SCENARIO_MODULE = "scenarios.multi_lane"  # Example: original multi-lane
-
-ENV_ID = "multi-lane-stop-to-int-v0"
-# ENV_ID = "multi-lane-custom-v0"  # Example: original multi-lane
+# Choose which centralized scenario config to use from configs/conf.py.
+SCENARIO_NAME = "multi_lane_stop_to_int"
+# SCENARIO_NAME = "multi_lane"
 
 # Episode runtime config (no CLI args)
 SEED = 42
 N_EPISODES = 20
 STEP_SLEEP_S = 0.0
-
-# Scenario flow control: probability of spawning a background vehicle per generation check.
-TRAFFIC_FLOW_SPAWN_PROB = 0.05
 
 # Render robustness toggles
 RENDER_MODE = "human"
@@ -35,59 +30,23 @@ FORCE_DISABLE_DUMMY_SDL = True
 EXPLICIT_RENDER_EACH_STEP = True
 EGO_HIGHLIGHT_COLOR = (255, 215, 0)  # Yellow
 
+# Video capture (records exactly one episode by index)
+SAVE_EPISODE_VIDEO = False
+# SAVE_EPISODE_VIDEO = True
+VIDEO_EPISODE_INDEX = 2  # 0-based: 0 means the first episode
+VIDEO_OUTPUT_DIR = "videos"
+VIDEO_NAME_PREFIX = "scenario"
 
-# Common overrides used by compatible scenarios
-COMMON_OVERRIDES: Dict[str, Any] = {
-    "duration": 70.0,
-    # Keep a single warmup for the first reset, then continue across episodes.
-    "warmup_each_episode": False,
+
+# Only override values that should differ from configs/conf.py for this script.
+TEST_ENV_OVERRIDES: Dict[str, Any] = {
     "show_trajectories": True,
-    # "warmup_render": False,
-    "warmup_render": True,
+    "warmup_render": False,
     "offscreen_rendering": False,
     "screen_width": 1800,
     "screen_height": 320,
     "scaling": 3,
     "centering_position": [0.5, 0.5],
-}
-
-
-# Scenario-specific overrides. Unknown keys are ignored by unrelated scenarios.
-SCENARIO_OVERRIDES_BY_ENV_ID: Dict[str, Dict[str, Any]] = {
-    "multi-lane-stop-to-int-v0": {
-        "lanes_count": 3,
-        "spawn_probability": TRAFFIC_FLOW_SPAWN_PROB,
-        "start_lane_id": 2,
-        "start_longitudinal": 0.0,
-        "target_lane_id": 0,
-        "goal_longitudinal": 400.0,
-        "intersection_length": 50.0,
-        # Movement-role lane mapping (lane ids). Any unlisted lanes default to straight.
-        "movement_lanes": {
-            # "left": [0],
-            "straight": [0, 1, 2],
-        },
-        # Optional movement-specific behavior distribution for background vehicles.
-        # "movement_behavior_probs": {
-        #     "left": [0.2, 0.3, 0.5],
-        #     "straight": [0.5, 0.3, 0.2],
-        # },
-        # Keep background vehicles in their movement-role lanes.
-        "background_vehicle_respect_movement_lanes": True,
-        # Signal plan format: [{direction: green+yellow total seconds}, ...]
-        "signal_plan": [
-            {"straight": 63.0},  # 18s green + 3s yellow
-            {"left": 37.0},      # 12s green + 3s yellow
-        ],
-        "signal_cycle_offset": 0.0,
-        "align_ego_spawn_to_signal_offset": True,
-        "episode_start_phase_offset": 25.0,
-    },
-    "multi-lane-custom-v0": {
-        "initial_lane_id": "random",
-        "goal_lane_id": 2,
-        "goal_longitudinal": 400.0,
-    },
 }
 
 
@@ -114,12 +73,8 @@ def ensure_render_backend(render_mode: str) -> None:
         print("[render] Removed SDL_VIDEODRIVER=dummy for human rendering.")
 
 
-def build_env_config(env_id: str, user_overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    overrides: Dict[str, Any] = dict(COMMON_OVERRIDES)
-    overrides.update(SCENARIO_OVERRIDES_BY_ENV_ID.get(env_id, {}))
-    if user_overrides:
-        overrides.update(user_overrides)
-    return get_env_config(overrides)
+def build_env_config(scenario_name: str, user_overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    return get_env_config_for_scenario(scenario_name, user_overrides or {})
 
 
 def switch_ego_to_idm(env: gym.Env) -> None:
@@ -128,6 +83,8 @@ def switch_ego_to_idm(env: gym.Env) -> None:
     ego_old = base_env.vehicle
     if ego_old is None:
         raise RuntimeError("Ego vehicle is not initialized after reset().")
+    if bool(getattr(base_env, "_inter_episode_active", False)):
+        raise RuntimeError("Cannot switch ego while inter-episode dummy phase is active.")
 
     if isinstance(ego_old, IDMVehicle):
         _set_vehicle_color_yellow(ego_old)
@@ -151,6 +108,32 @@ def switch_ego_to_idm(env: gym.Env) -> None:
         base_env.action_type.controlled_vehicle = ego_new
     if getattr(base_env, "observation_type", None) is not None:
         base_env.observation_type.observer_vehicle = ego_new
+
+
+def finish_inter_episode_phase(
+    env: gym.Env,
+    render_mode: str | None = None,
+    sleep_s: float = 0.0,
+) -> float:
+    """Step through deferred inter-episode simulation until the real ego is created."""
+    base_env = env.unwrapped
+    if not bool(getattr(base_env, "_inter_episode_active", False)):
+        return 0.0
+
+    remaining_start = float(getattr(base_env, "_inter_episode_remaining", 0.0))
+    steps = 0
+    while bool(getattr(base_env, "_inter_episode_active", False)):
+        env.step(None)
+        set_fixed_global_camera(env)
+        if render_mode == "human" and EXPLICIT_RENDER_EACH_STEP:
+            env.render()
+        if sleep_s > 0.0:
+            time.sleep(sleep_s)
+        steps += 1
+
+    if steps > 0:
+        print(f"[inter_episode] advanced {remaining_start:.3f}s in {steps} dummy steps")
+    return remaining_start
 
 
 def _signal_cycle_length(base_env: gym.Env) -> float | None:
@@ -292,31 +275,38 @@ def plot_queue_length_timeseries(times_s: list[float], queue_m: list[float], out
 
 
 def run_n_episodes(
-    scenario_module: str,
-    env_id: str,
+    scenario_name: str,
     n_episodes: int,
     seed: int,
     sleep_s: float,
     env_overrides: Dict[str, Any] | None = None,
 ) -> None:
+    scenario_spec = get_scenario_spec(scenario_name)
+    scenario_module = str(scenario_spec["module"])
+    env_id = str(scenario_spec["env_id"])
     register_scenario(scenario_module)
-    ensure_render_backend(RENDER_MODE)
-    cfg = build_env_config(env_id, env_overrides)
-    # Ensure only the first reset triggers warmup in this run.
-    cfg["warmup_each_episode"] = False
-
-    if env_id == "multi-lane-stop-to-int-v0":
-        # Explicitly enable fixed phase-aligned ego spawn in this test script.
-        cfg["align_ego_spawn_to_signal_offset"] = True
-        cfg.setdefault("episode_start_phase_offset", 0.0)
+    effective_render_mode = "rgb_array" if SAVE_EPISODE_VIDEO else RENDER_MODE
+    ensure_render_backend(effective_render_mode)
+    cfg = build_env_config(scenario_name, env_overrides)
 
     sim_dt = 1.0 / float(cfg["policy_frequency"])
 
     env = gym.make(
         env_id,
-        render_mode=RENDER_MODE,
+        render_mode=effective_render_mode,
         config=cfg,
     )
+
+    video_dir_abs = os.path.join(os.getcwd(), VIDEO_OUTPUT_DIR)
+    if SAVE_EPISODE_VIDEO:
+        os.makedirs(video_dir_abs, exist_ok=True)
+        env = RecordVideo(
+            env,
+            video_folder=video_dir_abs,
+            episode_trigger=lambda ep: int(ep) == int(VIDEO_EPISODE_INDEX),
+            name_prefix=VIDEO_NAME_PREFIX,
+            disable_logger=True,
+        )
 
     try:
         global_time_s = 0.0
@@ -327,6 +317,11 @@ def run_n_episodes(
             # Seed only the first reset to preserve continuity for later episodes.
             reset_seed = seed if ep_idx == 0 else None
             obs, info = env.reset(seed=reset_seed)
+            global_time_s += finish_inter_episode_phase(
+                env,
+                render_mode=effective_render_mode,
+                sleep_s=sleep_s,
+            )
             switch_ego_to_idm(env)
             base_env = env.unwrapped
 
@@ -348,7 +343,14 @@ def run_n_episodes(
             queue_lengths_m.append(q0)
             ep_queue_samples = [q0]
 
-            if RENDER_MODE == "human":
+            # Keep camera fixed for both on-screen rendering and off-screen video recording.
+            set_fixed_global_camera(env)
+            if SAVE_EPISODE_VIDEO and effective_render_mode == "rgb_array":
+                # Ensure viewer exists in off-screen mode so fixed camera applies from the first recorded frame.
+                env.render()
+                set_fixed_global_camera(env)
+
+            if effective_render_mode == "human":
                 # Create viewer first, then lock camera to a fixed global anchor.
                 env.render()
                 set_fixed_global_camera(env)
@@ -371,7 +373,10 @@ def run_n_episodes(
                 queue_lengths_m.append(q_t)
                 ep_queue_samples.append(q_t)
 
-                if EXPLICIT_RENDER_EACH_STEP and RENDER_MODE == "human":
+                # RecordVideo uses rgb_array rendering under the hood; re-apply fixed camera each step.
+                set_fixed_global_camera(env)
+
+                if EXPLICIT_RENDER_EACH_STEP and effective_render_mode == "human":
                     set_fixed_global_camera(env)
                     env.render()
 
@@ -413,16 +418,29 @@ def run_n_episodes(
 
     finally:
         env.close()
+        if SAVE_EPISODE_VIDEO:
+            mp4_files = sorted(
+                f for f in os.listdir(video_dir_abs)
+                if f.lower().endswith(".mp4") and f.startswith(VIDEO_NAME_PREFIX)
+            )
+            if mp4_files:
+                print("[video] saved files:")
+                for filename in mp4_files:
+                    print(f"[video] {os.path.join(video_dir_abs, filename)}")
+            else:
+                print(
+                    "[video] no mp4 found. "
+                    "Make sure the configured episode index exists and env supports rgb_array rendering."
+                )
 
 
 def main() -> None:
     run_n_episodes(
-        scenario_module=SCENARIO_MODULE,
-        env_id=ENV_ID,
+        scenario_name=SCENARIO_NAME,
         n_episodes=N_EPISODES,
         seed=SEED,
         sleep_s=STEP_SLEEP_S,
-        env_overrides=None,
+        env_overrides=TEST_ENV_OVERRIDES,
     )
 
 

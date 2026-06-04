@@ -32,7 +32,12 @@ def init_kinematics_meta(
 def split_time_kinematics(obs_flat: np.ndarray, n_veh: int, feat_dim: int):
     arr = np.asarray(obs_flat, dtype=np.float32)
     t = arr[:, 0]
-    kin_flat = arr[:, 1:]
+    kin_dim = int(n_veh) * int(feat_dim)
+    if arr.shape[1] < 1 + kin_dim:
+        raise ValueError(
+            f"Observation dim {arr.shape[1]} is too small for time + kinematics dim {1 + kin_dim}"
+        )
+    kin_flat = arr[:, 1 : 1 + kin_dim]
     kin = kin_flat.reshape(arr.shape[0], n_veh, feat_dim)
     return t, kin, kin_flat
 

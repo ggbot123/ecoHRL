@@ -171,6 +171,9 @@ class KinematicObservation(ObservationType):
         include_obstacles: bool = True,
         include_time: bool = False,
         time_range: list[float] | None = None,
+        append_front_vehicle_features: bool = False,
+        front_vehicle_distance_range: float = 150.0,
+        front_vehicle_ttc_range: float = 30.0,
         **kwargs: dict,
     ) -> None:
         """
@@ -198,10 +201,17 @@ class KinematicObservation(ObservationType):
         self.include_obstacles = include_obstacles
         self.include_time = include_time
         self.time_range = time_range
+        self.append_front_vehicle_features = bool(append_front_vehicle_features)
+        self.front_vehicle_distance_range = float(front_vehicle_distance_range)
+        self.front_vehicle_ttc_range = float(front_vehicle_ttc_range)
+
+    @property
+    def extra_features_dim(self) -> int:
+        return 2 if self.append_front_vehicle_features else 0
 
     def space(self) -> spaces.Space:
         if self.include_time:
-            dim = self.vehicles_count * len(self.features) + 1  # flatten 后 + t
+            dim = self.vehicles_count * len(self.features) + 1 + self.extra_features_dim
             return spaces.Box(
                 shape=(dim,),
                 low=-np.inf,
@@ -209,12 +219,74 @@ class KinematicObservation(ObservationType):
                 dtype=np.float32,
             )
         else:
+            if self.append_front_vehicle_features:
+                dim = self.vehicles_count * len(self.features) + self.extra_features_dim
+                return spaces.Box(
+                    shape=(dim,),
+                    low=-np.inf,
+                    high=np.inf,
+                    dtype=np.float32,
+                )
             return spaces.Box(
                 shape=(self.vehicles_count, len(self.features)),
                 low=-np.inf,
                 high=np.inf,
                 dtype=np.float32,
             )
+
+    def _front_vehicle_features(self) -> np.ndarray:
+        """Return [same-lane front distance, TTC], clipped in physical units."""
+        ego = self.observer_vehicle
+        road = self.env.road
+        dist_max = max(float(self.front_vehicle_distance_range), 1e-6)
+        ttc_max = max(float(self.front_vehicle_ttc_range), 1e-6)
+        out = np.array([dist_max, ttc_max], dtype=np.float32)
+        if road is None or ego is None or getattr(ego, "lane_index", None) is None:
+            return out
+
+        try:
+            lane = road.network.get_lane(ego.lane_index)
+            ego_s = float(lane.local_coordinates(ego.position)[0])
+            front = None
+            front_s = float("inf")
+            for v in getattr(road, "vehicles", []):
+                if v is ego or getattr(v, "crashed", False):
+                    continue
+                s_v, lat_v = lane.local_coordinates(v.position)
+                if not lane.on_lane(v.position, s_v, lat_v, margin=1.0):
+                    continue
+                if s_v > ego_s and s_v < front_s:
+                    front = v
+                    front_s = float(s_v)
+            if front is None:
+                return out
+            front_s = float(lane.local_coordinates(front.position)[0])
+            ego_len = float(getattr(ego, "LENGTH", getattr(ego, "length", 5.0)))
+            front_len = float(getattr(front, "LENGTH", getattr(front, "length", 5.0)))
+            distance = max(front_s - ego_s - 0.5 * (ego_len + front_len), 0.0)
+
+            heading = float(lane.heading_at(ego_s))
+            lane_dir = np.array([np.cos(heading), np.sin(heading)], dtype=np.float32)
+            ego_v = float(np.dot(getattr(ego, "velocity", np.zeros(2)), lane_dir))
+            front_v = float(np.dot(getattr(front, "velocity", np.zeros(2)), lane_dir))
+            closing = max(ego_v - front_v, 0.0)
+            ttc = ttc_max if closing <= 1e-6 else distance / closing
+        except Exception:
+            return out
+
+        out[0] = float(np.clip(distance, 0.0, dist_max))
+        out[1] = float(np.clip(ttc, 0.0, ttc_max))
+        if self.normalize:
+            out[0] = utils.lmap(out[0], [0.0, dist_max], [-1.0, 1.0])
+            out[1] = utils.lmap(out[1], [0.0, ttc_max], [-1.0, 1.0])
+            if self.clip:
+                out = np.clip(out, -1.0, 1.0)
+        return out.astype(np.float32)
+
+    def _append_extra_features(self, obs_flat: np.ndarray) -> np.ndarray:
+        if not self.append_front_vehicle_features:
+            return obs_flat.astype(np.float32)
+        return np.concatenate([obs_flat.astype(np.float32), self._front_vehicle_features()], axis=0).astype(np.float32)
 
     def normalize_obs(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -306,9 +378,164 @@ class KinematicObservation(ObservationType):
             obs_with_time = np.concatenate(
                 [np.array([t], dtype=np.float32), obs_flat], axis=0
             )
-            return obs_with_time.astype(self.space().dtype)
+            return self._append_extra_features(obs_with_time).astype(self.space().dtype)
 
         # Flatten
+        if self.append_front_vehicle_features:
+            return self._append_extra_features(obs.astype(np.float32).ravel()).astype(self.space().dtype)
+        return obs.astype(self.space().dtype)
+
+
+class LaneSlotKinematicObservation(KinematicObservation):
+    """Kinematic observation with fixed lane-relative neighbor slots.
+
+    Layout:
+        ego,
+        current-lane front 1, current-lane front 2,
+        left-lane front 1, left-lane front 2,
+        right-lane front 1, right-lane front 2,
+        left-lane rear 1,
+        right-lane rear 1.
+    """
+
+    def __init__(
+        self,
+        env: AbstractEnv,
+        front_range: float = 150.0,
+        rear_range: float = 50.0,
+        lateral_margin: float = 0.75,
+        **kwargs: dict,
+    ) -> None:
+        front_range = kwargs.pop("lane_slot_front_range", front_range)
+        rear_range = kwargs.pop("lane_slot_rear_range", rear_range)
+        lateral_margin = kwargs.pop("lane_slot_lateral_margin", lateral_margin)
+        kwargs["vehicles_count"] = 9
+        super().__init__(env, **kwargs)
+        self.front_range = float(front_range)
+        self.rear_range = float(rear_range)
+        self.lateral_margin = float(lateral_margin)
+
+    def _lane_exists(self, lane_index) -> bool:
+        if len(lane_index) < 3:
+            return False
+        _from, _to, lane_id = lane_index
+        try:
+            lane_id = int(lane_id)
+            lanes = self.env.road.network.graph[_from][_to]
+        except Exception:
+            return False
+        return 0 <= lane_id < len(lanes)
+
+    def _lane_vehicle_slots(self) -> list:
+        ego = self.observer_vehicle
+        road = self.env.road
+        if road is None or ego is None or getattr(ego, "lane_index", None) is None:
+            return [None] * 8
+
+        ego_lane_index = tuple(ego.lane_index)
+        if len(ego_lane_index) < 3:
+            return [None] * 8
+
+        lane_ids = {
+            "current": int(ego_lane_index[2]),
+            "left": int(ego_lane_index[2]) - 1,
+            "right": int(ego_lane_index[2]) + 1,
+        }
+        lane_prefix = ego_lane_index[:2]
+        lane_entries: dict[str, tuple[object, float, list[tuple[float, object]], list[tuple[float, object]]]] = {}
+
+        for name, lane_id in lane_ids.items():
+            lane_index = (*lane_prefix, lane_id)
+            if not self._lane_exists(lane_index):
+                lane_entries[name] = (None, 0.0, [], [])
+                continue
+            lane = road.network.get_lane(lane_index)
+            ego_s, _ = lane.local_coordinates(ego.position)
+            lane_entries[name] = (lane, float(ego_s), [], [])
+
+        for v in road.vehicles:
+            if v is ego:
+                continue
+            candidates = []
+            for name, (lane, ego_s, _fronts, _rears) in lane_entries.items():
+                if lane is None:
+                    continue
+                s_v, lat_v = lane.local_coordinates(v.position)
+                lane_width = float(lane.width_at(max(0.0, min(float(s_v), float(getattr(lane, "length", s_v))))))
+                half_width = 0.5 * lane_width + self.lateral_margin
+                if abs(float(lat_v)) <= half_width:
+                    candidates.append((abs(float(lat_v)), name, float(s_v), float(ego_s)))
+            if not candidates:
+                continue
+            _abs_lat, name, s_v, ego_s = min(candidates, key=lambda item: item[0])
+            dx = float(s_v - ego_s)
+            if 0.0 <= dx <= self.front_range:
+                lane_entries[name][2].append((dx, v))
+            elif -self.rear_range <= dx < 0.0:
+                lane_entries[name][3].append((dx, v))
+
+        for _name, (_lane, _ego_s, fronts, rears) in lane_entries.items():
+            fronts.sort(key=lambda item: item[0])
+            rears.sort(key=lambda item: abs(item[0]))
+
+        def front(name: str, idx: int):
+            vals = lane_entries.get(name, (None, 0.0, [], []))[2]
+            return vals[idx][1] if len(vals) > idx else None
+
+        def rear(name: str, idx: int):
+            vals = lane_entries.get(name, (None, 0.0, [], []))[3]
+            return vals[idx][1] if len(vals) > idx else None
+
+        return [
+            front("current", 0),
+            front("current", 1),
+            front("left", 0),
+            front("left", 1),
+            front("right", 0),
+            front("right", 1),
+            rear("left", 0),
+            rear("right", 0),
+        ]
+
+    def observe(self) -> np.ndarray:
+        if not self.env.road:
+            return np.zeros(self.space().shape)
+
+        origin = self.observer_vehicle if not self.absolute else None
+        records = [self.observer_vehicle.to_dict()]
+        for vehicle in self._lane_vehicle_slots():
+            if vehicle is None:
+                records.append({feature: 0.0 for feature in self.features})
+            else:
+                records.append(vehicle.to_dict(origin, observe_intentions=self.observe_intentions))
+
+        df = pd.DataFrame.from_records(records)
+        df = df[self.features]
+
+        if self.normalize:
+            df = self.normalize_obs(df)
+
+        obs = df[self.features].values.copy()
+
+        if "acceleration" in self.features and obs.shape[0] > 1:
+            acc_idx = self.features.index("acceleration")
+            obs[1:, acc_idx] = 0.0
+
+        if self.include_time:
+            obs_flat = obs.astype(np.float32).ravel()
+            t = float(getattr(self.env, "time", 0.0))
+            if self.time_range is not None:
+                t_min, t_max = float(self.time_range[0]), float(self.time_range[1])
+            else:
+                t_min = 0.0
+                t_max = float(self.env.config.get("duration", 50.0))
+            if self.normalize and t_max > t_min:
+                t = utils.lmap(t, [t_min, t_max], [-1.0, 1.0])
+            obs_with_time = np.concatenate([np.array([t], dtype=np.float32), obs_flat], axis=0)
+            return self._append_extra_features(obs_with_time).astype(self.space().dtype)
+
+        if self.append_front_vehicle_features:
+            return self._append_extra_features(obs.astype(np.float32).ravel()).astype(self.space().dtype)
         return obs.astype(self.space().dtype)
 
 
@@ -810,6 +1037,8 @@ def observation_factory(env: AbstractEnv, config: dict) -> ObservationType:
         return TimeToCollisionObservation(env, **config)
     elif config["type"] == "Kinematics":
         return KinematicObservation(env, **config)
+    elif config["type"] == "LaneSlotKinematics":
+        return LaneSlotKinematicObservation(env, **config)
     elif config["type"] == "OccupancyGrid":
         return OccupancyGridObservation(env, **config)
     elif config["type"] == "KinematicsGoal":

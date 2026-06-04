@@ -23,6 +23,7 @@ class GoalMarker(Landmark):
         self.collidable = False  # Purely visual, no collision physics
 
 class BusStop(Obstacle):
+    affects_traffic = False
     """
     静态矩形公交站台，沿道路方向放置。
     length: 沿道路方向长度
@@ -157,6 +158,10 @@ class MultiLaneEnv(AbstractEnv):
         weighted = getattr(self, "_last_weighted_rewards", None)
         if isinstance(info, dict) and weighted is not None:
             info["reward_components"] = dict(weighted)
+        if isinstance(info, dict):
+            info["env_diagnostics"] = self._env_diagnostics()
+        if isinstance(info, dict) and bool(terminated or truncated):
+            info["terminal_signal_features"] = tuple(self.get_hiro_signal_features())
 
         sim_freq = float(self.config["simulation_frequency"])
         pol_freq = float(self.config["policy_frequency"])
@@ -166,6 +171,41 @@ class MultiLaneEnv(AbstractEnv):
         self._spawn_background(self.config["spawn_probability"] * (sim_freq / pol_freq))    # TODO: 完善增车策略，现在是按policy_freq集总生成，不是按simu_freq生成
 
         return obs, reward, terminated, truncated, info
+
+    def _env_diagnostics(self) -> dict:
+        bg = [v for v in self.road.vehicles if v not in self.controlled_vehicles]
+        valid = [v for v in bg if not getattr(v, "crashed", False)]
+        speeds = [
+            float(getattr(v, "speed", np.linalg.norm(getattr(v, "velocity", np.zeros(2)))))
+            for v in valid
+        ]
+        xs = [float(np.asarray(getattr(v, "position", [np.nan, np.nan]), dtype=float)[0]) for v in valid]
+        near_goal_low = sum(
+            1
+            for x, s in zip(xs, speeds)
+            if float(self.config.get("goal_longitudinal", self.config["road_length"])) - 40.0 <= x <= float(self.config.get("goal_longitudinal", self.config["road_length"])) + 10.0
+            and s < 2.0
+        )
+        ego_pos = np.asarray(getattr(self.vehicle, "position", [np.nan, np.nan]), dtype=float)
+        lane_index = getattr(self.vehicle, "lane_index", (None, None, -1))
+        return {
+            "time": float(getattr(self, "time", 0.0)),
+            "ego_x": float(ego_pos[0]),
+            "ego_y": float(ego_pos[1]),
+            "ego_speed": float(getattr(self.vehicle, "speed", 0.0)),
+            "ego_lane": int(lane_index[2]) if lane_index is not None and len(lane_index) >= 3 else -1,
+            "bg_count": int(len(bg)),
+            "bg_valid_count": int(len(valid)),
+            "bg_low_speed_1": int(sum(1 for s in speeds if s < 1.0)),
+            "bg_low_speed_2": int(sum(1 for s in speeds if s < 2.0)),
+            "bg_near_goal_low": int(near_goal_low),
+            "bg_min_speed": float(min(speeds)) if speeds else np.nan,
+            "bg_mean_speed": float(np.mean(speeds)) if speeds else np.nan,
+            "bg_max_x": float(max(xs)) if xs else np.nan,
+            "virtual_stop_count": 0,
+            "signal_is_green": -1.0,
+            "signal_remaining": -1.0,
+        }
 
     def get_hiro_signal_features(self) -> tuple[float, float]:
         """Return (is_green, remaining_seconds) for HIRO observation.
@@ -260,6 +300,7 @@ class MultiLaneEnv(AbstractEnv):
             self._has_arrived = True
             self._arrival_time = self.time
             punctual = self._punctual_factor(self._arrival_time)
+        wrong_lane_terminal = float(self._goal_longitudinal_reached() and not self._goal_reached())
 
         self._last_speed = cur_speed
         self._last_acc = acc
@@ -273,6 +314,7 @@ class MultiLaneEnv(AbstractEnv):
             "comfort_reward_acc_only": comfort_acc_only,
             "lane_change_reward": lane_changed,
             "punctual_reward": punctual,
+            "wrong_lane_terminal_penalty": wrong_lane_terminal,
             "on_road_reward": float(self.vehicle.on_road),
         }
     
@@ -374,6 +416,9 @@ class MultiLaneEnv(AbstractEnv):
         cfg = self.config
         min_gap = float(cfg.get("spawn_min_gap", 10.0))          # 纯空间
         min_t_headway = float(cfg.get("spawn_min_t_headway", 1.5))  # 车头时距
+        check_cutins = bool(cfg.get("spawn_check_adjacent_cutins", False))
+        cutin_front_gap = float(cfg.get("spawn_adjacent_cutin_front_gap", 15.0))
+        cutin_back_gap = float(cfg.get("spawn_adjacent_cutin_back_gap", 5.0))
         front_dist = None
 
         # 计算最近的前车距离
@@ -381,6 +426,24 @@ class MultiLaneEnv(AbstractEnv):
             li = getattr(v, "lane_index", None)
             if li is None or len(li) < 3:
                 continue
+            if check_cutins:
+                target_li = getattr(v, "target_lane_index", None)
+                is_targeting_spawn_lane = (
+                    isinstance(target_li, tuple)
+                    and len(target_li) >= 3
+                    and target_li[0] == lane_index[0]
+                    and target_li[1] == lane_index[1]
+                    and target_li[2] == lane_index[2]
+                )
+                is_adjacent_lane = (
+                    li[0] == lane_index[0]
+                    and li[1] == lane_index[1]
+                    and abs(int(li[2]) - int(lane_index[2])) == 1
+                )
+                if is_targeting_spawn_lane and is_adjacent_lane:
+                    longi_cutin, _ = lane.local_coordinates(v.position)
+                    if -cutin_back_gap <= float(longi_cutin) <= cutin_front_gap:
+                        return False
             if li[0] != lane_index[0] or li[1] != lane_index[1] or li[2] != lane_index[2]:
                 continue
             longi, _ = lane.local_coordinates(v.position)

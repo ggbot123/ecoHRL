@@ -79,6 +79,7 @@ class HighGoalSafeBoundsCalculator:
         ego_y = kin[:, 0, self.y_idx]
         ego_vx = kin[:, 0, self.vx_idx]
         ego_vy = kin[:, 0, self.vy_idx] if self.vy_idx < kin.shape[2] else np.zeros((batch,), dtype=np.float32)
+        ego_lane_idx = np.argmin(np.abs(ego_y[:, None] - self.lane_center_ys[None, :]), axis=1)
 
         rear_dx = np.full((batch,), -1e9, dtype=np.float32)
         front_dx = np.full((batch,), 1e9, dtype=np.float32)
@@ -115,7 +116,12 @@ class HighGoalSafeBoundsCalculator:
             # to decide front/rear membership.
             # rel_h = x_veh(t+h) - x_ego(t+h) = rel_x(t0) + rel_vx * h
             rel_h = veh_x_rel + veh_vx_rel * horizon_t
-            is_front = rel_h >= 0.0
+            is_front_future = rel_h >= 0.0
+            # Keep-lane semantics: vehicles that are front/rear at t0 in ego lane
+            # keep that membership during reachable-set front/rear partitioning.
+            is_front_now = veh_x_rel >= 0.0
+            is_ego_lane = lane_idx == ego_lane_idx
+            is_front = np.where(is_ego_lane, is_front_now, is_front_future)
 
             # Keep bound values in ego-t0 frame (same frame as goal dx):
             # x_veh(t+h) - x_ego(t0) = rel_x(t0) + v_veh_abs * h
@@ -133,12 +139,13 @@ class HighGoalSafeBoundsCalculator:
         total_dim = int(kin_flat.shape[1])
         if total_dim % self.feat_dim != 0:
             # Backward/forward compatibility:
-            # high_obs may append 2-dim signal features at tail:
-            # [t_remaining] + [kinematics_flat] + [signal_color, signal_remaining].
-            if total_dim > 2 and (total_dim - 2) % self.feat_dim == 0:
-                kin_flat = kin_flat[:, :-2]
+            # high_obs may append extra scalar features and/or 2-dim signal features at tail:
+            # [t_remaining] + [kinematics_flat] + [extra...] + [signal_color, signal_remaining].
+            trim = total_dim % self.feat_dim
+            if trim > 0 and total_dim > trim:
+                kin_flat = kin_flat[:, :-trim]
                 total_dim = int(kin_flat.shape[1])
-            else:
+            if total_dim % self.feat_dim != 0:
                 raise ValueError(
                     f"high_obs kinematics dim {total_dim} is not divisible by feat_dim {self.feat_dim}"
                 )

@@ -1,8 +1,9 @@
 # rl/algos/hiro/trainer.py
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import replace
+from dataclasses import asdict, is_dataclass, replace
 from typing import Any, Dict
 
 import numpy as np
@@ -15,6 +16,82 @@ from rl.utils import utils
 from stable_baselines3.common.callbacks import CallbackList
 
 
+def _json_safe(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_safe(asdict(value))
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    if callable(value):
+        return getattr(value, "__name__", repr(value))
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _write_hiro_run_config(
+    *,
+    log_dir: str,
+    env,
+    total_timesteps: int,
+    save_dir: str,
+    save_name_prefix: str,
+    seed: int,
+    high_transition_csv_all: int,
+    high_transition_csv_envs: str,
+    low_transition_detail_csv: bool,
+    low_transition_detail_envs: str,
+    effective_cfg: Any,
+    high_sac_kwargs: Dict[str, Any],
+    low_sac_kwargs: Dict[str, Any],
+    run_metadata: Dict[str, Any] | None = None,
+) -> None:
+    os.makedirs(log_dir, exist_ok=True)
+    try:
+        env_configs = env.get_attr("config")
+    except Exception as exc:
+        env_configs = [{"error": f"env.get_attr('config') failed: {exc!r}"}]
+
+    payload = {
+        "run_metadata": dict(run_metadata or {}),
+        "trainer": {
+            "total_timesteps": int(total_timesteps),
+            "save_dir": save_dir,
+            "save_name_prefix": save_name_prefix,
+            "seed": int(seed),
+            "n_envs": int(getattr(env, "num_envs", len(env_configs) if isinstance(env_configs, list) else 1)),
+            "high_transition_csv_all": int(high_transition_csv_all),
+            "high_transition_csv_envs": str(high_transition_csv_envs),
+            "low_transition_detail_csv": bool(low_transition_detail_csv),
+            "low_transition_detail_envs": str(low_transition_detail_envs),
+        },
+        "environment": {
+            "env0_config": env_configs[0] if isinstance(env_configs, list) and env_configs else env_configs,
+            "all_env_configs": env_configs,
+        },
+        "hiro": {
+            "config": effective_cfg,
+            "high_sac_kwargs": high_sac_kwargs,
+            "low_sac_kwargs": low_sac_kwargs,
+        },
+    }
+    out_path = os.path.join(log_dir, "run_config.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(payload), f, ensure_ascii=False, indent=2, sort_keys=True)
+    print(f"[HIRO Trainer] Saved run config: {out_path}")
+
+
 def train_hiro(
     env,
     total_timesteps: int,
@@ -25,12 +102,18 @@ def train_hiro(
     cfg,
     save_name_prefix: str,
     seed: int = 42,
+    high_transition_csv_all: int = 1,
+    high_transition_csv_envs: str = "env0",
+    low_transition_detail_csv: bool = False,
+    low_transition_detail_envs: str = "env0",
+    run_metadata: Dict[str, Any] | None = None,
 ):
     """Train HiRO (SAC high + SAC low).
 
     The HiRO high-level replay buffer (with OPC) is configured here (trainer),
     so hiro.py stays focused on the algorithm logic.
     """
+    os.makedirs(log_dir, exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
 
     train_mode = str(getattr(cfg, "train_mode", "joint")).lower()
@@ -52,10 +135,12 @@ def train_hiro(
 
     high_sac_kwargs = dict(high_sac_kwargs)
     rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
+    q_debug_cfg = high_sac_kwargs.get("q_replay_debug", {}) or {}
+    q_debug_enabled = bool(q_debug_cfg.get("enabled", False)) if isinstance(q_debug_cfg, dict) else False
 
-    if opc_enabled:
+    if opc_enabled or q_debug_enabled:
         high_sac_kwargs["replay_buffer_class"] = HiROHighReplayBuffer
-        rb_kwargs["enable_off_policy_correction"] = True
+        rb_kwargs["enable_off_policy_correction"] = bool(opc_enabled)
         high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
     else:
         high_sac_kwargs.pop("replay_buffer_class", None)
@@ -77,6 +162,23 @@ def train_hiro(
             cfg_new["ego_speed_range"] = [8.0, 12.0]
             env.set_attr("config", cfg_new, indices=i)
         print("[HIRO Trainer] Enabled ego_speed_range=[8,12] for speed_near_cruise sampler")
+
+    _write_hiro_run_config(
+        log_dir=log_dir,
+        env=env,
+        total_timesteps=total_timesteps,
+        save_dir=save_dir,
+        save_name_prefix=save_name_prefix,
+        seed=seed,
+        high_transition_csv_all=high_transition_csv_all,
+        high_transition_csv_envs=high_transition_csv_envs,
+        low_transition_detail_csv=bool(low_transition_detail_csv),
+        low_transition_detail_envs=low_transition_detail_envs,
+        effective_cfg=effective_cfg,
+        high_sac_kwargs=high_sac_kwargs,
+        low_sac_kwargs=low_sac_kwargs,
+        run_metadata=run_metadata,
+    )
 
     def _extract_ego_speed(high_obs_batch: np.ndarray) -> np.ndarray:
         arr = np.asarray(high_obs_batch, dtype=np.float32)
@@ -108,6 +210,10 @@ def train_hiro(
         csv_save_dir=log_dir,
         low_obs_csv_interval_hi=10,
         low_obs_csv_env0_only=True,
+        high_transition_csv_all=max(0, int(high_transition_csv_all)),
+        high_transition_csv_envs=high_transition_csv_envs,
+        low_transition_detail_csv=bool(low_transition_detail_csv),
+        low_transition_detail_envs=low_transition_detail_envs,
         verbose=1,
     )
     checkpoint_cb = HIROCheckpointCallback(
