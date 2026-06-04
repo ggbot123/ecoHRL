@@ -17,8 +17,13 @@ from rl.algos.HRL.goal_samplers import GoalSamplerConfig
 from rl.algos.HRL.high_goal_safe_bounds import HighGoalSafeBoundsCalculator
 from rl.algos.HRL.low_her_buffer import HiROLowHERReplayBuffer
 from stable_baselines3.common.utils import get_device, configure_logger
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 
 class DummyEnv(gym.Env):
@@ -39,6 +44,37 @@ class DummyEnv(gym.Env):
 
 def _make_dummy_vec_env(obs_space: gym.spaces.Box, act_space: gym.spaces.Box, n_envs: int) -> DummyVecEnv:
     return DummyVecEnv([(lambda: DummyEnv(obs_space, act_space)) for _ in range(int(n_envs))])
+
+
+class HIROProgressBarCallback(BaseCallback):
+    """Progress bar that follows HIRO effective replay/train timesteps."""
+
+    def __init__(self):
+        super().__init__()
+        self.pbar = None
+        self._last_num_timesteps = 0
+        self._target_timesteps = 0
+
+    def _on_training_start(self) -> None:
+        self._last_num_timesteps = int(getattr(self.model, "num_timesteps", 0))
+        self._target_timesteps = int(self.locals.get("total_timesteps", self._last_num_timesteps))
+        if tqdm is not None:
+            total = max(self._target_timesteps - self._last_num_timesteps, 0)
+            self.pbar = tqdm(total=total)
+
+    def _on_step(self) -> bool:
+        current = int(getattr(self.model, "num_timesteps", 0))
+        delta = max(current - self._last_num_timesteps, 0)
+        if self.pbar is not None and delta > 0:
+            remaining = max(int(self.pbar.total or 0) - int(self.pbar.n), 0)
+            self.pbar.update(min(delta, remaining))
+        self._last_num_timesteps = current
+        return True
+
+    def _on_training_end(self) -> None:
+        if self.pbar is not None:
+            self.pbar.close()
+            self.pbar = None
 
 
 class SB3AgentWrapper:
@@ -443,8 +479,8 @@ class HIROSAC:
             callback = CallbackList([])
         elif not isinstance(callback, BaseCallback):
             callback = ConvertCallback(callback)
-        if progress_bar and ProgressBarCallback is not None:
-            callback = CallbackList([callback, ProgressBarCallback()])
+        if progress_bar:
+            callback = CallbackList([callback, HIROProgressBarCallback()])
         callback.init_callback(self)
         return callback
 
@@ -958,6 +994,9 @@ class HIROSAC:
                     self.low_agent.train_if_needed()
 
             self.total_timesteps += replay_count
+            target_reached = self.total_timesteps >= total_timesteps
+            close_to_target = (total_timesteps - self.total_timesteps) <= n_envs
+            dummy_tail_only = replay_count == 0 and close_to_target
 
             if replay_count > 0:
                 callback.update_locals(locals())
@@ -1066,7 +1105,17 @@ class HIROSAC:
                 high_acc_hard_accel[idx_dummy_done] = 0
             obs = next_obs
             obs_skip_mask = next_obs_is_dummy
+
+            if target_reached or dummy_tail_only:
+                if dummy_tail_only:
+                    print(
+                        "[HIROSAC] Stop near target without draining inter-episode dummy steps: "
+                        f"env_steps={self.total_timesteps}, target={total_timesteps}"
+                    )
+                break
         
+        print(f"[HIROSAC] Training loop finished, running callbacks: env_steps={self.total_timesteps}")
         callback.on_training_end()
+        print(f"[HIROSAC] Training callbacks finished: env_steps={self.total_timesteps}")
         print(f"[HIROSAC] 训练结束: env_steps={self.total_timesteps}")
         return self

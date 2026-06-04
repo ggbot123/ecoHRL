@@ -261,6 +261,9 @@ def train_hiro(
         raise ValueError(f"Unknown train_mode: {train_mode}")
 
     if train_mode != "low_only":
+        print("[HIRO Trainer] Saving final high-level model...")
         model.high_agent.save(os.path.join(save_dir, f"{save_name_prefix}_high_final.zip"))
     if train_mode != "high_only":
+        print("[HIRO Trainer] Saving final low-level model...")
         model.low_agent.save(os.path.join(save_dir, f"{save_name_prefix}_low_final.zip"))
+    print("[HIRO Trainer] Final model save finished")

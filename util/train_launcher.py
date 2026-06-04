@@ -428,4 +428,6 @@ def run_hiro_training(
             },
         )
     finally:
+        print("[MAIN] Closing training env...")
         env.close()
+        print("[MAIN] Training env closed")

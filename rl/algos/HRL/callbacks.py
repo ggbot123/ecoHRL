@@ -1065,12 +1065,14 @@ class HIROCheckpointCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         if self.save_freq > 0 and self.n_calls % self.save_freq == 0:
-            if getattr(self.model.cfg, "train_mode", "joint") != "low_only":
+            train_mode = getattr(self.model.cfg, "train_mode", "joint")
+            if train_mode != "low_only":
                 high_path = os.path.join(self.save_dir, f"{self.prefix}_high_step_{self.num_timesteps}.zip")
                 self.model.high_agent.save(high_path)
-            
-            low_path = os.path.join(self.save_dir, f"{self.prefix}_low_step_{self.num_timesteps}.zip")
-            self.model.low_agent.save(low_path)
+
+            if train_mode != "high_only":
+                low_path = os.path.join(self.save_dir, f"{self.prefix}_low_step_{self.num_timesteps}.zip")
+                self.model.low_agent.save(low_path)
             if self.verbose:
                 print(f"[Checkpoint] Saved HIRO models at step={self.num_timesteps}")
         return True
