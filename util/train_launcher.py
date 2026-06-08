@@ -197,6 +197,8 @@ def run_training(
     scenario_name: str = "multi_lane",
     env_overrides: Mapping[str, Any] | None = None,
     sac_env_overrides: Mapping[str, Any] | None = None,
+    sac_transition_csv_episode_freq: int = 1,
+    sac_transition_csv_envs: str = "env0",
     hiro_high_pretrained_path: str | None = None,
     hiro_low_pretrained_path: str | None = None,
     hiro_low_target_entropy: str | float = "auto",
@@ -277,6 +279,23 @@ def run_training(
             eval_freq=eval_freq,
             save_freq=save_freq,
             save_name_prefix="sac",
+            transition_csv_episode_freq=sac_transition_csv_episode_freq,
+            transition_csv_envs=sac_transition_csv_envs,
+            run_metadata={
+                "algo": "sac",
+                "run_name": run_name,
+                "scenario_name": scenario_name,
+                "scenario_module": scenario_module,
+                "env_id": env_id,
+                "log_root": log_root,
+                "save_root": save_root,
+                "n_envs": int(n_envs),
+                "render": bool(render),
+                "master_seed": int(MASTER_SEED),
+                "train_time_env_overrides": dict(env_overrides),
+                "sac_env_overrides": dict(sac_env_overrides or {}),
+                "effective_sac_env_overrides": dict(sac_overrides),
+            },
         )
 
     elif algo == "hiro":
