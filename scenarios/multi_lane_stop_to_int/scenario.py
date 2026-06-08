@@ -8,6 +8,7 @@ from custom_env import utils
 from custom_env.vehicle.objects import Obstacle, Landmark
 
 from configs.conf import get_env_config
+from util.config_utils import sync_punctual_time_with_phase_offset
 from util.safety_utils import compute_ego_clear_distance_for_front_vehicle
 
 Observation = np.ndarray
@@ -408,6 +409,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         self._advance_to_episode_start_offset(strict_next=has_previous_episode)
         self._signal_episode_base = float(self._signal_time_global)
+        self._sync_episode_punctual_time()
         self._create_ego()
         self._episodes_started += 1
         self._update_signal_virtual_stops(query_time=0.0)
@@ -429,6 +431,49 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         if strict_next and delta <= 1e-9:
             delta = cycle
         return max(float(delta), 0.0)
+
+    def _current_signal_phase_offset(self) -> float:
+        controller = getattr(self, "_signal_controller", None)
+        if controller is None:
+            return float(self.config.get("episode_start_phase_offset", 0.0))
+        cycle = float(sum(total for _, total in controller.signal_plan))
+        if cycle <= 1e-9:
+            return float(self.config.get("episode_start_phase_offset", 0.0))
+        phase_offset = (
+            float(self._signal_time_global) + float(controller.cycle_offset)
+        ) % cycle
+        phase_offset = round(float(phase_offset), 9)
+        if phase_offset >= cycle:
+            phase_offset = 0.0
+        return float(phase_offset)
+
+    def _sync_episode_punctual_time(self) -> None:
+        actual_offset = self._current_signal_phase_offset()
+        self.config["actual_episode_start_phase_offset"] = float(actual_offset)
+        sync_punctual_time_with_phase_offset(
+            self.config,
+            phase_offset=actual_offset,
+        )
+
+    def get_punctual_time_target(self) -> float:
+        return float(
+            self.config.get(
+                "punctual_time_target",
+                self.config.get("duration", 0.0),
+            )
+        )
+
+    def get_punctual_time_window(self) -> tuple[float, float]:
+        window = self.config.get("punctual_time_window", [0.0, 0.0])
+        return float(window[0]), float(window[1])
+
+    def get_actual_episode_start_phase_offset(self) -> float:
+        return float(
+            self.config.get(
+                "actual_episode_start_phase_offset",
+                self._current_signal_phase_offset(),
+            )
+        )
 
     def _inter_episode_step_seconds(self) -> float:
         configured = float(self.config.get("inter_episode_step_seconds", 0.0))
@@ -482,6 +527,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self.time = 0.0
         self.steps = 0
         self._signal_episode_base = float(self._signal_time_global)
+        self._sync_episode_punctual_time()
         self._create_ego()
         self._episodes_started += 1
         self._update_signal_virtual_stops(query_time=0.0)
@@ -645,10 +691,15 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         ego_pos = np.asarray(getattr(self.vehicle, "position", [np.nan, np.nan]), dtype=float)
         lane_index = getattr(self.vehicle, "lane_index", (None, None, -1))
         signal_is_green, signal_remaining = self.get_hiro_signal_features()
+        punctual_window = self.get_punctual_time_window()
         return {
             "time": float(getattr(self, "time", 0.0)),
             "signal_time_global": float(getattr(self, "_signal_time_global", np.nan)),
             "signal_episode_base": float(getattr(self, "_signal_episode_base", np.nan)),
+            "actual_episode_start_phase_offset": self.get_actual_episode_start_phase_offset(),
+            "punctual_time_target": self.get_punctual_time_target(),
+            "punctual_time_window_start": float(punctual_window[0]),
+            "punctual_time_window_end": float(punctual_window[1]),
             "ego_x": float(ego_pos[0]),
             "ego_y": float(ego_pos[1]),
             "ego_speed": float(getattr(self.vehicle, "speed", 0.0)),

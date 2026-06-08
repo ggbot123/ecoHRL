@@ -230,9 +230,22 @@ class HIROPolicyRunner:
                 return float(self.goal_longitudinal_default)
         return float(self.goal_longitudinal_default)
 
+    def _get_punctual_time_target(self, env) -> float:
+        if env is None:
+            return float(self.punctual_time_target)
+        base = getattr(env, "unwrapped", env)
+        fn = getattr(base, "get_punctual_time_target", None)
+        if callable(fn):
+            try:
+                return float(fn())
+            except Exception:
+                return float(self.punctual_time_target)
+        return float(self.punctual_time_target)
+
     def _build_high_obs(self, obs: np.ndarray, env=None) -> np.ndarray:
         arr = np.asarray(obs, dtype=np.float32).reshape(1, -1)
-        t_remaining = (float(self.punctual_time_target) - arr[:, :1]).astype(np.float32)
+        punctual_target = self._get_punctual_time_target(env)
+        t_remaining = (punctual_target - arr[:, :1]).astype(np.float32)
         kin_flat = np.asarray(arr[:, 1 : 1 + self.kin_flat_dim], dtype=np.float32).copy()
         extra = np.asarray(arr[:, 1 + self.kin_flat_dim : 1 + self.kin_flat_dim + self.obs_extra_dim], dtype=np.float32)
         ego_x = float(kin_flat[0, self.idx_x])

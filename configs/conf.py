@@ -65,11 +65,16 @@ _SAC_KWARGS_BY_LEVEL: Dict[str, Dict[str, Any]] = {
         "verbose": 0,
         "buffer_size": 1_000_000,
         "batch_size": 256,
+        # "gamma": 0.9995,
         "gamma": 0.99,
         "tau": 0.005,
         "learning_rate": 3e-4,
         "train_freq": (1, "step"),
         "gradient_steps": 1,
+        "replay_buffer_kwargs": {
+            "handle_timeout_termination": True,
+            # "handle_timeout_termination": False,
+        },
     },
 }
 
@@ -203,12 +208,17 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
         "env_overrides": {
             "spawn_probability": 0.07,
             # Task
-            "initial_lane_id": 2,
-            "goal_lane_id": 1,
+            # "initial_lane_id": 2,
+            # "initial_lane_id": "1",
+            # "goal_lane_id": 1,
+            "goal_lane_id": 2,
             "lane_change_reward": -1.0,
             # "lane_change_reward": -0.5,
             # "rule_based_compute_action_mode": "goal_x_accel",
             "rule_based_compute_action_mode": "goal_x_accel_follow",
+            "observation": {
+                "append_front_vehicle_features": False,
+            }
         },
     },
     "multi_lane_stop_to_int": {
@@ -220,8 +230,9 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
             "spawn_probability": 0.05,
             "behavior_lane_probs": [
                 [0.6, 0.3, 0.1],
-                [0.4, 0.3, 0.3],
                 [0.6, 0.3, 0.1],
+                [0.4, 0.3, 0.3],
+                # [0.6, 0.3, 0.1],
             ],
             "single_road_network": True,
             "intersection_length": 50.0,
@@ -236,6 +247,7 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
             # Task
             "start_longitudinal": 0.0,
             "goal_longitudinal": 400.0,
+            "duration": 85.0,
             "punctual_time_window": [30.0, 40.0],
             "punctual_time_target": 35.0,
             "signal_plan": [
@@ -243,9 +255,22 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
                 {"left": 37.0},
             ],
             "signal_cycle_offset": 0.0,
-            "align_ego_spawn_to_signal_offset": True,
+            # "align_ego_spawn_to_signal_offset": True,
+            "align_ego_spawn_to_signal_offset": False,
             "inter_episode_as_steps": True,
-            "episode_start_phase_offset": 20.0,
+            # "episode_start_phase_offset": 20.0,   # late green pass
+            # "episode_start_phase_offset": 90.0,     # mid green pass
+            "episode_start_phase_offset": 40.0,     # early green pass
+            "punctual_time_offset_profile": {
+                "enabled": True,
+                "left_end": 3.0,
+                "low_plateau_end": 25.0,
+                "high_plateau_end": 30.0,
+                "low_level": 35.0,
+                "high_level": 75.0,
+                "shared_slope": -0.55330067,
+                "window_length": 10.0,
+            },
             "initial_lane_id": 2,
             "goal_lane_id": 1,
             "lane_change_reward": -1.0,
@@ -366,8 +391,8 @@ _HIRO_CONFIG: Dict[str, Any] = {
     "fixed_goal_vx": 0.0,
     # "fixed_goal_vx": None,
 
-    "high_obs_use_signal_features": False,
-    # "high_obs_use_signal_features": True,
+    # "high_obs_use_signal_features": False,
+    "high_obs_use_signal_features": True,
 }
 
 _HIRO_HIGH_Q_REPLAY_DEBUG: Dict[str, Any] = {
@@ -395,17 +420,22 @@ _HIRO_HIGH_REPLAY_BUFFER_KWARGS: Dict[str, Any] = {
 
 TRAIN_CONFIG: Dict[str, Any] = {
     "algo": "hiro",
+    # "algo": "sac",
     "log_root": "./logs/current",
     "save_root": "./models",
-    "total_timesteps": 5_000_000,
-    # "total_timesteps": 10_000_000,
+    # "total_timesteps": 5_000_000,
+    "total_timesteps": 10_000_000,
     "eval_freq": 10_000,
     "save_freq": 50_000,
     "n_envs": 8,
     "render": False,
-    # "run_name": "hiro_260604_highonly_ruleFollow_augObs_SigFeat",
-    # "run_name": "hiro_260604_highonly_ruleFollow_augObs_SigFeat_newFlowProbs",
-    "run_name": "hiro_260604_highonly_ruleFollow_augObs_noSigFeat_newFlowProbs",
+
+    # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_earlyGreen",
+    # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_midGreen",
+    "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_varOffset",
+    # "run_name": "hiro_260604_sac_withPrior_oldEnv_fixTimeout",
+    # "run_name": "hiro_260604_sac_base_oldEnv_fixTimeout",
+    # "scenario_name": "multi_lane",
     "scenario_name": "multi_lane_stop_to_int",
 
     # Train-time env overrides. Keep empty unless you want to override scenario defaults.
@@ -415,6 +445,7 @@ TRAIN_CONFIG: Dict[str, Any] = {
     # SAC-specific env overrides used only when algo="sac".
     "sac_env_overrides": {
         "speed_ref_aux_reward": 0.1,
+        # "speed_ref_aux_reward": 0,
     },
 
     # Optional pretrained / implementation switches.
@@ -450,7 +481,7 @@ def get_ppo_kwargs(log_dir: str, seed: int) -> Dict[str, Any]:
     return kwargs
 
 
-def get_sac_kwargs(log_dir: str, seed: int, level: str = "high") -> Dict[str, Any]:
+def get_sac_kwargs(log_dir: str, seed: int, level: str = "default") -> Dict[str, Any]:
     key = str(level).strip().lower()
     kwargs = dict(_SAC_KWARGS_BY_LEVEL.get(key, _SAC_KWARGS_BY_LEVEL["default"]))
     numerics_guard_cfg = dict(_SAC_NUMERICS_GUARD)

@@ -273,7 +273,7 @@ def run_training(
             total_timesteps=total_timesteps,
             log_dir=log_dir,
             save_dir=save_dir,
-            sac_kwargs=get_sac_kwargs(log_dir=log_dir, seed=MASTER_SEED),
+            sac_kwargs=get_sac_kwargs(log_dir=log_dir, seed=MASTER_SEED, level="default"),
             eval_freq=eval_freq,
             save_freq=save_freq,
             save_name_prefix="sac",

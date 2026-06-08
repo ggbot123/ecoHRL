@@ -17,13 +17,13 @@ from rl.algos.HRL.goal_samplers import GoalSamplerConfig
 from rl.algos.HRL.high_goal_safe_bounds import HighGoalSafeBoundsCalculator
 from rl.algos.HRL.low_her_buffer import HiROLowHERReplayBuffer
 from stable_baselines3.common.utils import get_device, configure_logger
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback
+from stable_baselines3.common.callbacks import (
+    BaseCallback,
+    CallbackList,
+    ConvertCallback,
+    ProgressBarCallback,
+)
 from stable_baselines3.common.vec_env import DummyVecEnv
-
-try:
-    from tqdm.auto import tqdm
-except ImportError:
-    tqdm = None
 
 
 class DummyEnv(gym.Env):
@@ -46,35 +46,25 @@ def _make_dummy_vec_env(obs_space: gym.spaces.Box, act_space: gym.spaces.Box, n_
     return DummyVecEnv([(lambda: DummyEnv(obs_space, act_space)) for _ in range(int(n_envs))])
 
 
-class HIROProgressBarCallback(BaseCallback):
-    """Progress bar that follows HIRO effective replay/train timesteps."""
+class HIROProgressBarCallback(ProgressBarCallback):
+    """SB3 Rich progress bar driven by HIRO effective replay/train timesteps."""
 
     def __init__(self):
         super().__init__()
-        self.pbar = None
         self._last_num_timesteps = 0
-        self._target_timesteps = 0
 
     def _on_training_start(self) -> None:
+        super()._on_training_start()
         self._last_num_timesteps = int(getattr(self.model, "num_timesteps", 0))
-        self._target_timesteps = int(self.locals.get("total_timesteps", self._last_num_timesteps))
-        if tqdm is not None:
-            total = max(self._target_timesteps - self._last_num_timesteps, 0)
-            self.pbar = tqdm(total=total)
 
     def _on_step(self) -> bool:
         current = int(getattr(self.model, "num_timesteps", 0))
         delta = max(current - self._last_num_timesteps, 0)
-        if self.pbar is not None and delta > 0:
+        if delta > 0:
             remaining = max(int(self.pbar.total or 0) - int(self.pbar.n), 0)
             self.pbar.update(min(delta, remaining))
         self._last_num_timesteps = current
         return True
-
-    def _on_training_end(self) -> None:
-        if self.pbar is not None:
-            self.pbar.close()
-            self.pbar = None
 
 
 class SB3AgentWrapper:
@@ -531,10 +521,33 @@ class HIROSAC:
         # in SubprocVecEnv workers on Windows spawn mode.
         return np.full((n,), float(self.goal_longitudinal), dtype=np.float32)
 
+    def _get_punctual_time_targets(self) -> np.ndarray:
+        """Get the current episode punctual target for each parallel env."""
+        n = int(self.n_envs)
+        fallback = np.full((n,), float(self.punctual_time_target), dtype=np.float32)
+        if not hasattr(self.env, "env_method"):
+            return fallback
+        try:
+            values = self.env.env_method("get_punctual_time_target")
+        except Exception:
+            return fallback
+        if values is None:
+            return fallback
+        out = fallback.copy()
+        for i, value in enumerate(values):
+            if i >= n:
+                break
+            try:
+                out[i] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def _build_high_obs(self, obs: np.ndarray, signal_feat: np.ndarray) -> np.ndarray:
         arr = np.asarray(obs, dtype=np.float32)
         t_cur = arr[:, :1]
-        t_remaining = (float(self.punctual_time_target) - t_cur).astype(np.float32)
+        punctual_targets = self._get_punctual_time_targets().reshape(-1, 1)
+        t_remaining = (punctual_targets - t_cur).astype(np.float32)
         kin_flat = np.asarray(arr[:, 1 : 1 + self.kin_flat_dim], dtype=np.float32).copy()
         extra = np.asarray(arr[:, 1 + self.kin_flat_dim : 1 + self.kin_flat_dim + self.obs_extra_dim], dtype=np.float32)
         ego_x = kin_flat[:, self.ego_x_idx]
