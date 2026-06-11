@@ -65,15 +65,15 @@ _SAC_KWARGS_BY_LEVEL: Dict[str, Dict[str, Any]] = {
         "verbose": 0,
         "buffer_size": 1_000_000,
         "batch_size": 256,
-        # "gamma": 0.9995,
-        "gamma": 0.99,
+        "gamma": 0.9995,
+        # "gamma": 0.99,
         "tau": 0.005,
         "learning_rate": 3e-4,
         "train_freq": (1, "step"),
         "gradient_steps": 1,
         "replay_buffer_kwargs": {
-            "handle_timeout_termination": True,
-            # "handle_timeout_termination": False,
+            # "handle_timeout_termination": True,
+            "handle_timeout_termination": False,
         },
     },
 }
@@ -222,7 +222,7 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
             # "rule_based_compute_action_mode": "goal_x_accel",
             "rule_based_compute_action_mode": "goal_x_accel_follow",
             "observation": {
-                "append_front_vehicle_features": False,
+                "append_front_vehicle_features": True,
             }
         },
     },
@@ -428,8 +428,8 @@ TRAIN_CONFIG: Dict[str, Any] = {
     "algo": "sac",
     "log_root": "./logs/current",
     "save_root": "./models",
-    "total_timesteps": 5_000_000,
-    # "total_timesteps": 10_000_000,
+    # "total_timesteps": 5_000_000,
+    "total_timesteps": 10_000_000,
     "eval_freq": 10_000,
     "save_freq": 50_000,
     "n_envs": 8,
@@ -438,8 +438,10 @@ TRAIN_CONFIG: Dict[str, Any] = {
     # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_earlyGreen",
     # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_midGreen",
     # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_varOffset",
-    # "run_name": "hiro_260604_sac_withPrior_oldEnv_fixTimeout",
-    "run_name": "hiro_260608_sac_base_oldEnv_test",
+    # "run_name": "hiro_260608_sac_base_oldEnv_fixTimeout",
+    # "run_name": "hiro_260608_sac_base_oldEnv_fixTimeout_fixGamma",
+    # "run_name": "hiro_260608_sac_withPrior_oldEnv_fixTimeout",
+    "run_name": "hiro_260608_sac_withPrior_oldEnv_fixTimeout_fixGamma",
     "scenario_name": "multi_lane",
     # "scenario_name": "multi_lane_stop_to_int",
 
@@ -449,8 +451,8 @@ TRAIN_CONFIG: Dict[str, Any] = {
 
     # SAC-specific env overrides used only when algo="sac".
     "sac_env_overrides": {
-        # "speed_ref_aux_reward": 0.1,
-        "speed_ref_aux_reward": 0,
+        "speed_ref_aux_reward": 0.1,
+        # "speed_ref_aux_reward": 0,
     },
     # 0 disables SAC transition/episode CSV logging; N records every Nth episode.
     "sac_transition_csv_episode_freq": 1,

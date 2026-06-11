@@ -265,7 +265,7 @@ class MultiLaneEnv(AbstractEnv):
             ref_speed = speed_limit
         else:
             ref_speed = remaining_distance / max(remaining_expected_time, 1e-6)
-        ref_speed = goal_long / float(self.config.get("punctual_time_target", self.config.get("duration", 0.0)))
+        # ref_speed = goal_long / float(self.config.get("punctual_time_target", self.config.get("duration", 0.0)))
         speed_ref_aux = -abs(float(cur_speed) - float(ref_speed)) * dt
         # speed_ref_aux = 0
 
