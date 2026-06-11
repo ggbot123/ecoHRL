@@ -502,6 +502,14 @@ class SAC(OffPolicyAlgorithm):
 
         l2 = bounds["l2"].detach().cpu().numpy().astype(np.float32)
         u2 = bounds["u2"].detach().cpu().numpy().astype(np.float32)
+        l_vx = bounds.get("l_vx")
+        u_vx = bounds.get("u_vx")
+        if l_vx is not None and u_vx is not None:
+            l_vx = l_vx.detach().cpu().numpy().astype(np.float32)
+            u_vx = u_vx.detach().cpu().numpy().astype(np.float32)
+        else:
+            l_vx = None
+            u_vx = None
 
         if l2.ndim != 2 or u2.ndim != 2 or l2.shape[1] != 3 or u2.shape[1] != 3:
             return None
@@ -539,6 +547,14 @@ class SAC(OffPolicyAlgorithm):
             actions[:, 0] = low[0] + 0.5 * (x_norm + 1.0) * (high[0] - low[0])
         if actions.shape[1] >= 2:
             actions[:, 1] = np.clip(y_code, low[1], high[1])
+        if actions.shape[1] >= 3 and l_vx is not None and u_vx is not None and l_vx.shape == l2.shape and u_vx.shape == u2.shape:
+            v_low_n = l_vx[row, k]
+            v_high_n = u_vx[row, k]
+            v_valid = v_high_n > v_low_n
+            if not np.all(v_valid):
+                return None
+            v_norm = v_low_n + np.random.rand(n_envs).astype(np.float32) * (v_high_n - v_low_n)
+            actions[:, 2] = low[2] + 0.5 * (v_norm + 1.0) * (high[2] - low[2])
 
         return actions
 

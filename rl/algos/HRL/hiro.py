@@ -185,6 +185,13 @@ class HIROConfig:
     low_use_her: bool = False
     low_her_ratio: float = 0.8
     low_her_strategy: str = "future"  # "future" | "final"
+    low_her_future_mode: str | None = None  # None->compat map, or "episode_timeaware"|"segment_timeaware"|"segment_legacy"
+    low_her_episode_timeaware_steps_ahead_range: Optional[tuple[int, int] | List[int]] = None  # e.g. (1, 8)
+    low_her_future_timeaware: bool = True  # True: new episode-time HER, False: legacy segment-future HER
+    low_her_debug_csv_interval_steps: int = 0
+    low_her_debug_csv_max_rows_per_flush: int = 200
+    low_her_debug_max_records: int = 20000
+    low_her_debug_sample_prob: float = 1.0
     high_pretrained_path: Optional[str] = None
     low_pretrained_path: Optional[str] = None
     mask_ego_position_in_low_obs: bool = False
@@ -201,6 +208,7 @@ class HIROConfig:
     high_goal_safe_lane_change_rear_dmin: float = 0.0
     high_goal_safe_min_goal_x_span: float = 0.0
     high_obs_use_signal_features: bool = True
+    high_goal_safe_enable_goal_vx_bounds: bool = True
 
 
 class HIROSAC:
@@ -258,6 +266,9 @@ class HIROSAC:
             goal_low[2] = fixed_goal_vx - 0.01
             goal_high[2] = fixed_goal_vx + 0.01
         high_act_space = gym.spaces.Box(goal_low, goal_high, dtype=np.float32)
+        enable_goal_vx_bounds = bool(getattr(self.cfg, "high_goal_safe_enable_goal_vx_bounds", True))
+        if fixed_goal_vx is not None and np.isclose(float(fixed_goal_vx), 0.0):
+            enable_goal_vx_bounds = False
 
         action_cfg = env_cfg.get("action", {})
         accel_range = action_cfg.get("acceleration_range", [-5.0, 5.0])
@@ -293,6 +304,7 @@ class HIROSAC:
             y_idx=int(self.feature_names.index("y")),
             vx_idx=int(self.feature_names.index("vx")),
             vy_idx=int(self.feature_names.index("vy")),
+            enable_goal_vx_bounds=bool(enable_goal_vx_bounds),
         )
 
         low_obs_dim = self.local_kin_flat_dim + self.obs_extra_dim + self.ego_dim + 1
@@ -355,9 +367,16 @@ class HIROSAC:
                         else np.asarray(self.cfg.intrinsic_weights, dtype=np.float32),
                         intrinsic_type=str(getattr(self.cfg, "intrinsic_type", "l2")),
                         low_gamma=float(self.low_gamma),
+                        high_interval=int(self.cfg.high_interval),
                         fixed_goal_vx=getattr(self.cfg, "fixed_goal_vx", None),
                         her_ratio=float(getattr(self.cfg, "low_her_ratio", 0.8)),
                         her_strategy=str(getattr(self.cfg, "low_her_strategy", "future")),
+                        her_future_mode=getattr(self.cfg, "low_her_future_mode", None),
+                        her_episode_timeaware_steps_ahead_range=getattr(self.cfg, "low_her_episode_timeaware_steps_ahead_range", None),
+                        her_future_timeaware=bool(getattr(self.cfg, "low_her_future_timeaware", True)),
+                        her_debug_enabled=bool(int(getattr(self.cfg, "low_her_debug_csv_interval_steps", 0)) > 0),
+                        her_debug_max_records=int(getattr(self.cfg, "low_her_debug_max_records", 20000)),
+                        her_debug_sample_prob=float(getattr(self.cfg, "low_her_debug_sample_prob", 1.0)),
                         enable_her=True,
                     )
                 )
@@ -691,6 +710,8 @@ class HIROSAC:
         c = np.zeros(n_envs, dtype=np.int32)
         seg_id = np.zeros(n_envs, dtype=np.int64)
         seg_counter = 0
+        ep_id = np.zeros(n_envs, dtype=np.int64)
+        ep_step = np.zeros(n_envs, dtype=np.int64)
 
         high_obs_start = np.zeros((n_envs, int(self.high_obs_dim)), dtype=np.float32)
         goal_action = np.zeros((n_envs, int(self.high_agent.action_space.shape[0])), dtype=np.float32)
@@ -987,6 +1008,8 @@ class HIROSAC:
                 for i in np.flatnonzero(replay_mask):
                     low_infos[i]["low_seg_id"] = int(seg_id[i])
                     low_infos[i]["low_t_in_seg"] = int(c[i])
+                    low_infos[i]["low_ep_id"] = int(ep_id[i])
+                    low_infos[i]["low_ep_step"] = int(ep_step[i])
                     low_infos[i]["low_ego_start"] = np.asarray(ego_start[i], dtype=np.float32)
                     low_infos[i]["low_ego_now"] = np.asarray(ego_now_sub[i], dtype=np.float32)
                     low_infos[i]["low_ego_next"] = np.asarray(ego_next_sub[i], dtype=np.float32)
@@ -1015,6 +1038,13 @@ class HIROSAC:
                 callback.update_locals(locals())
                 if callback.on_step() is False:
                     break
+
+            # Track per-env episode timeline for HER future-step relabeling.
+            ep_step += 1
+            if done.any():
+                idx_done_env = np.flatnonzero(done)
+                ep_id[idx_done_env] += 1
+                ep_step[idx_done_env] = 0
 
             # === 1.5. High Level Store & Train ===
             if done_low.any():

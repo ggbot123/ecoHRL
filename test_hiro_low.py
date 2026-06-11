@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
+from stable_baselines3.common.buffers import ReplayBuffer
 
 from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 from rl.algos.sac.sac import SAC
@@ -645,8 +646,16 @@ def main(
     base_env, ego, neighbors = setup_env_with_state(env, ego_state, neighbors_state)
     obs0 = base_env.observation_type.observe()
 
-    low_model = SAC.load(low_model_path)
     hiro_cfg = get_hiro_config()
+    low_model = SAC.load(
+        low_model_path,
+        # Inference does not need HER replay buffer; this keeps loading compatible
+        # with checkpoints saved before HiROLowHERReplayBuffer required high_interval.
+        custom_objects={
+            "replay_buffer_class": ReplayBuffer,
+            "replay_buffer_kwargs": {},
+        },
+    )
 
     runner = HIROPolicyRunner(
         _DummyHigh(),

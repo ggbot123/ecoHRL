@@ -28,7 +28,8 @@ class SafeGoalActor(Actor):
        [-1, -1/3], [-1/3, 1/3], [1/3, 1];
     3) conditioned on k, sample latent xi0 ~ N(mu0, sigma0^2), then map
        a0 = m_k + r_k * tanh(xi0), where m_k=(l_k+u_k)/2 and r_k=(u_k-l_k)/2;
-    4) keep dim-1 and dims >= 2 unchanged from the base sample.
+     4) keep dim-1 unchanged from the base sample, and map dim-2 (goal vx)
+         into safe bounds when provided by bounds_fn.
     """
 
     def __init__(
@@ -130,8 +131,22 @@ class SafeGoalActor(Actor):
             z_base = mean_actions + std * th.randn_like(mean_actions)
 
         y_base = th.tanh(z_base)
-        k = self._segment_index_from_action(y_base[:, 1])
-        valid_sel = safe_stats["valid_k"][idx, k]
+        k_base = self._segment_index_from_action(y_base[:, 1])
+        valid_k = safe_stats["valid_k"]
+        valid_sel_base = valid_k[idx, k_base]
+        feasible_any = th.any(valid_k, dim=1)
+
+        # If selected segment is infeasible, reroute to the nearest feasible segment.
+        seg_m = th.as_tensor([-2.0 / 3.0, 0.0, 2.0 / 3.0], dtype=mean_actions.dtype, device=mean_actions.device)
+        seg_r = th.as_tensor([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=mean_actions.dtype, device=mean_actions.device)
+        y1_base = y_base[:, 1]
+        dist_to_center = th.abs(y1_base[:, None] - seg_m[None, :])
+        inf = th.full_like(dist_to_center, 1e9)
+        dist_masked = th.where(valid_k, dist_to_center, inf)
+        k_fallback = th.argmin(dist_masked, dim=1)
+        use_fallback = (~valid_sel_base) & feasible_any
+        k = th.where(use_fallback, k_fallback, k_base)
+        valid_sel = valid_k[idx, k]
 
         m2_sel = safe_stats["m2"][idx, k]
         r2_sel = safe_stats["r2"][idx, k]
@@ -148,9 +163,46 @@ class SafeGoalActor(Actor):
         y = y_base.clone()
         y[:, 0] = th.where(valid_sel, a0_safe, y_base[:, 0])
 
+        # For rerouted rows, map dim-1 latent sample into the selected feasible segment.
+        t1 = th.tanh(z_base[:, 1])
+        m1_sel = seg_m[k]
+        r1_sel = seg_r[k]
+        r1_safe = th.clamp(r1_sel, min=eps)
+        a1_safe = m1_sel + r1_sel * t1
+        y[:, 1] = th.where(use_fallback, a1_safe, y_base[:, 1])
+
+        has_safe_vx = bool(safe_stats.get("has_safe_vx", False)) and mean_actions.shape[1] >= 3
+        if has_safe_vx:
+            m_vx_sel = safe_stats["m_vx"][idx, k]
+            r_vx_sel = safe_stats["r_vx"][idx, k]
+            r_vx_safe = th.clamp(r_vx_sel, min=eps)
+            if deterministic:
+                xi2 = mean_actions[:, 2]
+            else:
+                xi2 = mean_actions[:, 2] + std[:, 2] * th.randn((batch,), dtype=mean_actions.dtype, device=mean_actions.device)
+            t2 = th.tanh(xi2)
+            a2_safe = m_vx_sel + r_vx_sel * t2
+            y[:, 2] = th.where(valid_sel, a2_safe, y_base[:, 2])
+        else:
+            xi2 = None
+            t2 = None
+            r_vx_safe = None
+
         dim_mask_other = th.ones_like(mean_actions, dtype=th.bool)
         dim_mask_other[:, 0] = False
+        if has_safe_vx:
+            dim_mask_other[:, 2] = False
         log_prob_other = self._log_prob_base_with_mask(mean_actions, log_std, z_base, y_base, eps, dim_mask_other)
+
+        # Replace dim-1 base contribution only for rerouted rows.
+        dim_mask_1 = th.zeros_like(mean_actions, dtype=th.bool)
+        dim_mask_1[:, 1] = True
+        log_prob_dim1_base = self._log_prob_base_with_mask(mean_actions, log_std, z_base, y_base, eps, dim_mask_1)
+        normalized1 = (z_base[:, 1] - mean_actions[:, 1]) / std[:, 1]
+        log_gauss1 = -0.5 * (normalized1.pow(2) + LOG_2PI) - log_std[:, 1]
+        log_det1 = th.log(r1_safe) + th.log(1.0 - t1.pow(2) + eps)
+        log_prob_dim1_safe = log_gauss1 - log_det1
+        log_prob_other = log_prob_other + th.where(use_fallback, log_prob_dim1_safe - log_prob_dim1_base, th.zeros_like(log_prob_dim1_base))
 
         dim_mask_0 = th.zeros_like(mean_actions, dtype=th.bool)
         dim_mask_0[:, 0] = True
@@ -162,6 +214,16 @@ class SafeGoalActor(Actor):
         log_prob_dim0_safe = log_gauss0 - log_det0
 
         log_prob_safe = log_prob_other + th.where(valid_sel, log_prob_dim0_safe, log_prob_dim0_base)
+        if has_safe_vx and xi2 is not None and t2 is not None and r_vx_safe is not None:
+            dim_mask_2 = th.zeros_like(mean_actions, dtype=th.bool)
+            dim_mask_2[:, 2] = True
+            log_prob_dim2_base = self._log_prob_base_with_mask(mean_actions, log_std, z_base, y_base, eps, dim_mask_2)
+            normalized2 = (xi2 - mean_actions[:, 2]) / std[:, 2]
+            log_gauss2 = -0.5 * (normalized2.pow(2) + LOG_2PI) - log_std[:, 2]
+            log_det2 = th.log(r_vx_safe) + th.log(1.0 - t2.pow(2) + eps)
+            log_prob_dim2_safe = log_gauss2 - log_det2
+            log_prob_safe = log_prob_safe + th.where(valid_sel, log_prob_dim2_safe, log_prob_dim2_base)
+
         return y, log_prob_safe
 
     def base_log_prob_from_action(self, mean_actions: th.Tensor, log_std: th.Tensor, actions: th.Tensor) -> th.Tensor:
@@ -193,12 +255,34 @@ class SafeGoalActor(Actor):
         m2 = 0.5 * (l2 + u2)
         r2 = 0.5 * (u2 - l2)
 
+        has_safe_vx = False
+        if mean_actions.shape[1] >= 3 and ("l_vx" in stats) and ("u_vx" in stats):
+            l_vx = th.clamp(stats["l_vx"].to(dtype=mean_actions.dtype, device=mean_actions.device), -1.0 + eps, 1.0 - eps)
+            u_vx = th.clamp(stats["u_vx"].to(dtype=mean_actions.dtype, device=mean_actions.device), -1.0 + eps, 1.0 - eps)
+            if l_vx.shape != l2.shape or u_vx.shape != u2.shape:
+                raise ValueError("l_vx/u_vx must have same shape as l2/u2")
+            valid_k_vx = u_vx > l_vx
+            valid_k = valid_k & valid_k_vx
+            m_vx = 0.5 * (l_vx + u_vx)
+            r_vx = 0.5 * (u_vx - l_vx)
+            has_safe_vx = True
+        else:
+            l_vx = th.zeros_like(l2)
+            u_vx = th.zeros_like(u2)
+            m_vx = th.zeros_like(l2)
+            r_vx = th.zeros_like(u2)
+
         return {
             "l2": l2,
             "u2": u2,
             "valid_k": valid_k,
             "m2": m2,
             "r2": r2,
+            "l_vx": l_vx,
+            "u_vx": u_vx,
+            "m_vx": m_vx,
+            "r_vx": r_vx,
+            "has_safe_vx": th.tensor(has_safe_vx, device=mean_actions.device).item(),
         }
 
     @classmethod

@@ -375,6 +375,12 @@ _HIRO_CONFIG: Dict[str, Any] = {
     "low_use_her": True,
     "low_her_ratio": 0.8,
     "low_her_strategy": "future",
+    "low_her_future_mode": "episode_timeaware",
+    "low_her_episode_timeaware_steps_ahead_range": None,
+    "low_her_debug_csv_interval_steps": 1000,
+    "low_her_debug_csv_max_rows_per_flush": 200,
+    "low_her_debug_max_records": 20000,
+    "low_her_debug_sample_prob": 0.05,
 
     # "use_off_policy_correction": True,
     "use_off_policy_correction": False,
@@ -391,6 +397,7 @@ _HIRO_CONFIG: Dict[str, Any] = {
     "high_goal_safe_front_dmin": 15.0,
     "high_goal_safe_lane_change_rear_dmin": 10.0,
     "high_goal_safe_min_goal_x_span": 0,
+    "high_goal_safe_enable_goal_vx_bounds": False,
 
     "low_safety_violation_penalty": 0.3,
 

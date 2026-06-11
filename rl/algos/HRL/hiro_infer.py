@@ -123,6 +123,12 @@ class HIROPolicyRunner:
         v_max = float(cfg.get("speed_limit", 15.0)) if isinstance(cfg, dict) else 15.0
         dx_low = float(v_min * t_h)
         dx_high = float(v_max * t_h)
+        fixed_goal_vx = getattr(self.cfg, "fixed_goal_vx", None)
+        if fixed_goal_vx is not None:
+            fixed_goal_vx = float(np.clip(float(fixed_goal_vx), v_min, v_max))
+        enable_goal_vx_bounds = bool(getattr(self.cfg, "high_goal_safe_enable_goal_vx_bounds", True))
+        if fixed_goal_vx is not None and np.isclose(float(fixed_goal_vx), 0.0):
+            enable_goal_vx_bounds = False
         self.high_goal_safe_bounds = HighGoalSafeBoundsCalculator(
             n_lanes=int(cfg.get("lanes_count", len(self.lane_center_ys))) if isinstance(cfg, dict) else int(len(self.lane_center_ys)),
             lane_width=float(cfg.get("lane_width", 4.0)) if isinstance(cfg, dict) else 4.0,
@@ -143,6 +149,7 @@ class HIROPolicyRunner:
             y_idx=int(self.idx_y),
             vx_idx=int(self.idx_vx),
             vy_idx=int(self.idx_vy),
+            enable_goal_vx_bounds=bool(enable_goal_vx_bounds),
         )
 
         # In training we bind high-goal safe bounds explicitly. During standalone

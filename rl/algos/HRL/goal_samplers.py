@@ -18,6 +18,7 @@ class GoalSamplerConfig:
     action: Optional[list[float]] = None  # used when type == "fixed"
     gaussian_mean_x_m: float = 27.0  # used when type == "reachable_gaussian"
     gaussian_half_range_m: float = 5.0  # used when type == "reachable_gaussian"
+    enable_vx_bounds: bool = True  # used by reachable samplers
 
 class GoalSampler:
     """Base class for goal samplers."""
@@ -44,9 +45,15 @@ class ReachableUniformGoalSampler(GoalSampler):
     sampled uniformly inside the selected component bounds.
     """
 
-    def __init__(self, action_space: gym.spaces.Box, bounds_fn: Callable[[np.ndarray], dict[str, np.ndarray]]):
+    def __init__(
+        self,
+        action_space: gym.spaces.Box,
+        bounds_fn: Callable[[np.ndarray], dict[str, np.ndarray]],
+        enable_vx_bounds: bool = True,
+    ):
         super().__init__(action_space)
         self._bounds_fn = bounds_fn
+        self._enable_vx_bounds = bool(enable_vx_bounds)
 
     @staticmethod
     def _sample_component_uniform(valid_mask: np.ndarray) -> np.ndarray:
@@ -71,6 +78,12 @@ class ReachableUniformGoalSampler(GoalSampler):
         stats = self._bounds_fn(obs)
         l2 = np.asarray(stats["l2"], dtype=np.float32)
         u2 = np.asarray(stats["u2"], dtype=np.float32)
+        if self._enable_vx_bounds and ("l_vx" in stats and "u_vx" in stats):
+            l_vx = np.asarray(stats.get("l_vx"), dtype=np.float32)
+            u_vx = np.asarray(stats.get("u_vx"), dtype=np.float32)
+        else:
+            l_vx = None
+            u_vx = None
 
         seg_low = np.asarray([-1.0, -1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)[None, :]
         seg_high = np.asarray([-1.0 / 3.0, 1.0 / 3.0, 1.0], dtype=np.float32)[None, :]
@@ -100,6 +113,20 @@ class ReachableUniformGoalSampler(GoalSampler):
                 x_env = low[0] + 0.5 * (x_norm + 1.0) * denom
                 actions[idx, 0] = np.clip(x_env, low[0], high[0])
 
+            # dim-2 (goal vx) bounds are optional normalized intervals in [-1, 1].
+            if act_dim >= 3 and l_vx is not None and u_vx is not None:
+                vl = l_vx[idx, k]
+                vh = u_vx[idx, k]
+                v_valid = vh > vl
+                if np.any(v_valid):
+                    ii = idx[v_valid]
+                    vv_l = vl[v_valid]
+                    vv_h = vh[v_valid]
+                    v_norm = vv_l + np.random.rand(ii.size).astype(np.float32) * (vv_h - vv_l)
+                    denom_v = max(float(high[2] - low[2]), 1e-6)
+                    v_env = low[2] + 0.5 * (v_norm + 1.0) * denom_v
+                    actions[ii, 2] = np.clip(v_env, low[2], high[2])
+
         return actions.astype(np.float32)
 
 
@@ -118,10 +145,12 @@ class ReachableGaussianGoalSampler(GoalSampler):
         bounds_fn: Callable[[np.ndarray], dict[str, np.ndarray]],
         mean_x_m: float = 27.0,
         half_range_m: float = 5.0,
+        enable_vx_bounds: bool = True,
     ):
         super().__init__(action_space)
         self._bounds_fn = bounds_fn
         self._mu_x_m = float(mean_x_m)
+        self._enable_vx_bounds = bool(enable_vx_bounds)
         half = float(max(half_range_m, 1e-6))
         # Keep 70% probability mass inside [mu-half, mu+half].
         z = float(NormalDist().inv_cdf(0.85))
@@ -144,6 +173,12 @@ class ReachableGaussianGoalSampler(GoalSampler):
         stats = self._bounds_fn(obs)
         l2 = np.asarray(stats["l2"], dtype=np.float32)
         u2 = np.asarray(stats["u2"], dtype=np.float32)
+        if self._enable_vx_bounds and ("l_vx" in stats and "u_vx" in stats):
+            l_vx = np.asarray(stats.get("l_vx"), dtype=np.float32)
+            u_vx = np.asarray(stats.get("u_vx"), dtype=np.float32)
+        else:
+            l_vx = None
+            u_vx = None
 
         seg_low = np.asarray([-1.0, -1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)
         seg_high = np.asarray([-1.0 / 3.0, 1.0 / 3.0, 1.0], dtype=np.float32)
@@ -182,6 +217,14 @@ class ReachableGaussianGoalSampler(GoalSampler):
             y_code = float(seg_low[k] + np.random.rand() * (seg_high[k] - seg_low[k]))
             actions[i, 0] = np.float32(np.clip(x_env, low[0], high[0]))
             actions[i, 1] = np.float32(y_code)
+            if act_dim >= 3 and l_vx is not None and u_vx is not None:
+                v_lo_n = float(l_vx[i, k])
+                v_hi_n = float(u_vx[i, k])
+                if v_hi_n > v_lo_n:
+                    v_norm = float(v_lo_n + np.random.rand() * (v_hi_n - v_lo_n))
+                    denom_v = max(float(high[2] - low[2]), 1e-6)
+                    v_env = float(low[2] + 0.5 * (v_norm + 1.0) * denom_v)
+                    actions[i, 2] = np.float32(np.clip(v_env, low[2], high[2]))
 
         return actions.astype(np.float32)
 
@@ -276,17 +319,19 @@ def get_goal_sampler(
     action_space: gym.spaces.Box,
     bounds_fn: Optional[Callable[[np.ndarray], dict[str, np.ndarray]]] = None,
     speed_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    enable_vx_bounds: Optional[bool] = None,
 ) -> GoalSampler:
     if isinstance(cfg, str):
         cfg = GoalSamplerConfig(type=cfg)
 
     sampler_type = str(cfg.type).lower()
+    use_vx_bounds = bool(cfg.enable_vx_bounds if enable_vx_bounds is None else enable_vx_bounds)
     if sampler_type == "uniform":
         return UniformGoalSampler(action_space)
     if sampler_type == "reachable_uniform":
         if bounds_fn is None:
             raise ValueError("bounds_fn is required for type='reachable_uniform'")
-        return ReachableUniformGoalSampler(action_space, bounds_fn=bounds_fn)
+        return ReachableUniformGoalSampler(action_space, bounds_fn=bounds_fn, enable_vx_bounds=use_vx_bounds)
     if sampler_type in {"reachable_gaussian", "gaussian_reachable", "reachable_trunc_gaussian"}:
         if bounds_fn is None:
             raise ValueError("bounds_fn is required for type='reachable_gaussian'")
@@ -295,6 +340,7 @@ def get_goal_sampler(
             bounds_fn=bounds_fn,
             mean_x_m=float(cfg.gaussian_mean_x_m),
             half_range_m=float(cfg.gaussian_half_range_m),
+            enable_vx_bounds=use_vx_bounds,
         )
     if sampler_type in {"speed_near_cruise", "near_cruise", "cruise_nearby"}:
         if speed_fn is None:
