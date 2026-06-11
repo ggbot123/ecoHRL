@@ -206,17 +206,19 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
         "module": "scenarios.multi_lane",
         "env_id": "multi-lane-custom-v0",
         "env_overrides": {
-            "spawn_probability": 0.07,
+            "spawn_probability": 0.05,
+            # "spawn_probability": 0.07,
             "behavior_lane_probs": [
                 [0.6, 0.3, 0.1],
-                [0.6, 0.3, 0.1],
                 [0.4, 0.3, 0.3],
+                [0.6, 0.3, 0.1],
+                # [0.4, 0.3, 0.3],
             ],
             # Task
-            # "initial_lane_id": 2,
+            "initial_lane_id": 2,
             # "initial_lane_id": "1",
-            # "goal_lane_id": 1,
-            "goal_lane_id": 2,
+            "goal_lane_id": 1,
+            # "goal_lane_id": 2,
             "lane_change_reward": -1.0,
             # "lane_change_reward": -0.5,
             # "rule_based_compute_action_mode": "goal_x_accel",
@@ -424,12 +426,12 @@ _HIRO_HIGH_REPLAY_BUFFER_KWARGS: Dict[str, Any] = {
 # =========================
 
 TRAIN_CONFIG: Dict[str, Any] = {
-    # "algo": "hiro",
-    "algo": "sac",
+    "algo": "hiro",
+    # "algo": "sac",
     "log_root": "./logs/current",
     "save_root": "./models",
-    # "total_timesteps": 5_000_000,
-    "total_timesteps": 10_000_000,
+    "total_timesteps": 5_000_000,
+    # "total_timesteps": 10_000_000,
     "eval_freq": 10_000,
     "save_freq": 50_000,
     "n_envs": 8,
@@ -441,12 +443,33 @@ TRAIN_CONFIG: Dict[str, Any] = {
     # "run_name": "hiro_260608_sac_base_oldEnv_fixTimeout",
     # "run_name": "hiro_260608_sac_base_oldEnv_fixTimeout_fixGamma",
     # "run_name": "hiro_260608_sac_withPrior_oldEnv_fixTimeout",
-    "run_name": "hiro_260608_sac_withPrior_oldEnv_fixTimeout_fixGamma",
+    # "run_name": "hiro_260608_sac_withPrior_oldEnv_fixTimeout_fixGamma",
+    # "run_name": "hiro_260611_ruleFollow_augObs_oldEnv_lane2to1_005",
+    # "run_name": "hiro_260611_ruleFollow_oldEnv_lane2to1_005",
+    # "run_name": "hiro_260611_rule_oldEnv_lane2to1_005",
+    # "run_name": "hiro_260611_rule_oldEnv_lane1to2_005",
+    "run_name": "hiro_260611_rule_oldEnv_lane1to2_007",
     "scenario_name": "multi_lane",
     # "scenario_name": "multi_lane_stop_to_int",
 
     # Train-time env overrides. Keep empty unless you want to override scenario defaults.
     "env_overrides": {
+        # "rule_based_compute_action_mode": "goal_x_accel_follow",
+        "rule_based_compute_action_mode": "goal_x_accel",
+        "observation": {
+            "append_front_vehicle_features": False,
+            # "append_front_vehicle_features": True,
+        },
+        "initial_lane_id": 1,
+        "goal_lane_id": 2,
+        # "spawn_probability": 0.05,
+        "spawn_probability": 0.07,
+        "behavior_lane_probs": [
+            [0.6, 0.3, 0.1],
+            [0.6, 0.3, 0.1],
+            [0.4, 0.3, 0.3],
+            # [0.6, 0.3, 0.1],
+        ],
     },
 
     # SAC-specific env overrides used only when algo="sac".

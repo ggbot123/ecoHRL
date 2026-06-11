@@ -1,6 +1,7 @@
 *.pyc
 /logs
 /models
+/results
 /debug
 /videos
 *.csv

@@ -34,7 +34,7 @@ EGO_HIGHLIGHT_COLOR = (255, 215, 0)  # Yellow
 SAVE_EPISODE_VIDEO = False
 # SAVE_EPISODE_VIDEO = True
 VIDEO_EPISODE_INDEX = 2  # 0-based: 0 means the first episode
-VIDEO_OUTPUT_DIR = "videos"
+VIDEO_OUTPUT_DIR = os.path.join("results", "videos")
 VIDEO_NAME_PREFIX = "scenario"
 
 

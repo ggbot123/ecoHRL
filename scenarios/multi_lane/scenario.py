@@ -214,6 +214,20 @@ class MultiLaneEnv(AbstractEnv):
         Use fixed sentinel values to indicate "no signal": (-1, -1).
         """
         return -1.0, -1.0
+
+    def get_punctual_time_target(self) -> float:
+        """Return the punctual target used for the current episode."""
+        return float(
+            self.config.get(
+                "punctual_time_target",
+                self.config.get("duration", 0.0),
+            )
+        )
+
+    def get_punctual_time_window(self) -> tuple[float, float]:
+        """Return the configured punctual arrival window."""
+        window = self.config.get("punctual_time_window", [0.0, 0.0])
+        return float(window[0]), float(window[1])
     
     # ----------------- RL task 定义 ----------------- #
     def _reward(self, action: Action) -> float:

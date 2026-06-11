@@ -6,15 +6,43 @@ import numpy as np
 import os
 import csv
 import json
-from dataclasses import replace
+import random
+import torch as th
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from util.plot_result import *
-from util.hiro_utils import unique_path, load_hiro_models
+from util.config_utils import deep_update
+from util.hiro_utils import (
+    apply_hiro_config_overrides,
+    env_config_from_run_config,
+    hiro_config_from_run_config,
+    load_hiro_high_model,
+    load_hiro_low_model,
+    load_hiro_run_config,
+    unique_path,
+)
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig, get_goal_sampler
-from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
+from configs.conf import get_env_config_for_scenario, get_scenario_spec
+
+
+class OneBasedEvalRecordVideo(RecordVideo):
+    """Name evaluation videos with the same 1-based episode id as trajectory CSVs."""
+
+    def __init__(self, *args, eval_episode_number: Optional[int] = None, **kwargs):
+        self.eval_episode_number = eval_episode_number
+        super().__init__(*args, **kwargs)
+
+    def start_recording(self, video_name: str):
+        episode_number = (
+            int(self.eval_episode_number)
+            if self.eval_episode_number is not None
+            else int(self.episode_id) + 1
+        )
+        return super().start_recording(f"hiro_ep_{episode_number:04d}")
 
 
 def main(
@@ -22,19 +50,87 @@ def main(
     episodes: int,
     record_episodes: Optional[Sequence[int]] = None,
     record_trajectory_episodes: Optional[Sequence[int]] = None,
-    env_overrides: Optional[Dict[str, Any]] = None,
+    config_overrides: Optional[Mapping[str, Any]] = None,
     high_model_dir: Optional[str] = None,
     low_model_dir: Optional[str] = None,
     model_suffix: Optional[str] = "final",
-    use_low_safety_layer: Optional[bool] = None,
-    use_goal_sampler_for_high: bool = False,
-    high_goal_sampler_type: Optional[str] = None,
-    high_goal_sampler_path: Optional[str] = None,
-    high_goal_sampler_deterministic: Optional[bool] = None,
     enable_rendering: bool = True,
-    scenario_name: str = "multi_lane",
-):
-    eval_root_dir = os.path.join(model_dir, "eval_results")
+    scenario_name: Optional[str] = None,
+    config_model_dir: Optional[str] = None,
+    env_config_model_dir: Optional[str] = None,
+    seed_base: int = 42,
+    episode_seeds: Optional[Sequence[int]] = None,
+    independent_episodes: bool = True,
+    eval_root_dir: str = "./results/eval_results",
+) -> str:
+    def _strict_deep_update(
+        dst: Dict[str, Any],
+        src: Mapping[str, Any],
+        path: str,
+    ) -> None:
+        for key, value in src.items():
+            key_path = f"{path}.{key}"
+            if key not in dst:
+                raise ValueError(f"Unknown config override: {key_path}")
+            if isinstance(value, Mapping):
+                if not isinstance(dst[key], dict):
+                    raise TypeError(f"{key_path} cannot be overridden with an object")
+                _strict_deep_update(dst[key], value, key_path)
+            else:
+                dst[key] = deepcopy(value)
+
+    overrides = deepcopy(dict(config_overrides or {}))
+    allowed_override_sections = {"environment", "hiro", "evaluation"}
+    unknown_sections = set(overrides) - allowed_override_sections
+    if unknown_sections:
+        raise ValueError(
+            "Unknown config_overrides section(s): "
+            f"{sorted(unknown_sections)}. Supported: {sorted(allowed_override_sections)}"
+        )
+
+    def _override_section(name: str) -> Dict[str, Any]:
+        section = overrides.get(name, {})
+        if not isinstance(section, Mapping):
+            raise TypeError(f"config_overrides['{name}'] must be a mapping")
+        return deepcopy(dict(section))
+
+    env_overrides = _override_section("environment")
+    hiro_overrides = _override_section("hiro")
+    evaluation_overrides = _override_section("evaluation")
+    allowed_evaluation_overrides = {"high_policy_source"}
+    unknown_evaluation_keys = set(evaluation_overrides) - allowed_evaluation_overrides
+    if unknown_evaluation_keys:
+        raise ValueError(
+            "Unknown evaluation override(s): "
+            f"{sorted(unknown_evaluation_keys)}. "
+            f"Supported: {sorted(allowed_evaluation_overrides)}"
+        )
+    high_policy_source = str(
+        evaluation_overrides.get("high_policy_source", "high_model")
+    ).strip().lower()
+    if high_policy_source not in {"high_model", "goal_sampler"}:
+        raise ValueError(
+            "config_overrides['evaluation']['high_policy_source'] must be "
+            "'high_model' or 'goal_sampler'"
+        )
+
+    config_source_dir = config_model_dir or high_model_dir or model_dir
+    run_config, run_config_path = load_hiro_run_config(config_source_dir)
+    env_run_config, env_run_config_path = (
+        load_hiro_run_config(env_config_model_dir)
+        if env_config_model_dir
+        else (run_config, run_config_path)
+    )
+    saved_metadata = env_run_config.get("run_metadata")
+    if not isinstance(saved_metadata, Mapping):
+        raise ValueError("run_config.json is missing the 'run_metadata' object")
+    if not saved_metadata.get("scenario_name"):
+        raise ValueError(
+            "run_config.json is missing 'run_metadata.scenario_name'"
+        )
+    saved_scenario_name = str(saved_metadata["scenario_name"])
+    effective_scenario_name = scenario_name or saved_scenario_name or "multi_lane"
+
     os.makedirs(eval_root_dir, exist_ok=True)
     run_folder_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     eval_dir = unique_path(os.path.join(eval_root_dir, run_folder_name))
@@ -77,23 +173,7 @@ def main(
         n = np.asarray(norm_val, dtype=np.float32)
         return ((n + 1.0) * 0.5 * float(dx_high - dx_low) + float(dx_low)).astype(np.float32)
 
-    test_overrides: Dict[str, Any] = {
-        # "initial_lane_id": 1,
-        "initial_lane_id": "random",
-        # "PERCEPTION_DISTANCE": 200,
-        # "observation": {
-        #     "vehicles_count": 20,
-        #     "vehicles_count_local": 5,
-        #     "features_range": {
-        #         "x": [-200, 200],
-        #         "y": [-10, 10],
-        #         "vx": [-15, 15],
-        #         "vy": [-10, 10],
-        #     },
-        # },
-        "duration": 70.0,
-        # "warmup_each_episode": False,
-        "warmup_each_episode": True,
+    runtime_overrides: Dict[str, Any] = {
         "screen_width": 1800,
         "screen_height": 300,
         "scaling": 3,
@@ -114,17 +194,47 @@ def main(
         "goal_snapshot_fig_width": 15.0,
         "goal_snapshot_fig_height": 3.0,
     }
-    scenario_spec = get_scenario_spec(scenario_name)
+    scenario_spec = get_scenario_spec(effective_scenario_name)
     importlib.import_module(str(scenario_spec["module"]))
     env_id = str(scenario_spec["env_id"])
 
+    scenario_changed = bool(
+        scenario_name is not None
+        and saved_scenario_name is not None
+        and effective_scenario_name != saved_scenario_name
+    )
+    saved_env_config = (
+        None
+        if scenario_changed
+        else env_config_from_run_config(env_run_config)
+    )
+    if saved_env_config is not None:
+        env_config = saved_env_config
+        env_config.pop("_env_seed", None)
+        env_config.pop("actual_episode_start_phase_offset", None)
+    else:
+        env_config = get_env_config_for_scenario(effective_scenario_name)
+    deep_update(env_config, runtime_overrides)
     if env_overrides:
-        test_overrides.update(env_overrides)
+        _strict_deep_update(
+            env_config,
+            env_overrides,
+            "config_overrides.environment",
+        )
     if not enable_rendering:
-        test_overrides["show_trajectories"] = False
-        test_overrides["warmup_render"] = False
-        test_overrides["offscreen_rendering"] = False
-    env_config = get_env_config_for_scenario(scenario_name, test_overrides)
+        env_config["show_trajectories"] = False
+        env_config["warmup_render"] = False
+        env_config["offscreen_rendering"] = False
+
+    if record_episodes and any(int(ep_idx) < 1 for ep_idx in record_episodes):
+        raise ValueError("record_episodes uses 1-based episode numbers; values must be >= 1")
+    if (
+        record_trajectory_episodes
+        and any(int(ep_idx) < 1 for ep_idx in record_trajectory_episodes)
+    ):
+        raise ValueError(
+            "record_trajectory_episodes uses 1-based episode numbers; values must be >= 1"
+        )
 
     if not record_episodes:
         def trigger(ep_id: int) -> bool: return False
@@ -137,24 +247,54 @@ def main(
         trajectory_record_set = {int(ep_idx) for ep_idx in record_trajectory_episodes}
 
     render_mode = "rgb_array" if enable_rendering else None
-    base_env = gym.make(env_id, render_mode=render_mode, config=env_config)
-    env = RecordVideo(base_env, video_folder=eval_dir, episode_trigger=trigger, name_prefix="hiro") if enable_rendering else base_env
 
-    high_model, low_model = load_hiro_models(
-        model_dir,
-        high_model_dir=high_model_dir,
-        low_model_dir=low_model_dir,
-        model_suffix=model_suffix,
+    def make_eval_env(episode_number: Optional[int] = None):
+        base = gym.make(env_id, render_mode=render_mode, config=deepcopy(env_config))
+        if not enable_rendering:
+            return base
+        if episode_number is None:
+            episode_trigger = trigger
+        else:
+            should_record = trigger(int(episode_number) - 1)
+            episode_trigger = lambda _episode_id, enabled=should_record: enabled
+        return OneBasedEvalRecordVideo(
+            base,
+            video_folder=eval_dir,
+            episode_trigger=episode_trigger,
+            name_prefix="hiro",
+            eval_episode_number=episode_number,
+        )
+
+    env = make_eval_env(1 if independent_episodes else None)
+
+    hiro_cfg = hiro_config_from_run_config(run_config)
+    if hiro_overrides:
+        hiro_cfg = apply_hiro_config_overrides(hiro_cfg, hiro_overrides)
+    low_level_type = str(getattr(hiro_cfg, "low_level_type", "sac")).lower()
+    if low_level_type not in {"sac", "rule_based"}:
+        raise ValueError(f"Unknown low_level_type: {low_level_type}")
+    suffix = model_suffix or "final"
+    high_model = load_hiro_high_model(
+        high_model_dir or model_dir,
+        model_suffix=suffix,
     )
-    hiro_cfg = get_hiro_config()
+    low_model = (
+        load_hiro_low_model(
+            low_model_dir or model_dir,
+            model_suffix=suffix,
+        )
+        if low_level_type == "sac"
+        else None
+    )
     runner = HIROPolicyRunner(
         high_model,
         low_model,
         int(getattr(hiro_cfg, "high_interval", 25)),
-        use_low_safety_layer=use_low_safety_layer,
+        use_low_safety_layer=None,
+        config=hiro_cfg,
     )
 
-    if use_goal_sampler_for_high:
+    if high_policy_source == "goal_sampler":
         cfg_goal_sampler = getattr(hiro_cfg, "goal_sampler", GoalSamplerConfig(type="uniform"))
         if isinstance(cfg_goal_sampler, GoalSamplerConfig):
             sampler_cfg = cfg_goal_sampler
@@ -168,12 +308,6 @@ def main(
                 gaussian_mean_x_m=float(getattr(cfg_goal_sampler, "gaussian_mean_x_m", 27.0)),
                 gaussian_half_range_m=float(getattr(cfg_goal_sampler, "gaussian_half_range_m", 5.0)),
             )
-        if high_goal_sampler_type is not None:
-            sampler_cfg = replace(sampler_cfg, type=str(high_goal_sampler_type))
-        if high_goal_sampler_path is not None:
-            sampler_cfg = replace(sampler_cfg, path=str(high_goal_sampler_path))
-        if high_goal_sampler_deterministic is not None:
-            sampler_cfg = replace(sampler_cfg, deterministic=bool(high_goal_sampler_deterministic))
 
         def _goal_bounds_fn(high_obs_batch: np.ndarray) -> Dict[str, np.ndarray]:
             calc = getattr(runner, "high_goal_safe_bounds", None)
@@ -210,19 +344,30 @@ def main(
     log(f"Eval run folder    : {run_folder_name}")
     log(f"Eval results dir   : {eval_dir}")
     log(f"Episodes           : {episodes}")
+    log(f"Scenario           : {effective_scenario_name} ({env_id})")
+    log(f"HIRO config source : {run_config_path}")
+    log(f"Env config source  : {env_run_config_path}")
+    log(f"Config overrides   : {json.dumps(overrides, ensure_ascii=False, sort_keys=True)}")
+    log(f"Independent eps    : {independent_episodes}")
     hd = high_model_dir or model_dir
     ld = low_model_dir or model_dir
-    suffix = model_suffix or "final"
     hp = os.path.join(hd, f"hiro_high_{suffix}.zip")
     lp = os.path.join(ld, f"hiro_low_{suffix}.zip")
     log(f"HIRO high          : {hp}")
-    log(f"HIRO low           : {lp}")
-    if use_goal_sampler_for_high:
+    if low_level_type == "rule_based":
+        log("HIRO low           : N/A (rule-based controller)")
+    else:
+        log(f"HIRO low           : {lp}")
+    if high_policy_source == "goal_sampler":
         sampler_name = type(runner.high_policy).__name__ if runner.high_policy is not None else "None"
         log(f"High policy source : goal sampler ({sampler_name})")
     else:
         log("High policy source : high model")
-    log(f"Low safety layer   : {runner.use_low_safety_layer}")
+    if low_level_type == "rule_based":
+        log("Low safety layer   : rule-based built-in filter")
+    else:
+        log(f"Low safety layer   : {runner.use_low_safety_layer}")
+    log(f"Low policy source  : {low_level_type}")
     log(f"High interval      : {runner.hi}")
     log(f"Rendering enabled  : {enable_rendering}")
     log("=" * 80)
@@ -334,7 +479,37 @@ def main(
     failed_late_count = 0
     failed_early_count = 0
     viewer_initialized = False
-    seed_base = 42
+    if episode_seeds is None:
+        resolved_episode_seeds = [int(seed_base) + ep for ep in range(1, int(episodes) + 1)]
+    else:
+        resolved_episode_seeds = [int(seed) for seed in episode_seeds]
+        if len(resolved_episode_seeds) != int(episodes):
+            raise ValueError(
+                f"episode_seeds length ({len(resolved_episode_seeds)}) must equal episodes ({episodes})"
+            )
+    with open(os.path.join(eval_dir, "effective_eval_config.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "hiro_config_source": run_config_path,
+                "env_config_source": env_run_config_path,
+                "scenario_name": effective_scenario_name,
+                "env_id": env_id,
+                "episode_seeds": resolved_episode_seeds,
+                "independent_episodes": bool(independent_episodes),
+                "config_overrides": overrides,
+                "evaluation": {
+                    "high_policy_source": high_policy_source,
+                    "enable_rendering": bool(enable_rendering),
+                },
+                "environment": env_config,
+                "hiro": vars(hiro_cfg),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+            default=lambda value: vars(value) if hasattr(value, "__dict__") else str(value),
+        )
+
     hi_start_seen = 0
     hi_start_saved = 0
     high_segment_id = 0
@@ -343,10 +518,34 @@ def main(
     warmup_time = float(env_config.get("warmup_time", 0.0))
     warmup_each_episode = bool(env_config.get("warmup_each_episode", False))
     initial_vid = int(env.unwrapped.config.get("vid", 0))
+    generated_vehicle_count = 0
 
     for ep in range(1, int(episodes) + 1):
-        obs, _ = env.reset(seed=seed_base + ep)
+        if independent_episodes and ep > 1:
+            env.close()
+            env = make_eval_env(ep)
+            runner._inited = False
+            runner.safety_controller = None
+            runner.rule_based_agent = None
+            viewer_initialized = False
+            initial_vid = int(env.unwrapped.config.get("vid", 0))
+
+        episode_seed = resolved_episode_seeds[ep - 1]
+        random.seed(episode_seed)
+        np.random.seed(episode_seed)
+        th.manual_seed(episode_seed)
+        if th.cuda.is_available():
+            th.cuda.manual_seed_all(episode_seed)
+        obs, _ = env.reset(seed=episode_seed)
         reset_base_env = env.unwrapped
+        episode_time_window = reset_base_env.config.get(
+            "punctual_time_window",
+            punctual_time_window,
+        )
+        t_min = float(episode_time_window[0])
+        t_max = float(episode_time_window[1])
+        actual_offset_fn = getattr(reset_base_env, "get_actual_episode_start_phase_offset", None)
+        actual_offset = float(actual_offset_fn()) if callable(actual_offset_fn) else None
         init_lane = None
         ego_vehicle = getattr(reset_base_env, "vehicle", None)
         if ego_vehicle is not None:
@@ -361,6 +560,25 @@ def main(
             init_lane = -1
 
         runner.reset(env, obs, float(getattr(hiro_cfg, "intrinsic_coef", 1.0)))
+        if low_model is not None:
+            expected_low_dim = (
+                1
+                + int(runner.local_kin_flat_dim)
+                + int(runner.obs_extra_dim)
+                + int(runner.ego_dim)
+            )
+            low_shape = getattr(getattr(low_model, "observation_space", None), "shape", None)
+            trained_low_dim = int(np.prod(low_shape)) if low_shape else None
+            if trained_low_dim is not None and trained_low_dim != expected_low_dim:
+                raise ValueError(
+                    "Low-level observation dimension mismatch: "
+                    f"test config builds {expected_low_dim}, model expects {trained_low_dim}. "
+                    f"HIRO config source={run_config_path}, "
+                    f"env config source={env_run_config_path}. "
+                    "Use config_model_dir/env_config_model_dir with a complete saved config, "
+                    "or provide "
+                    "matching config_overrides['environment']."
+                )
         should_record_trajectory = ep in trajectory_record_set
         trajectory_rows: list[Dict[str, Any]] = []
 
@@ -375,7 +593,10 @@ def main(
                 kin_flat_local[0, : runner.local_kin_flat_dim], dtype=np.float32
             ).copy()
 
-            if bool(getattr(runner.cfg, "mask_ego_position_in_low_obs", False)):
+            if (
+                str(getattr(runner.cfg, "low_level_type", "sac")).lower() == "sac"
+                and bool(getattr(runner.cfg, "mask_ego_position_in_low_obs", False))
+            ):
                 if int(runner.feat_dim) > 0 and local_kin_flat_local.shape[0] >= int(runner.feat_dim):
                     idx_x_local = int(runner.feature_names.index("x"))
                     idx_y_local = int(runner.feature_names.index("y"))
@@ -614,6 +835,10 @@ def main(
         reason = "terminated" if terminated else ("truncated(time limit)" if truncated else "unknown")
         log("=" * 60)
         log(f"Episode {ep}:")
+        log(f"  seed                    : {episode_seed}")
+        if actual_offset is not None:
+            log(f"  start phase offset      : {actual_offset:.6f} s")
+        log(f"  punctual window         : [{t_min:.3f}, {t_max:.3f}] s")
         log(f"  initial lane            : {init_lane}")
         log(f"  terminal lane           : {final_lane_id if final_lane_id is not None else 'N/A'}")
         log(f"  length (steps)          : {steps}")
@@ -685,6 +910,10 @@ def main(
             group["failed_late_count"] += 1
         if failed_early:
             group["failed_early_count"] += 1
+
+        if independent_episodes:
+            final_ep_vid = int(env.unwrapped.config.get("vid", initial_vid))
+            generated_vehicle_count += max(final_ep_vid - initial_vid, 0)
 
     n = int(episodes)
     log("=" * 80)
@@ -774,9 +1003,14 @@ def main(
         failed_early_count,
     )
 
-    final_vid = int(env.unwrapped.config.get("vid", initial_vid))
-    generated_vehicle_count = max(final_vid - initial_vid, 0)
-    warmup_runs = int(episodes) if warmup_each_episode else (1 if warmup_time > 0.0 else 0)
+    if not independent_episodes:
+        final_vid = int(env.unwrapped.config.get("vid", initial_vid))
+        generated_vehicle_count = max(final_vid - initial_vid, 0)
+    warmup_runs = (
+        int(episodes)
+        if independent_episodes or warmup_each_episode
+        else (1 if warmup_time > 0.0 else 0)
+    )
     total_warmup_time = warmup_time * float(warmup_runs)
     total_episode_time = float(total_env_steps) / max(policy_frequency, 1e-6)
     total_sim_time = total_episode_time + total_warmup_time
@@ -792,35 +1026,135 @@ def main(
 
     log_file.close()
     env.close()
+    return eval_dir
+
+
+@dataclass(frozen=True)
+class HIROEvalModel:
+    name: str
+    model_dir: str
+    high_model_dir: Optional[str] = None
+    low_model_dir: Optional[str] = None
+    model_suffix: str = "final"
+    config_model_dir: Optional[str] = None
+
+
+def run_batch(
+    models: Sequence[HIROEvalModel],
+    episodes: int,
+    *,
+    seed_base: int = 42,
+    episode_seeds: Optional[Sequence[int]] = None,
+    batch_output_dir: str = "./results/hiro_batch",
+    shared_env_config_model_dir: Optional[str] = None,
+    **eval_kwargs: Any,
+) -> Dict[str, str]:
+    """Evaluate several model pairs on identical per-episode random conditions."""
+    if not models:
+        raise ValueError("models must contain at least one HIROEvalModel")
+    eval_kwargs.pop("independent_episodes", None)
+    eval_kwargs.pop("episode_seeds", None)
+    eval_kwargs.pop("seed_base", None)
+    eval_kwargs.pop("env_config_model_dir", None)
+    seeds = (
+        [int(seed) for seed in episode_seeds]
+        if episode_seeds is not None
+        else [int(seed_base) + ep for ep in range(1, int(episodes) + 1)]
+    )
+    if len(seeds) != int(episodes):
+        raise ValueError(f"episode_seeds length ({len(seeds)}) must equal episodes ({episodes})")
+
+    batch_dir = unique_path(
+        os.path.join(batch_output_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    )
+    os.makedirs(batch_dir, exist_ok=True)
+    results: Dict[str, str] = {}
+    manifest_models = []
+    shared_env_source = (
+        shared_env_config_model_dir
+        or models[0].config_model_dir
+        or models[0].high_model_dir
+        or models[0].model_dir
+    )
+
+    for spec in models:
+        if spec.name in results:
+            raise ValueError(f"Duplicate model name in batch: {spec.name}")
+        eval_dir = main(
+            model_dir=spec.model_dir,
+            high_model_dir=spec.high_model_dir,
+            low_model_dir=spec.low_model_dir,
+            model_suffix=spec.model_suffix,
+            config_model_dir=spec.config_model_dir,
+            env_config_model_dir=shared_env_source,
+            episodes=int(episodes),
+            episode_seeds=seeds,
+            independent_episodes=True,
+            **eval_kwargs,
+        )
+        results[spec.name] = eval_dir
+        manifest_models.append(
+            {
+                "name": spec.name,
+                "model_dir": spec.model_dir,
+                "high_model_dir": spec.high_model_dir,
+                "low_model_dir": spec.low_model_dir,
+                "model_suffix": spec.model_suffix,
+                "config_model_dir": spec.config_model_dir,
+                "eval_dir": eval_dir,
+            }
+        )
+
+    with open(os.path.join(batch_dir, "batch_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "episodes": int(episodes),
+                "episode_seeds": seeds,
+                "shared_env_config_model_dir": shared_env_source,
+                "config_overrides": deepcopy(eval_kwargs.get("config_overrides", {})),
+                "models": manifest_models,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return results
 
 
 if __name__ == "__main__":
-    # 用法示例：
-    # - model_dir: 训练产物目录（默认从该目录读取 hiro_high_final.zip / hiro_low_final.zip）
     main(
-        # model_dir="./models/hiro_260120_joint_safetyLayer_noOpc_rewShaping",
         model_dir="./models",
-        # high_model_dir="./models/hiro_260401_highonly_UniformLane1_Rainbow_randomLane",
-        # high_model_dir="./models/hiro_260329_highonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10",
-        high_model_dir="./models/hiro_260331_highonly_reachableUniformLane1_Rainbow_amax3_dmin15_10_randomlane",
-        # high_model_dir="./models/hiro_260319_highonly_pretrained_newSLv2_vio03_HER_reDim_lc10",
-        # high_model_dir="./models/hiro_test_260211_highonly_pretrained_vmin0",
-
-        # low_model_dir="./models/hiro_260416_lowonly_reUni_amax3_dmin15_10_newEnv",
+        # high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_earlyGreen",
+        # high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_midGreen",
+        # high_model_dir="./models/hiro_260604_highonly_ruleFollow_augObs_SigFeat_newFlowProbs",
+        high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_varOffset",
         low_model_dir="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10",
-        # low_model_dir="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2",
-        # low_model_dir="./models/hiro_260122_onlyLow_uniform_safetyLayer_rewShaping",
         # model_suffix="step_6400000",
-        use_goal_sampler_for_high=True,
-        high_goal_sampler_type="reachable_uniform",
-        # high_goal_sampler_path="./models/your_high_model/hiro_high_final.zip",  # only for type="pretrained"
-        use_low_safety_layer=True,
-        episodes=300, 
+
+        episodes=30,
         # record_episodes=[],
         # record_trajectory_episodes=[],
-        record_episodes=[i for i in range(1, 11)],
-        record_trajectory_episodes=[i for i in range(1, 11)],
+        record_episodes=[i for i in range(1, 31)],
+        record_trajectory_episodes=[i for i in range(1, 31)],
         # enable_rendering=False,
-        scenario_name="multi_lane",
-        # scenario_name="multi_lane_stop_to_int",
+
+        # scenario_name="multi_lane",
+        scenario_name="multi_lane_stop_to_int",
+
+        config_overrides={
+            "environment": {
+                # "align_ego_spawn_to_signal_offset": True,
+                # "episode_start_phase_offset": 40.0,
+            },
+            "hiro": {
+                "use_low_safety_layer": True,
+                "goal_sampler": {
+                    "type": "reachable_uniform",
+                },
+            },
+            "evaluation": {
+                "high_policy_source": "high_model",
+                # "high_policy_source": "goal_sampler",
+            },
+        },
     )

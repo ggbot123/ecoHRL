@@ -1,10 +1,19 @@
 import numpy as np
-from typing import Tuple, Optional, Callable
+from typing import Tuple, Optional, Callable, Any
 from rl.algos.sac.sac import SAC
 from rl.utils import utils
-from rl.algos.HRL.rule_based import RuleBasedController
+from rl.algos.HRL.rule_based import RuleBasedAgentWrapper, RuleBasedController
 from rl.algos.HRL.high_goal_safe_bounds import HighGoalSafeBoundsCalculator
 from configs.conf import get_hiro_config
+
+
+class _SingleEnvAdapter:
+    def __init__(self, env):
+        self.env = env
+        self.action_space = env.action_space
+
+    def get_attr(self, name, indices=None):
+        return [getattr(self.env.unwrapped, name)]
 
 class HIROPolicyRunner:
     """Single-env HIRO inference runner.
@@ -21,10 +30,11 @@ class HIROPolicyRunner:
         high_interval: int,
         use_low_safety_layer: Optional[bool] = None,
         high_policy: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        config: Optional[Any] = None,
     ):
         self.high_model, self.low_model, self.hi = high_model, low_model, int(high_interval)
         self.high_policy = high_policy
-        self.cfg = get_hiro_config()
+        self.cfg = config if config is not None else get_hiro_config()
         self.use_low_safety_layer = bool(use_low_safety_layer) if use_low_safety_layer is not None else bool(getattr(self.cfg, "use_low_safety_layer", False))
         self._inited = False
         self.need_high, self.c = True, 0
@@ -43,6 +53,7 @@ class HIROPolicyRunner:
         self.idx_vx = 2
         self.idx_vy = 3
         self.safety_controller: Optional[RuleBasedController] = None
+        self.rule_based_agent: Optional[RuleBasedAgentWrapper] = None
         self.last_action_pre_safety = np.zeros(0, dtype=np.float32)
         self.last_action_post_safety = np.zeros(0, dtype=np.float32)
         self.last_goal_action = np.zeros(0, dtype=np.float32)
@@ -81,6 +92,16 @@ class HIROPolicyRunner:
         if self.use_low_safety_layer and self.safety_controller is None:
             self.safety_controller = RuleBasedController(
                 cfg,
+                low_safety_filter=getattr(self.cfg, "low_safety_filter", None),
+            )
+        if (
+            str(getattr(self.cfg, "low_level_type", "sac")).lower() == "rule_based"
+            and self.rule_based_agent is None
+        ):
+            self.rule_based_agent = RuleBasedAgentWrapper(
+                _SingleEnvAdapter(env),
+                n_envs=1,
+                high_interval=int(self.hi),
                 low_safety_filter=getattr(self.cfg, "low_safety_filter", None),
             )
 
@@ -127,15 +148,24 @@ class HIROPolicyRunner:
         # In training we bind high-goal safe bounds explicitly. During standalone
         # inference we must rebind it after model deserialization.
         high_actor = getattr(self.high_model, "actor", None)
+        use_high_goal_safety = bool(
+            getattr(self.cfg, "use_high_goal_safety_layer", False)
+        )
+        if use_high_goal_safety and (
+            high_actor is None
+            or not hasattr(high_actor, "goal_safe_sampling_enabled")
+        ):
+            raise RuntimeError(
+                "The saved high-level model does not support the configured "
+                "high-goal safety layer"
+            )
         if high_actor is not None and hasattr(high_actor, "goal_safe_sampling_enabled"):
             need_bind_bounds = bool(getattr(high_actor, "goal_safe_bounds_fn", None) is None)
-            if need_bind_bounds and bool(getattr(self.cfg, "use_high_goal_safety_layer", False)):
+            if need_bind_bounds and use_high_goal_safety:
                 high_actor.goal_safe_eps = float(getattr(self.cfg, "high_goal_safe_eps", 1e-6))
                 high_actor.goal_safe_bounds_fn = self.high_goal_safe_bounds.compute_torch
                 high_actor.goal_safe_sampling_enabled = True
             elif need_bind_bounds:
-                # Fallback for legacy checkpoints: disable safe sampling when
-                # no bounds function can be reconstructed.
                 high_actor.goal_safe_sampling_enabled = False
 
         intrinsic_norm = getattr(self.cfg, "intrinsic_norm_ranges", None)
@@ -259,13 +289,6 @@ class HIROPolicyRunner:
         if self.need_high:
             self._sample_goal(obs, kin, env)
 
-        if self.low_model is None:
-            # Some evaluation scripts call runner.act() only to update self.goal_phys.
-            # In that case, allow low_model to be absent and return a dummy action.
-            self.last_action_pre_safety = np.zeros(0, dtype=np.float32)
-            self.last_action_post_safety = np.zeros(0, dtype=np.float32)
-            return np.zeros(0, dtype=np.float32)
-
         ego_sub = self._ego_sub(kin)
         t_norm = np.array([self.c / float(self.hi)], dtype=np.float32)
         goal_rel = (self.goal_phys - ego_sub).astype(np.float32)
@@ -275,14 +298,41 @@ class HIROPolicyRunner:
         extra = obs_arr[1 + self.kin_flat_dim : 1 + self.kin_flat_dim + self.obs_extra_dim].astype(np.float32)
 
         # Keep inference low_obs consistent with training: mask ego absolute position (x/y).
-        if bool(getattr(self.cfg, "mask_ego_position_in_low_obs", False)):
+        low_level_type = str(getattr(self.cfg, "low_level_type", "sac")).lower()
+        if (
+            low_level_type == "sac"
+            and bool(getattr(self.cfg, "mask_ego_position_in_low_obs", False))
+        ):
             if int(self.feat_dim) > 0 and local_kin_flat.shape[0] >= int(self.feat_dim):
                 idx_x = int(self.feature_names.index("x"))
                 idx_y = int(self.feature_names.index("y"))
                 local_kin_flat[idx_x] = 0.0
                 local_kin_flat[idx_y] = 0.0
         low_obs = np.concatenate([t_norm, local_kin_flat, extra, goal_rel]).astype(np.float32)
-        
+
+        if low_level_type == "rule_based":
+            if self.rule_based_agent is None:
+                raise RuntimeError("Rule-based low-level agent is not initialized")
+            low_obs_batch = low_obs.reshape(1, -1)
+            goal_batch = self.goal_phys.reshape(1, -1)
+            action_raw = self.rule_based_agent.act(low_obs_batch, goal_batch)[0]
+            action = self.rule_based_agent.apply_safety_layer(
+                low_obs_batch,
+                goal_batch,
+                np.asarray(action_raw, dtype=np.float32).reshape(1, -1),
+            )[0]
+            self.last_action_pre_safety = np.asarray(action_raw, dtype=np.float32).copy()
+            self.last_action_post_safety = np.asarray(action, dtype=np.float32).copy()
+            return np.asarray(action, dtype=np.float32)
+        if low_level_type != "sac":
+            raise ValueError(f"Unknown low_level_type: {low_level_type}")
+        if self.low_model is None:
+            # Goal-only evaluation scripts use the runner to update goal_phys
+            # and compute their own primitive action.
+            self.last_action_pre_safety = np.zeros(0, dtype=np.float32)
+            self.last_action_post_safety = np.zeros(0, dtype=np.float32)
+            return np.zeros(0, dtype=np.float32)
+
         action, _ = self.low_model.predict(low_obs, deterministic=True)
         action = np.asarray(action, dtype=np.float32)
         self.last_action_pre_safety = action.copy()

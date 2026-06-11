@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import asdict, is_dataclass, replace
 from typing import Any, Dict
 
@@ -56,8 +57,10 @@ def _write_hiro_run_config(
     high_sac_kwargs: Dict[str, Any],
     low_sac_kwargs: Dict[str, Any],
     run_metadata: Dict[str, Any] | None = None,
+    checkpoint_save_freq: int = 50_000,
 ) -> None:
     os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
     try:
         env_configs = env.get_attr("config")
     except Exception as exc:
@@ -75,6 +78,7 @@ def _write_hiro_run_config(
             "high_transition_csv_envs": str(high_transition_csv_envs),
             "low_transition_detail_csv": bool(low_transition_detail_csv),
             "low_transition_detail_envs": str(low_transition_detail_envs),
+            "checkpoint_save_freq": int(checkpoint_save_freq),
         },
         "environment": {
             "env0_config": env_configs[0] if isinstance(env_configs, list) and env_configs else env_configs,
@@ -90,6 +94,10 @@ def _write_hiro_run_config(
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(_json_safe(payload), f, ensure_ascii=False, indent=2, sort_keys=True)
     print(f"[HIRO Trainer] Saved run config: {out_path}")
+    model_config_path = os.path.join(save_dir, "run_config.json")
+    if os.path.abspath(model_config_path) != os.path.abspath(out_path):
+        shutil.copyfile(out_path, model_config_path)
+        print(f"[HIRO Trainer] Saved model-side run config: {model_config_path}")
 
 
 def train_hiro(
@@ -163,6 +171,7 @@ def train_hiro(
             env.set_attr("config", cfg_new, indices=i)
         print("[HIRO Trainer] Enabled ego_speed_range=[8,12] for speed_near_cruise sampler")
 
+    checkpoint_save_freq = 50_000
     _write_hiro_run_config(
         log_dir=log_dir,
         env=env,
@@ -178,6 +187,7 @@ def train_hiro(
         high_sac_kwargs=high_sac_kwargs,
         low_sac_kwargs=low_sac_kwargs,
         run_metadata=run_metadata,
+        checkpoint_save_freq=checkpoint_save_freq,
     )
 
     def _extract_ego_speed(high_obs_batch: np.ndarray) -> np.ndarray:
@@ -217,7 +227,7 @@ def train_hiro(
         verbose=1,
     )
     checkpoint_cb = HIROCheckpointCallback(
-        save_freq=50_000,
+        save_freq=checkpoint_save_freq,
         save_dir=save_dir,
         prefix=save_name_prefix,
         verbose=1,
