@@ -53,6 +53,7 @@ def _write_hiro_run_config(
     high_transition_csv_envs: str,
     low_transition_detail_csv: bool,
     low_transition_detail_envs: str,
+    low_debug_config: Dict[str, Any],
     effective_cfg: Any,
     high_sac_kwargs: Dict[str, Any],
     low_sac_kwargs: Dict[str, Any],
@@ -78,6 +79,7 @@ def _write_hiro_run_config(
             "high_transition_csv_envs": str(high_transition_csv_envs),
             "low_transition_detail_csv": bool(low_transition_detail_csv),
             "low_transition_detail_envs": str(low_transition_detail_envs),
+            "low_debug_config": dict(low_debug_config),
             "checkpoint_save_freq": int(checkpoint_save_freq),
         },
         "environment": {
@@ -114,6 +116,12 @@ def train_hiro(
     high_transition_csv_envs: str = "env0",
     low_transition_detail_csv: bool = False,
     low_transition_detail_envs: str = "env0",
+    low_her_debug_csv_interval_steps: int = 0,
+    low_her_debug_csv_max_rows_per_flush: int = 200,
+    low_her_debug_max_records: int = 20000,
+    low_her_debug_sample_prob: float = 0.0,
+    low_debug_summary_interval_steps: int = 10000,
+    low_debug_env_step_interval_steps: int = 1000,
     run_metadata: Dict[str, Any] | None = None,
 ):
     """Train HiRO (SAC high + SAC low).
@@ -159,7 +167,22 @@ def train_hiro(
         else:
             high_sac_kwargs.pop("replay_buffer_kwargs", None)
 
-    model = HIROSAC(env, high_sac_kwargs, low_sac_kwargs, effective_cfg)
+    low_debug_config = {
+        "her_debug_enabled": int(low_her_debug_csv_interval_steps) > 0,
+        "her_debug_max_records": int(low_her_debug_max_records),
+        "her_debug_sample_prob": float(low_her_debug_sample_prob),
+        "her_debug_csv_interval_steps": int(low_her_debug_csv_interval_steps),
+        "her_debug_csv_max_rows_per_flush": int(low_her_debug_csv_max_rows_per_flush),
+        "summary_interval_steps": int(low_debug_summary_interval_steps),
+        "env_step_interval_steps": int(low_debug_env_step_interval_steps),
+    }
+    model = HIROSAC(
+        env,
+        high_sac_kwargs,
+        low_sac_kwargs,
+        effective_cfg,
+        low_debug_config=low_debug_config,
+    )
 
     sampler_type = str(getattr(effective_cfg.goal_sampler, "type", "")).lower()
     if sampler_type in {"speed_near_cruise", "near_cruise", "cruise_nearby"}:
@@ -172,6 +195,7 @@ def train_hiro(
         print("[HIRO Trainer] Enabled ego_speed_range=[8,12] for speed_near_cruise sampler")
 
     checkpoint_save_freq = 50_000
+    logging_high_transition_csv_all = max(0, int(high_transition_csv_all))
     _write_hiro_run_config(
         log_dir=log_dir,
         env=env,
@@ -179,10 +203,11 @@ def train_hiro(
         save_dir=save_dir,
         save_name_prefix=save_name_prefix,
         seed=seed,
-        high_transition_csv_all=high_transition_csv_all,
+        high_transition_csv_all=logging_high_transition_csv_all,
         high_transition_csv_envs=high_transition_csv_envs,
         low_transition_detail_csv=bool(low_transition_detail_csv),
         low_transition_detail_envs=low_transition_detail_envs,
+        low_debug_config=low_debug_config,
         effective_cfg=effective_cfg,
         high_sac_kwargs=high_sac_kwargs,
         low_sac_kwargs=low_sac_kwargs,
@@ -220,12 +245,14 @@ def train_hiro(
         csv_save_dir=log_dir,
         low_obs_csv_interval_hi=10,
         low_obs_csv_env0_only=True,
-        high_transition_csv_all=max(0, int(high_transition_csv_all)),
+        high_transition_csv_all=logging_high_transition_csv_all,
         high_transition_csv_envs=high_transition_csv_envs,
         low_transition_detail_csv=bool(low_transition_detail_csv),
         low_transition_detail_envs=low_transition_detail_envs,
-        her_debug_csv_interval_steps=int(getattr(effective_cfg, "low_her_debug_csv_interval_steps", 0)),
-        her_debug_csv_max_rows_per_flush=int(getattr(effective_cfg, "low_her_debug_csv_max_rows_per_flush", 200)),
+        her_debug_csv_interval_steps=int(low_debug_config["her_debug_csv_interval_steps"]),
+        her_debug_csv_max_rows_per_flush=int(low_debug_config["her_debug_csv_max_rows_per_flush"]),
+        low_debug_summary_interval_steps=int(low_debug_config["summary_interval_steps"]),
+        low_debug_env_step_interval_steps=int(low_debug_config["env_step_interval_steps"]),
         verbose=1,
     )
     checkpoint_cb = HIROCheckpointCallback(
@@ -260,6 +287,9 @@ def train_hiro(
             bounds_fn=model.high_goal_safe_bounds.compute_np,
             speed_fn=_extract_ego_speed,
             enable_vx_bounds=enable_vx_bounds,
+            dynamic_feasible_lane_intervals=bool(
+                getattr(effective_cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+            ),
         )
         model.learn_low(
             total_timesteps=total_timesteps,

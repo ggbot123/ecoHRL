@@ -188,10 +188,6 @@ class HIROConfig:
     low_her_future_mode: str | None = None  # None->compat map, or "episode_timeaware"|"segment_timeaware"|"segment_legacy"
     low_her_episode_timeaware_steps_ahead_range: Optional[tuple[int, int] | List[int]] = None  # e.g. (1, 8)
     low_her_future_timeaware: bool = True  # True: new episode-time HER, False: legacy segment-future HER
-    low_her_debug_csv_interval_steps: int = 0
-    low_her_debug_csv_max_rows_per_flush: int = 200
-    low_her_debug_max_records: int = 20000
-    low_her_debug_sample_prob: float = 1.0
     high_pretrained_path: Optional[str] = None
     low_pretrained_path: Optional[str] = None
     mask_ego_position_in_low_obs: bool = False
@@ -209,12 +205,21 @@ class HIROConfig:
     high_goal_safe_min_goal_x_span: float = 0.0
     high_obs_use_signal_features: bool = True
     high_goal_safe_enable_goal_vx_bounds: bool = True
+    high_goal_dynamic_feasible_lane_intervals: bool = False
 
 
 class HIROSAC:
-    def __init__(self, env, high_sac_kwargs: Dict[str, Any], low_sac_kwargs: Dict[str, Any], config: HIROConfig):
+    def __init__(
+        self,
+        env,
+        high_sac_kwargs: Dict[str, Any],
+        low_sac_kwargs: Dict[str, Any],
+        config: HIROConfig,
+        low_debug_config: Dict[str, Any] | None = None,
+    ):
         self.env = env
         self.cfg = config
+        self.low_debug_config = dict(low_debug_config or {})
         self.device = get_device(config.device)
         self.total_timesteps = 0
         self.n_envs = int(env.num_envs)
@@ -374,9 +379,9 @@ class HIROSAC:
                         her_future_mode=getattr(self.cfg, "low_her_future_mode", None),
                         her_episode_timeaware_steps_ahead_range=getattr(self.cfg, "low_her_episode_timeaware_steps_ahead_range", None),
                         her_future_timeaware=bool(getattr(self.cfg, "low_her_future_timeaware", True)),
-                        her_debug_enabled=bool(int(getattr(self.cfg, "low_her_debug_csv_interval_steps", 0)) > 0),
-                        her_debug_max_records=int(getattr(self.cfg, "low_her_debug_max_records", 20000)),
-                        her_debug_sample_prob=float(getattr(self.cfg, "low_her_debug_sample_prob", 1.0)),
+                        her_debug_enabled=bool(self.low_debug_config.get("her_debug_enabled", False)),
+                        her_debug_max_records=int(self.low_debug_config.get("her_debug_max_records", 20000)),
+                        her_debug_sample_prob=float(self.low_debug_config.get("her_debug_sample_prob", 0.0)),
                         enable_her=True,
                     )
                 )
@@ -422,6 +427,9 @@ class HIROSAC:
 
             policy_kwargs = dict(high_sac_kwargs.get("policy_kwargs", {}) or {})
             policy_kwargs["goal_safe_eps"] = float(getattr(self.cfg, "high_goal_safe_eps", 1e-6))
+            policy_kwargs["dynamic_feasible_lane_intervals"] = bool(
+                getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+            )
             high_sac_kwargs["policy_kwargs"] = policy_kwargs
 
         q_debug_cfg = high_sac_kwargs.get("q_replay_debug", {}) or {}
@@ -438,6 +446,9 @@ class HIROSAC:
                     ego_feature_idx=list(self.ego_feature_idx),
                     lane_center_ys=self.lane_center_ys,
                     high_interval=int(self.cfg.high_interval),
+                    dynamic_feasible_lane_intervals=bool(
+                        getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+                    ),
                     low_policy=self.low_agent.policy if self.use_off_policy_correction else None,
                 )
             )
@@ -461,6 +472,9 @@ class HIROSAC:
         if bool(getattr(self.cfg, "use_high_goal_safety_layer", False)):
             high_sac.actor.goal_safe_eps = float(getattr(self.cfg, "high_goal_safe_eps", 1e-6))
             high_sac.actor.goal_safe_bounds_fn = self.high_goal_safe_bounds.compute_torch
+            high_sac.actor.dynamic_feasible_lane_intervals = bool(
+                getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+            )
 
         self.high_agent = SB3AgentWrapper(high_sac, config.train_freq, config.gradient_steps_high, config.batch_size)
 
@@ -792,7 +806,14 @@ class HIROSAC:
 
                 ego_sub = utils.extract_ego_substate(kin[idx], self.ego_feature_idx)
                 ego_start[idx] = ego_sub
-                goal_phys[idx] = utils.goal_action_to_abs(ego_sub, a, self.lane_center_ys)
+                goal_phys[idx] = utils.goal_action_to_abs(
+                    ego_sub,
+                    a,
+                    self.lane_center_ys,
+                    dynamic_feasible_intervals=bool(
+                        getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+                    ),
+                )
                 goal_dist_start[idx] = goal_phys[idx] - ego_start[idx]
 
                 high_ret[idx] = 0.0

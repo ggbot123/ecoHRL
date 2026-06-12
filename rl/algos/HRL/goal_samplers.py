@@ -9,6 +9,31 @@ import gymnasium as gym
 import numpy as np
 
 
+def _semantic_y_interval(
+    component: int,
+    lane_idx: int,
+    n_lanes: int,
+    dynamic_feasible_intervals: bool,
+) -> tuple[float, float]:
+    """Return the y-code interval for relative [LEFT, KEEP, RIGHT]."""
+    fixed = ((-1.0, -1.0 / 3.0), (-1.0 / 3.0, 1.0 / 3.0), (1.0 / 3.0, 1.0))
+    if not dynamic_feasible_intervals:
+        return fixed[component]
+    if n_lanes <= 1:
+        return (-1.0, 1.0) if component == 1 else fixed[component]
+    if lane_idx == 0:
+        if component == 1:
+            return -1.0, 0.0
+        if component == 2:
+            return 0.0, 1.0
+    if lane_idx == n_lanes - 1:
+        if component == 0:
+            return -1.0, 0.0
+        if component == 1:
+            return 0.0, 1.0
+    return fixed[component]
+
+
 @dataclass(frozen=True)
 class GoalSamplerConfig:
     type: str = "uniform"  # "uniform" | "reachable_uniform" | "reachable_gaussian" | "speed_near_cruise" | "pretrained" | "pretrained_sac"
@@ -50,10 +75,12 @@ class ReachableUniformGoalSampler(GoalSampler):
         action_space: gym.spaces.Box,
         bounds_fn: Callable[[np.ndarray], dict[str, np.ndarray]],
         enable_vx_bounds: bool = True,
+        dynamic_feasible_intervals: bool = False,
     ):
         super().__init__(action_space)
         self._bounds_fn = bounds_fn
         self._enable_vx_bounds = bool(enable_vx_bounds)
+        self._dynamic_feasible_intervals = bool(dynamic_feasible_intervals)
 
     @staticmethod
     def _sample_component_uniform(valid_mask: np.ndarray) -> np.ndarray:
@@ -85,9 +112,6 @@ class ReachableUniformGoalSampler(GoalSampler):
             l_vx = None
             u_vx = None
 
-        seg_low = np.asarray([-1.0, -1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)[None, :]
-        seg_high = np.asarray([-1.0 / 3.0, 1.0 / 3.0, 1.0], dtype=np.float32)[None, :]
-
         valid = u2 > l2
         valid_any = np.any(valid, axis=1)
 
@@ -95,9 +119,26 @@ class ReachableUniformGoalSampler(GoalSampler):
             idx = np.flatnonzero(valid_any)
             k = self._sample_component_uniform(valid[idx])
 
-            row = np.arange(idx.size)
-            yl = seg_low[0, k]
-            yh = seg_high[0, k]
+            lane_idx = np.asarray(stats.get("ego_lane_idx", np.zeros(n)), dtype=np.int64).reshape(-1)
+            n_lanes = int(np.asarray(stats.get("n_lanes", 3)).reshape(-1)[0])
+            use_dynamic = self._dynamic_feasible_intervals and {
+                "ego_lane_idx",
+                "n_lanes",
+            }.issubset(stats)
+            y_intervals = np.asarray(
+                [
+                    _semantic_y_interval(
+                        int(comp),
+                        int(lane_idx[obs_idx]),
+                        n_lanes,
+                        use_dynamic,
+                    )
+                    for obs_idx, comp in zip(idx, k)
+                ],
+                dtype=np.float32,
+            )
+            yl = y_intervals[:, 0]
+            yh = y_intervals[:, 1]
             xl = l2[idx, k]
             xh = u2[idx, k]
 
@@ -146,11 +187,13 @@ class ReachableGaussianGoalSampler(GoalSampler):
         mean_x_m: float = 27.0,
         half_range_m: float = 5.0,
         enable_vx_bounds: bool = True,
+        dynamic_feasible_intervals: bool = False,
     ):
         super().__init__(action_space)
         self._bounds_fn = bounds_fn
         self._mu_x_m = float(mean_x_m)
         self._enable_vx_bounds = bool(enable_vx_bounds)
+        self._dynamic_feasible_intervals = bool(dynamic_feasible_intervals)
         half = float(max(half_range_m, 1e-6))
         # Keep 70% probability mass inside [mu-half, mu+half].
         z = float(NormalDist().inv_cdf(0.85))
@@ -180,11 +223,14 @@ class ReachableGaussianGoalSampler(GoalSampler):
             l_vx = None
             u_vx = None
 
-        seg_low = np.asarray([-1.0, -1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)
-        seg_high = np.asarray([-1.0 / 3.0, 1.0 / 3.0, 1.0], dtype=np.float32)
-
         valid = u2 > l2
         denom = max(float(high[0] - low[0]), 1e-6)
+        lane_idx = np.asarray(stats.get("ego_lane_idx", np.zeros(n)), dtype=np.int64).reshape(-1)
+        n_lanes = int(np.asarray(stats.get("n_lanes", 3)).reshape(-1)[0])
+        use_dynamic = self._dynamic_feasible_intervals and {
+            "ego_lane_idx",
+            "n_lanes",
+        }.issubset(stats)
 
         for i in range(n):
             candidates = np.flatnonzero(valid[i])
@@ -214,7 +260,13 @@ class ReachableGaussianGoalSampler(GoalSampler):
                 x_env = float(self._gauss.inv_cdf(p))
                 x_env = float(np.clip(x_env, lo, hi))
 
-            y_code = float(seg_low[k] + np.random.rand() * (seg_high[k] - seg_low[k]))
+            y_low, y_high = _semantic_y_interval(
+                k,
+                int(lane_idx[i]),
+                n_lanes,
+                use_dynamic,
+            )
+            y_code = float(y_low + np.random.rand() * (y_high - y_low))
             actions[i, 0] = np.float32(np.clip(x_env, low[0], high[0]))
             actions[i, 1] = np.float32(y_code)
             if act_dim >= 3 and l_vx is not None and u_vx is not None:
@@ -320,6 +372,7 @@ def get_goal_sampler(
     bounds_fn: Optional[Callable[[np.ndarray], dict[str, np.ndarray]]] = None,
     speed_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     enable_vx_bounds: Optional[bool] = None,
+    dynamic_feasible_lane_intervals: bool = False,
 ) -> GoalSampler:
     if isinstance(cfg, str):
         cfg = GoalSamplerConfig(type=cfg)
@@ -331,7 +384,12 @@ def get_goal_sampler(
     if sampler_type == "reachable_uniform":
         if bounds_fn is None:
             raise ValueError("bounds_fn is required for type='reachable_uniform'")
-        return ReachableUniformGoalSampler(action_space, bounds_fn=bounds_fn, enable_vx_bounds=use_vx_bounds)
+        return ReachableUniformGoalSampler(
+            action_space,
+            bounds_fn=bounds_fn,
+            enable_vx_bounds=use_vx_bounds,
+            dynamic_feasible_intervals=dynamic_feasible_lane_intervals,
+        )
     if sampler_type in {"reachable_gaussian", "gaussian_reachable", "reachable_trunc_gaussian"}:
         if bounds_fn is None:
             raise ValueError("bounds_fn is required for type='reachable_gaussian'")
@@ -341,6 +399,7 @@ def get_goal_sampler(
             mean_x_m=float(cfg.gaussian_mean_x_m),
             half_range_m=float(cfg.gaussian_half_range_m),
             enable_vx_bounds=use_vx_bounds,
+            dynamic_feasible_intervals=dynamic_feasible_lane_intervals,
         )
     if sampler_type in {"speed_near_cruise", "near_cruise", "cruise_nearby"}:
         if speed_fn is None:

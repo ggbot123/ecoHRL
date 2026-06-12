@@ -153,8 +153,37 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         self._seg_index: dict[int, dict[tuple[int, int], int]] = defaultdict(dict)
         self._time_index: dict[tuple[int, int, int], tuple[int, int]] = {}
         self._her_debug_records: deque[dict[str, Any]] = deque(maxlen=self.her_debug_max_records)
+        self._training_debug_stats = self._new_training_debug_stats()
 
         self.rng = np.random.default_rng()
+
+    @staticmethod
+    def _new_training_debug_stats() -> dict[str, float]:
+        return {
+            "sample_calls": 0.0,
+            "sampled_transitions": 0.0,
+            "her_candidates": 0.0,
+            "her_applied": 0.0,
+            "skip_missing_metadata": 0.0,
+            "skip_goal_lookup": 0.0,
+            "skip_start_ref": 0.0,
+            "skip_invalid_steps": 0.0,
+            "steps_sum": 0.0,
+            "steps_sq_sum": 0.0,
+            "steps_min": np.inf,
+            "steps_max": -np.inf,
+            "relabeled_terminal": 0.0,
+            "intrinsic_sum": 0.0,
+            "intrinsic_sq_sum": 0.0,
+            "intrinsic_abs_max": 0.0,
+            "external_sum": 0.0,
+            "external_sq_sum": 0.0,
+            "total_reward_sum": 0.0,
+            "total_reward_sq_sum": 0.0,
+            "goal_error_l2_sum": 0.0,
+            "goal_error_l2_sq_sum": 0.0,
+            "her_debug_records_dropped": 0.0,
+        }
 
     def set_seed(self, seed: int) -> None:
         self.rng = np.random.default_rng(seed)
@@ -279,6 +308,15 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             out.append(self._her_debug_records.popleft())
         return out
 
+    def pop_training_debug_stats(self) -> dict[str, float]:
+        stats = dict(self._training_debug_stats)
+        self._training_debug_stats = self._new_training_debug_stats()
+        stats["buffer_size"] = float(self.buffer_size)
+        stats["buffer_entries"] = float(self.buffer_size if self.full else self.pos)
+        stats["buffer_valid_entries"] = float(np.count_nonzero(self._valid))
+        stats["pending_her_debug_records"] = float(len(self._her_debug_records))
+        return stats
+
     def _get_next_obs_at(self, row: int, col: int) -> np.ndarray:
         if self.optimize_memory_usage:
             return self.observations[(int(row) + 1) % self.buffer_size, int(col)]
@@ -294,7 +332,9 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             return None
 
         if self.her_strategy == "future":
-            future_entries = [e for e in entries if e[0] > int(t_in_seg)]
+            # A transition at t reaches its achieved next state in one action,
+            # so it is already a valid one-step future goal for state s_t.
+            future_entries = [e for e in entries if e[0] >= int(t_in_seg)]
             if len(future_entries) > 0:
                 pick = int(self.rng.integers(0, len(future_entries)))
                 _, r, c = future_entries[pick]
@@ -313,14 +353,16 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             return None
 
         if self.her_strategy == "future":
-            future_entries = [e for e in entries if e[0] > int(t_in_seg)]
+            future_entries = [e for e in entries if e[0] >= int(t_in_seg)]
             if len(future_entries) > 0:
                 pick = int(self.rng.integers(0, len(future_entries)))
                 t_target, r, c = future_entries[pick]
-                return self._ego_next[int(r), int(c)].astype(np.float32, copy=True), int(r), int(c), int(t_target - int(t_in_seg))
+                steps_ahead = int(t_target - int(t_in_seg) + 1)
+                return self._ego_next[int(r), int(c)].astype(np.float32, copy=True), int(r), int(c), steps_ahead
 
         t_target, r, c = max(entries, key=lambda x: x[0])
-        return self._ego_next[int(r), int(c)].astype(np.float32, copy=True), int(r), int(c), int(max(0, t_target - int(t_in_seg)))
+        steps_ahead = int(t_target - int(t_in_seg) + 1)
+        return self._ego_next[int(r), int(c)].astype(np.float32, copy=True), int(r), int(c), steps_ahead
 
     def _get_future_goal_in_segment_with_steps(self, seg_id: int, t_in_seg: int) -> tuple[np.ndarray, int, int, int] | None:
         seg_map = self._seg_index.get(int(seg_id))
@@ -331,28 +373,30 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         if len(entries) == 0:
             return None
 
-        future_entries = [e for e in entries if e[0] > int(t_in_seg)]
+        future_entries = [e for e in entries if e[0] >= int(t_in_seg)]
         if len(future_entries) == 0:
             return None
 
         pick = int(self.rng.integers(0, len(future_entries)))
         t_target, r, c = future_entries[pick]
-        steps_ahead = int(t_target - int(t_in_seg))
+        steps_ahead = int(t_target - int(t_in_seg) + 1)
         if steps_ahead <= 0:
             return None
 
         return self._ego_next[int(r), int(c)].astype(np.float32, copy=True), int(r), int(c), steps_ahead
 
     def _get_future_goal_by_episode_time(self, env_i: int, ep_id: int, ep_step: int) -> tuple[np.ndarray, int, int, int] | None:
-        # Randomly choose i in configured [min_steps, max_steps], then use
-        # same-env same-episode future step (ep_step + i).
-        i_steps = int(
+        # Randomly choose the true action distance to the achieved goal.
+        # Transition k stores s_k -> s_(k+1), so an H-step goal from s_t
+        # is the next state of transition t + H - 1.
+        steps_ahead = int(
             self.rng.integers(
                 int(self.her_episode_timeaware_min_steps_ahead),
                 int(self.her_episode_timeaware_max_steps_ahead) + 1,
             )
         )
-        target_key = (int(env_i), int(ep_id), int(ep_step + i_steps))
+        target_transition_step = int(ep_step + steps_ahead - 1)
+        target_key = (int(env_i), int(ep_id), target_transition_step)
         loc = self._time_index.get(target_key)
         if loc is None:
             return None
@@ -360,12 +404,12 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         r, c = int(loc[0]), int(loc[1])
         if c != int(env_i):
             return None
-        if int(self._ep_id[r, c]) != int(ep_id) or int(self._ep_step[r, c]) != int(ep_step + i_steps):
+        if int(self._ep_id[r, c]) != int(ep_id) or int(self._ep_step[r, c]) != target_transition_step:
             # Stale index (e.g. ring-buffer overwrite): clean and skip relabel for this sample.
             self._time_index.pop(target_key, None)
             return None
 
-        return self._ego_next[r, c].astype(np.float32, copy=True), int(r), int(c), i_steps
+        return self._ego_next[r, c].astype(np.float32, copy=True), int(r), int(c), steps_ahead
 
     def _get_episode_step_ego_now(self, env_i: int, ep_id: int, ep_step: int) -> tuple[np.ndarray, int, int] | None:
         if int(ep_step) < 0:
@@ -419,6 +463,12 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         upper_bound = self.buffer_size if self.full else self.pos
 
         her_mask = (self.rng.random(batch_size) < self.her_ratio) & (seg_ids >= 0)
+        her_applied_mask = np.zeros(batch_size, dtype=bool)
+        applied_steps: list[int] = []
+        debug_stats = self._training_debug_stats
+        debug_stats["sample_calls"] += 1.0
+        debug_stats["sampled_transitions"] += float(batch_size)
+        debug_stats["her_candidates"] += float(np.count_nonzero(her_mask))
         ego_now_all = self._ego_now[batch_inds, env_indices].astype(np.float32, copy=False)
         ego_next_all = self._ego_next[batch_inds, env_indices].astype(np.float32, copy=False)
         ego_start_ref_all = self._ego_start[batch_inds, env_indices].astype(np.float32, copy=True)
@@ -437,6 +487,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             if self.her_strategy == "future":
                 if self.her_future_mode == "episode_timeaware":
                     if int(ep_ids[i]) < 0 or int(ep_steps[i]) < 0:
+                        debug_stats["skip_missing_metadata"] += 1.0
                         continue
                     goal_with_steps = self._get_future_goal_by_episode_time(
                         int(env_indices[i]),
@@ -444,6 +495,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                         int(ep_steps[i]),
                     )
                     if goal_with_steps is None:
+                        debug_stats["skip_goal_lookup"] += 1.0
                         continue
                     g_new_abs, goal_row, goal_col, i_steps = goal_with_steps
                     steps_ahead = int(i_steps)
@@ -457,6 +509,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                         int(start_ref_step),
                     )
                     if start_ref is None:
+                        debug_stats["skip_start_ref"] += 1.0
                         continue
                     ego_start_ref, start_ref_row, start_ref_col = start_ref
                     ego_start_ref_all[i] = ego_start_ref
@@ -469,6 +522,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                         int(t_in_seg[i]),
                     )
                     if goal_with_steps is None:
+                        debug_stats["skip_goal_lookup"] += 1.0
                         continue
                     g_new_abs, goal_row, goal_col, i_steps = goal_with_steps
                     steps_ahead = int(i_steps)
@@ -478,16 +532,20 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                     # Legacy behavior: sample achieved goal from future steps in the same segment.
                     goal_meta = self._get_future_goal_with_meta(int(seg_ids[i]), int(t_in_seg[i]))
                     if goal_meta is None:
+                        debug_stats["skip_goal_lookup"] += 1.0
                         continue
                     g_new_abs, goal_row, goal_col, steps_ahead = goal_meta
             else:
                 goal_meta = self._get_future_goal_with_meta(int(seg_ids[i]), int(t_in_seg[i]))
                 if goal_meta is None:
+                    debug_stats["skip_goal_lookup"] += 1.0
                     continue
                 g_new_abs, goal_row, goal_col, steps_ahead = goal_meta
             if g_new_abs is None:
+                debug_stats["skip_goal_lookup"] += 1.0
                 continue
             if int(steps_ahead) < 1:
+                debug_stats["skip_invalid_steps"] += 1.0
                 continue
 
             # Keep HER goal semantics aligned with high-level goal_action_to_abs:
@@ -501,6 +559,8 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_now_all[i]).astype(np.float32)
             next_obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_next_all[i]).astype(np.float32)
             relabeled_done_mask[i] = (int(steps_ahead) == 1)
+            her_applied_mask[i] = True
+            applied_steps.append(int(steps_ahead))
             if relabeled_t_norm is not None:
                 obs_relabeled[i, 0] = np.float32(np.clip(relabeled_t_norm, 0.0, 1.0))
                 next_obs_relabeled[i, 0] = np.float32(np.clip(relabeled_t_norm + 1.0 / float(self.high_interval), 0.0, 1.0))
@@ -526,6 +586,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                         "source_next_obs": self._to_list(next_obs[i]),
                         "source_action": self._to_list(actions[i]),
                         "source_ego_abs": self._to_list(self._ego_now[src_row, src_col]),
+                        "source_ego_next_abs": self._to_list(self._ego_next[src_row, src_col]),
                         "source_reward_stored": float(self.rewards[src_row, src_col]),
                         "source_done": bool(source_done_mask[i]),
                         "relabeled_done": bool(relabeled_done_mask[i]),
@@ -538,7 +599,8 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                         "goal_obs": self._to_list(self.observations[int(goal_row), int(goal_col), :]),
                         "goal_next_obs": self._to_list(self._get_next_obs_at(int(goal_row), int(goal_col))),
                         "goal_action": self._to_list(self.actions[int(goal_row), int(goal_col), :]),
-                        "goal_ego_abs": self._to_list(self._ego_now[int(goal_row), int(goal_col)]),
+                        "goal_transition_ego_abs": self._to_list(self._ego_now[int(goal_row), int(goal_col)]),
+                        "goal_ego_abs": self._to_list(g_new_abs),
                         "goal_reward_stored": float(self.rewards[int(goal_row), int(goal_col)]),
                         "start_ref_row": int(start_ref_row),
                         "start_ref_col": int(start_ref_col),
@@ -590,12 +652,44 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         r_ext = self._r_ext[batch_inds, env_indices]
         rewards = (r_ext + r_goal).astype(np.float32).reshape(-1, 1)
 
+        applied_count = int(np.count_nonzero(her_applied_mask))
+        debug_stats["her_applied"] += float(applied_count)
+        if applied_steps:
+            steps_np = np.asarray(applied_steps, dtype=np.float32)
+            debug_stats["steps_sum"] += float(np.sum(steps_np))
+            debug_stats["steps_sq_sum"] += float(np.sum(steps_np * steps_np))
+            debug_stats["steps_min"] = min(float(debug_stats["steps_min"]), float(np.min(steps_np)))
+            debug_stats["steps_max"] = max(float(debug_stats["steps_max"]), float(np.max(steps_np)))
+        if applied_count > 0:
+            applied_intrinsic = np.asarray(r_goal[her_applied_mask], dtype=np.float32)
+            applied_external = np.asarray(r_ext[her_applied_mask], dtype=np.float32)
+            applied_total = np.asarray(rewards.reshape(-1)[her_applied_mask], dtype=np.float32)
+            goal_error_l2 = np.linalg.norm(
+                goal_abs_all[her_applied_mask] - ego_next_all[her_applied_mask],
+                axis=1,
+            ).astype(np.float32)
+            debug_stats["relabeled_terminal"] += float(np.count_nonzero(relabeled_done_mask & her_applied_mask))
+            debug_stats["intrinsic_sum"] += float(np.sum(applied_intrinsic))
+            debug_stats["intrinsic_sq_sum"] += float(np.sum(applied_intrinsic * applied_intrinsic))
+            debug_stats["intrinsic_abs_max"] = max(
+                float(debug_stats["intrinsic_abs_max"]),
+                float(np.max(np.abs(applied_intrinsic))),
+            )
+            debug_stats["external_sum"] += float(np.sum(applied_external))
+            debug_stats["external_sq_sum"] += float(np.sum(applied_external * applied_external))
+            debug_stats["total_reward_sum"] += float(np.sum(applied_total))
+            debug_stats["total_reward_sq_sum"] += float(np.sum(applied_total * applied_total))
+            debug_stats["goal_error_l2_sum"] += float(np.sum(goal_error_l2))
+            debug_stats["goal_error_l2_sq_sum"] += float(np.sum(goal_error_l2 * goal_error_l2))
+
         if self.her_debug_enabled and relabel_debug_pending:
             for rec in relabel_debug_pending:
                 bi = int(rec["batch_i"])
                 rec["intrinsic_reward_new"] = float(r_goal[bi])
                 rec["reward_ext"] = float(r_ext[bi])
                 rec["reward_total_new"] = float(rewards[bi, 0])
+                if len(self._her_debug_records) >= self._her_debug_records.maxlen:
+                    debug_stats["her_debug_records_dropped"] += 1.0
                 self._her_debug_records.append(rec)
 
         dones_relabeled = relabeled_done_mask.astype(dones.dtype, copy=False).reshape(-1, 1)

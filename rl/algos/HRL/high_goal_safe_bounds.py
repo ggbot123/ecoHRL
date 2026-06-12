@@ -344,7 +344,12 @@ class HighGoalSafeBoundsCalculator:
                 l_vx[:, comp_idx] = v_lo_n
                 u_vx[:, comp_idx] = v_hi_n
 
-        out: Dict[str, np.ndarray] = {"l2": l2, "u2": u2}
+        out: Dict[str, np.ndarray] = {
+            "l2": l2,
+            "u2": u2,
+            "ego_lane_idx": ego_lane_idx.astype(np.int64),
+            "n_lanes": np.asarray(self.n_lanes, dtype=np.int64),
+        }
         if self.enable_goal_vx_bounds:
             out["l_vx"] = l_vx
             out["u_vx"] = u_vx
@@ -355,6 +360,8 @@ class HighGoalSafeBoundsCalculator:
         out = {
             "l2": th.as_tensor(bounds_np["l2"], dtype=high_obs_t.dtype, device=high_obs_t.device),
             "u2": th.as_tensor(bounds_np["u2"], dtype=high_obs_t.dtype, device=high_obs_t.device),
+            "ego_lane_idx": th.as_tensor(bounds_np["ego_lane_idx"], dtype=th.long, device=high_obs_t.device),
+            "n_lanes": th.as_tensor(bounds_np["n_lanes"], dtype=th.long, device=high_obs_t.device),
         }
         if self.enable_goal_vx_bounds:
             out["l_vx"] = th.as_tensor(bounds_np["l_vx"], dtype=high_obs_t.dtype, device=high_obs_t.device)

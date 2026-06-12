@@ -1,8 +1,9 @@
 import json
 import os
+import warnings
 from copy import deepcopy
-from dataclasses import asdict, fields
-from typing import Any, Dict, Mapping, Optional, Tuple
+from dataclasses import MISSING, asdict, fields
+from typing import Any, Dict, Mapping, Optional, Tuple, Type
 
 from rl.algos.sac.sac import SAC
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig
@@ -64,43 +65,72 @@ def env_config_from_run_config(payload: Mapping[str, Any]) -> Dict[str, Any]:
     return deepcopy(dict(env_cfg))
 
 
-def _hiro_config_from_mapping(saved: Mapping[str, Any]) -> HIROConfig:
-    allowed = {field.name for field in fields(HIROConfig)}
-    missing = allowed - set(saved)
-    unknown = set(saved) - allowed
-    if missing or unknown:
+def _fill_missing_dataclass_defaults(
+    saved: Mapping[str, Any],
+    config_type: Type[Any],
+    config_name: str,
+) -> Dict[str, Any]:
+    config_fields = {field.name: field for field in fields(config_type)}
+    unknown = set(saved) - set(config_fields)
+    missing = set(config_fields) - set(saved)
+    missing_required = {
+        name
+        for name in missing
+        if config_fields[name].default is MISSING
+        and config_fields[name].default_factory is MISSING
+    }
+    if missing_required or unknown:
         raise ValueError(
-            "Invalid HIRO config fields: "
-            f"missing={sorted(missing)}, unknown={sorted(unknown)}"
+            f"Invalid {config_name} fields: "
+            f"missing={sorted(missing_required)}, unknown={sorted(unknown)}"
         )
 
     kwargs = deepcopy(dict(saved))
+    filled = {}
+    for name in sorted(missing):
+        field = config_fields[name]
+        value = (
+            field.default_factory()
+            if field.default_factory is not MISSING
+            else deepcopy(field.default)
+        )
+        kwargs[name] = value
+        filled[name] = value
+
+    if filled:
+        warnings.warn(
+            f"{config_name} is missing fields from an older run config; "
+            f"using current defaults: {filled}",
+            UserWarning,
+            stacklevel=3,
+        )
+    return kwargs
+
+
+def _hiro_config_from_mapping(saved: Mapping[str, Any]) -> HIROConfig:
+    kwargs = _fill_missing_dataclass_defaults(saved, HIROConfig, "HIRO config")
     goal_sampler = kwargs.get("goal_sampler")
     low_safety_filter = kwargs.get("low_safety_filter")
-    goal_sampler_fields = {field.name for field in fields(GoalSamplerConfig)}
-    low_safety_filter_fields = {field.name for field in fields(LowSafetyFilterConfig)}
     if not isinstance(goal_sampler, Mapping):
         raise ValueError("HIRO config 'goal_sampler' must be an object")
-    goal_missing = goal_sampler_fields - set(goal_sampler)
-    goal_unknown = set(goal_sampler) - goal_sampler_fields
-    if goal_missing or goal_unknown:
-        raise ValueError(
-            "Invalid goal_sampler fields: "
-            f"missing={sorted(goal_missing)}, unknown={sorted(goal_unknown)}"
+    kwargs["goal_sampler"] = GoalSamplerConfig(
+        **_fill_missing_dataclass_defaults(
+            goal_sampler,
+            GoalSamplerConfig,
+            "goal_sampler config",
         )
-    kwargs["goal_sampler"] = GoalSamplerConfig(**dict(goal_sampler))
+    )
 
     if low_safety_filter is None:
         kwargs["low_safety_filter"] = None
     elif isinstance(low_safety_filter, Mapping):
-        safety_missing = low_safety_filter_fields - set(low_safety_filter)
-        safety_unknown = set(low_safety_filter) - low_safety_filter_fields
-        if safety_missing or safety_unknown:
-            raise ValueError(
-                "Invalid low_safety_filter fields: "
-                f"missing={sorted(safety_missing)}, unknown={sorted(safety_unknown)}"
+        kwargs["low_safety_filter"] = LowSafetyFilterConfig(
+            **_fill_missing_dataclass_defaults(
+                low_safety_filter,
+                LowSafetyFilterConfig,
+                "low_safety_filter config",
             )
-        kwargs["low_safety_filter"] = LowSafetyFilterConfig(**dict(low_safety_filter))
+        )
     else:
         raise ValueError("HIRO config 'low_safety_filter' must be an object or null")
     return HIROConfig(**kwargs)

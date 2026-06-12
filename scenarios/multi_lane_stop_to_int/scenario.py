@@ -8,6 +8,7 @@ from custom_env import utils
 from custom_env.vehicle.objects import Obstacle, Landmark
 
 from configs.conf import get_env_config
+from scenarios.reward_logic import wrong_lane_terminal_triggered
 from util.config_utils import sync_punctual_time_with_phase_offset
 from util.safety_utils import compute_ego_clear_distance_for_front_vehicle
 
@@ -367,6 +368,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         """
         first_reset = not getattr(self, "_did_global_warmup", False)
         has_previous_episode = int(getattr(self, "_episodes_started", 0)) > 0
+        self._episode_initial_lane_id = self._sample_initial_lane_id()
         self._inter_episode_active = False
         self._inter_episode_remaining = 0.0
 
@@ -700,6 +702,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             "punctual_time_target": self.get_punctual_time_target(),
             "punctual_time_window_start": float(punctual_window[0]),
             "punctual_time_window_end": float(punctual_window[1]),
+            "initial_lane": int(self._initial_lane_id()),
             "ego_x": float(ego_pos[0]),
             "ego_y": float(ego_pos[1]),
             "ego_speed": float(getattr(self.vehicle, "speed", 0.0)),
@@ -970,7 +973,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             self._has_arrived = True
             self._arrival_time = self.time
             punctual = self._punctual_factor(self._arrival_time)
-        wrong_lane_terminal = float(self._goal_longitudinal_reached() and not self._goal_reached())
+        wrong_lane_terminal = float(self._wrong_lane_terminal_triggered())
 
         self._last_speed = cur_speed
         self._last_acc = acc
@@ -1001,6 +1004,20 @@ class MultiLaneStopToIntEnv(AbstractEnv):
     def _is_truncated(self) -> bool:
         """The episode is truncated if the episode time limit is reached."""
         return self.time >= self.config["duration"]
+
+    def _wrong_lane_terminal_triggered(self) -> bool:
+        longitudinal_reached = self._goal_longitudinal_reached()
+        episode_ending = (
+            self.vehicle.crashed
+            or self._is_truncated()
+            or self.config["offroad_terminal"]
+            and not self.vehicle.on_road
+        )
+        return wrong_lane_terminal_triggered(
+            longitudinal_reached=longitudinal_reached,
+            goal_reached=self._goal_reached(),
+            episode_ending=bool(episode_ending),
+        )
 
     # ----------------- 入口生成环境车（安全间距版） ----------------- #
     def _spawn_background(self, spawn_probability=None):
@@ -1383,13 +1400,32 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         self.road.highlight_regions = regions
 
-    def _initial_lane_id(self) -> int:
+    def _sample_initial_lane_id(self) -> int:
         cfg = self.config
-        lane_cfg = cfg.get("initial_lane_id", "random")
         lanes = int(cfg["lanes_count"])
+        lane_probs = cfg.get("initial_lane_probs", None)
+        if lane_probs is not None:
+            probs = np.asarray(lane_probs, dtype=np.float64).reshape(-1)
+            if probs.size != lanes:
+                raise ValueError(
+                    f"initial_lane_probs must contain {lanes} values, got {probs.size}"
+                )
+            if not np.all(np.isfinite(probs)) or np.any(probs < 0.0):
+                raise ValueError("initial_lane_probs must be finite and non-negative")
+            total = float(np.sum(probs))
+            if total <= 0.0:
+                raise ValueError("initial_lane_probs must have a positive sum")
+            return int(self.np_random.choice(lanes, p=probs / total))
+
+        lane_cfg = cfg.get("initial_lane_id", "random")
         if lane_cfg == "random":
             return int(self.np_random.integers(lanes))
         return int(np.clip(int(lane_cfg), 0, lanes - 1))
+
+    def _initial_lane_id(self) -> int:
+        if not hasattr(self, "_episode_initial_lane_id"):
+            self._episode_initial_lane_id = self._sample_initial_lane_id()
+        return int(self._episode_initial_lane_id)
 
     def _start_longitudinal(self) -> float:
         # Stop is fixed at x=0 for this scenario.

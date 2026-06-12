@@ -185,7 +185,13 @@ def intrinsic_reward_shaping_huber(
     return reward.astype(np.float32), goal_err_phys, reward_unweighted, terminal_bonus.astype(np.float32)
 
 
-def map_y_code_to_target_y(y_code: np.ndarray, y_current: np.ndarray, lane_center_ys: np.ndarray) -> np.ndarray:
+def map_y_code_to_target_y(
+    y_code: np.ndarray,
+    y_current: np.ndarray,
+    lane_center_ys: np.ndarray,
+    *,
+    dynamic_feasible_intervals: bool = False,
+) -> np.ndarray:
     y_code = np.asarray(y_code, dtype=np.float32).reshape(-1)
     y_current = np.asarray(y_current, dtype=np.float32).reshape(-1)
     lanes_y = np.asarray(lane_center_ys, dtype=np.float32).reshape(-1)
@@ -193,12 +199,29 @@ def map_y_code_to_target_y(y_code: np.ndarray, y_current: np.ndarray, lane_cente
     diff = np.abs(y_current[:, None] - lanes_y[None, :])
     k = diff.argmin(axis=1)
     k_target = k.copy()
-    k_target[(y_code < -1 / 3) & (k > 0)] -= 1
-    k_target[(y_code > 1 / 3) & (k < len(lanes_y) - 1)] += 1
+    if not dynamic_feasible_intervals:
+        k_target[(y_code < -1 / 3) & (k > 0)] -= 1
+        k_target[(y_code > 1 / 3) & (k < len(lanes_y) - 1)] += 1
+    elif len(lanes_y) > 1:
+        last_lane = len(lanes_y) - 1
+        interior = (k > 0) & (k < last_lane)
+        k_target[interior & (y_code < -1 / 3)] -= 1
+        k_target[interior & (y_code > 1 / 3)] += 1
+
+        # At a road edge, split [-1, 1] equally between the two feasible
+        # relative semantics while keeping LEFT / KEEP / RIGHT unchanged.
+        k_target[(k == 0) & (y_code > 0.0)] += 1
+        k_target[(k == last_lane) & (y_code < 0.0)] -= 1
     return lanes_y[k_target].astype(np.float32)
 
 
-def goal_action_to_abs(ego_sub: np.ndarray, goal_action: np.ndarray, lane_center_ys: np.ndarray) -> np.ndarray:
+def goal_action_to_abs(
+    ego_sub: np.ndarray,
+    goal_action: np.ndarray,
+    lane_center_ys: np.ndarray,
+    *,
+    dynamic_feasible_intervals: bool = False,
+) -> np.ndarray:
     """Convert high-level goal action a=[Δx, y_code, vx_target] to absolute goal state [x*, y*, vx*, 0].
 
     ego_sub: current absolute ego state [x0, y0, vx0, vy0]
@@ -213,7 +236,12 @@ def goal_action_to_abs(ego_sub: np.ndarray, goal_action: np.ndarray, lane_center
     vx_target = goal_action[:, 2]
 
     x_target = ego_sub[:, 0] + dx
-    y_target = map_y_code_to_target_y(y_code, ego_sub[:, 1], lane_center_ys)
+    y_target = map_y_code_to_target_y(
+        y_code,
+        ego_sub[:, 1],
+        lane_center_ys,
+        dynamic_feasible_intervals=dynamic_feasible_intervals,
+    )
     return np.stack([x_target, y_target, vx_target, np.zeros_like(x_target)], axis=1).astype(np.float32)
 
 

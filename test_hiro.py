@@ -329,6 +329,9 @@ def main(
             action_space=high_model.action_space,
             bounds_fn=_goal_bounds_fn,
             speed_fn=_goal_speed_fn,
+            dynamic_feasible_lane_intervals=bool(
+                getattr(hiro_cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+            ),
         )
         runner.high_policy = high_policy
 
@@ -1127,7 +1130,9 @@ if __name__ == "__main__":
         # high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_earlyGreen",
         # high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_midGreen",
         # high_model_dir="./models/hiro_260604_highonly_ruleFollow_augObs_SigFeat_newFlowProbs",
-        high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_varOffset",
+        # high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_varOffset",
+        # high_model_dir="./models/hiro_260611_ruleFollow_oldEnv_lane2to1_005",
+        high_model_dir="./models/hiro_260611_rule_oldEnv_lane1to2_005",
         low_model_dir="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10",
         # model_suffix="step_6400000",
 
@@ -1138,13 +1143,19 @@ if __name__ == "__main__":
         record_trajectory_episodes=[i for i in range(1, 31)],
         # enable_rendering=False,
 
-        # scenario_name="multi_lane",
-        scenario_name="multi_lane_stop_to_int",
+        scenario_name="multi_lane",
+        # scenario_name="multi_lane_stop_to_int",
 
         config_overrides={
             "environment": {
                 # "align_ego_spawn_to_signal_offset": True,
                 # "episode_start_phase_offset": 40.0,
+                # "observation": {
+                #     "append_front_vehicle_features": False,
+                #     # "append_front_vehicle_features": True,
+                # },
+                # "initial_lane_id": 2,
+                # "goal_lane_id": 1,
             },
             "hiro": {
                 "use_low_safety_layer": True,

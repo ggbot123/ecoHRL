@@ -43,6 +43,8 @@ class HIROLoggingCallback(BaseCallback):
         # HER relabel debug CSV
         her_debug_csv_interval_steps: int = 0,
         her_debug_csv_max_rows_per_flush: int = 200,
+        low_debug_summary_interval_steps: int = 10000,
+        low_debug_env_step_interval_steps: int = 1000,
     ):
         super().__init__(verbose)
         self.high_log_interval_episodes = int(high_log_interval_episodes)
@@ -77,6 +79,8 @@ class HIROLoggingCallback(BaseCallback):
         self._acc_max = 5.0
         self.her_debug_csv_interval_steps = max(0, int(her_debug_csv_interval_steps))
         self.her_debug_csv_max_rows_per_flush = max(1, int(her_debug_csv_max_rows_per_flush))
+        self.low_debug_summary_interval_steps = max(0, int(low_debug_summary_interval_steps))
+        self.low_debug_env_step_interval_steps = max(0, int(low_debug_env_step_interval_steps))
 
         # Effective high-level component keys (weighted values)
         # Sum over these components equals high_reward per interval.
@@ -95,6 +99,7 @@ class HIROLoggingCallback(BaseCallback):
         self._diagnostic_csv_enabled = bool(self.csv_save_dir)
         self._low_transition_detail_csv_enabled = self.low_transition_detail_csv and bool(self.csv_save_dir)
         self._her_debug_csv_enabled = self.her_debug_csv_interval_steps > 0 and bool(self.csv_save_dir)
+        self._low_debug_summary_enabled = self.low_debug_summary_interval_steps > 0 and bool(self.csv_save_dir)
 
         self.csv_active = False  # Whether current episode is being logged to CSV (env 0)
         self.csv_low_traj_recorded = False # Only record first interval's low traj per logged episode
@@ -108,6 +113,8 @@ class HIROLoggingCallback(BaseCallback):
         self._last_dump_high = 0
         self._last_dump_low = 0
         self._last_her_debug_dump_step = 0
+        self._last_low_debug_summary_step = 0
+        self._last_env_diag_step = 0
         self._high_buffers, self._low_buffers = {}, {}
 
         # CSV Headers
@@ -199,6 +206,7 @@ class HIROLoggingCallback(BaseCallback):
                 "time",
                 "signal_time_global",
                 "signal_episode_base",
+                "initial_lane",
                 "ego_x",
                 "ego_y",
                 "ego_speed",
@@ -328,6 +336,7 @@ class HIROLoggingCallback(BaseCallback):
                 "source_done",
                 "source_reward_stored",
                 "source_ego_abs",
+                "source_ego_next_abs",
                 "source_obs",
                 "source_action",
                 "source_next_obs",
@@ -336,6 +345,7 @@ class HIROLoggingCallback(BaseCallback):
                 "goal_ep_id",
                 "goal_ep_step",
                 "goal_reward_stored",
+                "goal_transition_ego_abs",
                 "goal_ego_abs",
                 "goal_obs",
                 "goal_action",
@@ -349,14 +359,52 @@ class HIROLoggingCallback(BaseCallback):
                 "intrinsic_reward_new",
                 "reward_ext",
                 "reward_total_new",
+                "relabeled_done",
+                "start_ref_ep_step",
+                "start_ref_ego_abs",
             ]
             self._init_csv(self.her_debug_csv_path, her_debug_header)
+
+        if self._low_debug_summary_enabled:
+            self.low_training_health_csv_path = os.path.join(self.csv_save_dir, "low_training_health.csv")
+            self._init_csv(
+                self.low_training_health_csv_path,
+                [
+                    "global_step",
+                    "sample_calls",
+                    "sampled_transitions",
+                    "her_candidates",
+                    "her_applied",
+                    "her_apply_rate",
+                    "skip_missing_metadata",
+                    "skip_goal_lookup",
+                    "skip_start_ref",
+                    "skip_invalid_steps",
+                    "steps_mean",
+                    "steps_std",
+                    "steps_min",
+                    "steps_max",
+                    "relabeled_terminal_rate",
+                    "intrinsic_mean",
+                    "intrinsic_std",
+                    "intrinsic_abs_max",
+                    "external_reward_mean",
+                    "total_reward_mean",
+                    "total_reward_std",
+                    "goal_error_l2_mean",
+                    "goal_error_l2_std",
+                    "buffer_entries",
+                    "buffer_valid_entries",
+                    "buffer_occupancy",
+                    "pending_her_debug_records",
+                    "her_debug_records_dropped",
+                ],
+            )
 
     def _init_csv(self, path, header):
         if not os.path.exists(path):
             with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
+                csv.writer(f).writerow(header)
 
     def _fmt_arr(self, arr):
         # Format array as string with 2 decimal places
@@ -368,10 +416,119 @@ class HIROLoggingCallback(BaseCallback):
             formatter={'float_kind': lambda x: f"{x:.2f}"}
         ).replace('\n', '')
 
-    def _append_csv(self, path, row):
+    def _append_csv(self, path, row) -> None:
         with open(path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
+            csv.writer(f).writerow(row)
+
+    @staticmethod
+    def _stats_mean_std(total: float, total_sq: float, count: float) -> tuple[float, float]:
+        if count <= 0:
+            return np.nan, np.nan
+        mean = float(total) / float(count)
+        variance = max(float(total_sq) / float(count) - mean * mean, 0.0)
+        return mean, float(np.sqrt(variance))
+
+    def _flush_low_training_debug(self, step_now: int, *, force: bool = False) -> None:
+        if not self._low_debug_summary_enabled or not hasattr(self, "low_training_health_csv_path"):
+            return
+        if not force and step_now - self._last_low_debug_summary_step < self.low_debug_summary_interval_steps:
+            return
+
+        rb = getattr(getattr(self.model, "low_agent", None), "replay_buffer", None)
+        if rb is None or not hasattr(rb, "pop_training_debug_stats"):
+            self._last_low_debug_summary_step = step_now
+            return
+
+        stats = rb.pop_training_debug_stats()
+        if force and float(stats.get("sample_calls", 0.0)) <= 0:
+            self._last_low_debug_summary_step = step_now
+            return
+        applied = float(stats.get("her_applied", 0.0))
+        candidates = float(stats.get("her_candidates", 0.0))
+        steps_mean, steps_std = self._stats_mean_std(
+            stats.get("steps_sum", 0.0), stats.get("steps_sq_sum", 0.0), applied
+        )
+        intrinsic_mean, intrinsic_std = self._stats_mean_std(
+            stats.get("intrinsic_sum", 0.0), stats.get("intrinsic_sq_sum", 0.0), applied
+        )
+        external_mean, _ = self._stats_mean_std(
+            stats.get("external_sum", 0.0), stats.get("external_sq_sum", 0.0), applied
+        )
+        total_mean, total_std = self._stats_mean_std(
+            stats.get("total_reward_sum", 0.0), stats.get("total_reward_sq_sum", 0.0), applied
+        )
+        goal_error_mean, goal_error_std = self._stats_mean_std(
+            stats.get("goal_error_l2_sum", 0.0), stats.get("goal_error_l2_sq_sum", 0.0), applied
+        )
+        buffer_size = float(stats.get("buffer_size", 0.0))
+        buffer_entries = float(stats.get("buffer_entries", 0.0))
+        buffer_occupancy = buffer_entries / buffer_size if buffer_size > 0 else 0.0
+        apply_rate = applied / candidates if candidates > 0 else 0.0
+        terminal_rate = float(stats.get("relabeled_terminal", 0.0)) / applied if applied > 0 else 0.0
+        steps_min = float(stats.get("steps_min", np.nan))
+        steps_max = float(stats.get("steps_max", np.nan))
+        steps_min = steps_min if np.isfinite(steps_min) else np.nan
+        steps_max = steps_max if np.isfinite(steps_max) else np.nan
+
+        self._append_csv(
+            self.low_training_health_csv_path,
+            [
+                int(step_now),
+                int(stats.get("sample_calls", 0.0)),
+                int(stats.get("sampled_transitions", 0.0)),
+                int(candidates),
+                int(applied),
+                apply_rate,
+                int(stats.get("skip_missing_metadata", 0.0)),
+                int(stats.get("skip_goal_lookup", 0.0)),
+                int(stats.get("skip_start_ref", 0.0)),
+                int(stats.get("skip_invalid_steps", 0.0)),
+                steps_mean,
+                steps_std,
+                steps_min,
+                steps_max,
+                terminal_rate,
+                intrinsic_mean,
+                intrinsic_std,
+                float(stats.get("intrinsic_abs_max", 0.0)),
+                external_mean,
+                total_mean,
+                total_std,
+                goal_error_mean,
+                goal_error_std,
+                int(buffer_entries),
+                int(stats.get("buffer_valid_entries", 0.0)),
+                buffer_occupancy,
+                int(stats.get("pending_her_debug_records", 0.0)),
+                int(stats.get("her_debug_records_dropped", 0.0)),
+            ],
+        )
+
+        logger = getattr(self.model, "low_logger", None)
+        if logger is not None:
+            logger.record("her/apply_rate", apply_rate)
+            logger.record("her/candidates", candidates)
+            logger.record("her/applied", applied)
+            logger.record("her/skip_missing_metadata", float(stats.get("skip_missing_metadata", 0.0)))
+            logger.record("her/skip_goal_lookup", float(stats.get("skip_goal_lookup", 0.0)))
+            logger.record("her/skip_start_ref", float(stats.get("skip_start_ref", 0.0)))
+            logger.record("her/steps_mean", steps_mean)
+            logger.record("her/terminal_rate", terminal_rate)
+            logger.record("her/intrinsic_mean", intrinsic_mean)
+            logger.record("her/intrinsic_std", intrinsic_std)
+            logger.record("her/goal_error_l2_mean", goal_error_mean)
+            logger.record("replay/buffer_occupancy", buffer_occupancy)
+            logger.record("replay/valid_entries", float(stats.get("buffer_valid_entries", 0.0)))
+            logger.record("her/debug_records_dropped", float(stats.get("her_debug_records_dropped", 0.0)))
+
+        self._last_low_debug_summary_step = step_now
+
+    def _on_training_end(self) -> None:
+        step_now = int(getattr(self.model, "num_timesteps", 0))
+        self._flush_low_training_debug(step_now, force=True)
+        logger = getattr(self.model, "low_logger", None)
+        if logger is not None:
+            logger.dump(step=step_now)
 
     @staticmethod
     def _json_arr(arr) -> str:
@@ -485,22 +642,19 @@ class HIROLoggingCallback(BaseCallback):
 
         if self.mpc_fail_csv_path:
             os.makedirs(os.path.dirname(self.mpc_fail_csv_path), exist_ok=True)
-            if not os.path.exists(self.mpc_fail_csv_path):
-                with open(self.mpc_fail_csv_path, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(
-                        f,
-                        fieldnames=[
-                            "global_step",
-                            "env_id",
-                            "segment_id",
-                            "planner",
-                            "message",
-                            "goal_phys",
-                            "ego_sub_now",
-                            "low_obs",
-                        ],
-                    )
-                    writer.writeheader()
+            self._init_csv(
+                self.mpc_fail_csv_path,
+                [
+                    "global_step",
+                    "env_id",
+                    "segment_id",
+                    "planner",
+                    "message",
+                    "goal_phys",
+                    "ego_sub_now",
+                    "low_obs",
+                ],
+            )
 
     @staticmethod
     def _record_smooth(logger, buffers: dict, tag: str, value: float, window: int = 50):
@@ -624,6 +778,7 @@ class HIROLoggingCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         loc = self.locals
+        step_now = int(getattr(self.model, "num_timesteps", 0))
         reward_env = np.asarray(loc.get("reward_env", 0.0), dtype=np.float32).reshape(-1)
         dones = np.asarray(loc.get("done", False), dtype=bool).reshape(-1)
         infos = loc.get("infos", [])
@@ -635,6 +790,8 @@ class HIROLoggingCallback(BaseCallback):
         if not replay_mask.any():
             return True
 
+        self._flush_low_training_debug(step_now)
+
         # Start of a new high interval for captured envs.
         if c.size > 0:
             for env_i in self._csv_env_indices(min(c.size, replay_mask.size)):
@@ -642,7 +799,6 @@ class HIROLoggingCallback(BaseCallback):
                     self._reset_hi_buffers(env_i)
 
         if self._her_debug_csv_enabled and hasattr(self, "her_debug_csv_path"):
-            step_now = int(getattr(self.model, "num_timesteps", 0))
             if (step_now - self._last_her_debug_dump_step) >= self.her_debug_csv_interval_steps:
                 rb = getattr(getattr(self.model, "low_agent", None), "replay_buffer", None)
                 if rb is not None and hasattr(rb, "pop_her_debug_records"):
@@ -661,6 +817,7 @@ class HIROLoggingCallback(BaseCallback):
                             int(bool(rec.get("source_done", False))),
                             float(rec.get("source_reward_stored", 0.0)),
                             json.dumps(rec.get("source_ego_abs", []), ensure_ascii=True),
+                            json.dumps(rec.get("source_ego_next_abs", []), ensure_ascii=True),
                             json.dumps(rec.get("source_obs", []), ensure_ascii=True),
                             json.dumps(rec.get("source_action", []), ensure_ascii=True),
                             json.dumps(rec.get("source_next_obs", []), ensure_ascii=True),
@@ -669,6 +826,7 @@ class HIROLoggingCallback(BaseCallback):
                             int(rec.get("goal_ep_id", -1)),
                             int(rec.get("goal_ep_step", -1)),
                             float(rec.get("goal_reward_stored", 0.0)),
+                            json.dumps(rec.get("goal_transition_ego_abs", []), ensure_ascii=True),
                             json.dumps(rec.get("goal_ego_abs", []), ensure_ascii=True),
                             json.dumps(rec.get("goal_obs", []), ensure_ascii=True),
                             json.dumps(rec.get("goal_action", []), ensure_ascii=True),
@@ -682,6 +840,9 @@ class HIROLoggingCallback(BaseCallback):
                             float(rec.get("intrinsic_reward_new", 0.0)),
                             float(rec.get("reward_ext", 0.0)),
                             float(rec.get("reward_total_new", 0.0)),
+                            int(bool(rec.get("relabeled_done", False))),
+                            int(rec.get("start_ref_ep_step", -1)),
+                            json.dumps(rec.get("start_ref_ego_abs", []), ensure_ascii=True),
                         ]
                         self._append_csv(self.her_debug_csv_path, row)
                 self._last_her_debug_dump_step = step_now
@@ -689,33 +850,20 @@ class HIROLoggingCallback(BaseCallback):
         if self.mpc_fail_csv_path:
             fail_records = list(loc.get("mpc_fail_records", []) or [])
             if fail_records:
-                with open(self.mpc_fail_csv_path, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(
-                        f,
-                        fieldnames=[
-                            "global_step",
-                            "env_id",
-                            "segment_id",
-                            "planner",
-                            "message",
-                            "goal_phys",
-                            "ego_sub_now",
-                            "low_obs",
+                for rec in fail_records:
+                    self._append_csv(
+                        self.mpc_fail_csv_path,
+                        [
+                            int(rec.get("global_step", 0)),
+                            int(rec.get("env_id", -1)),
+                            int(rec.get("segment_id", -1)),
+                            str(rec.get("planner", "")),
+                            str(rec.get("message", "")),
+                            json.dumps(rec.get("goal_phys", []), ensure_ascii=True),
+                            json.dumps(rec.get("ego_sub_now", []), ensure_ascii=True),
+                            json.dumps(rec.get("low_obs", []), ensure_ascii=True),
                         ],
                     )
-                    for rec in fail_records:
-                        writer.writerow(
-                            {
-                                "global_step": int(rec.get("global_step", 0)),
-                                "env_id": int(rec.get("env_id", -1)),
-                                "segment_id": int(rec.get("segment_id", -1)),
-                                "planner": str(rec.get("planner", "")),
-                                "message": str(rec.get("message", "")),
-                                "goal_phys": json.dumps(rec.get("goal_phys", []), ensure_ascii=True),
-                                "ego_sub_now": json.dumps(rec.get("ego_sub_now", []), ensure_ascii=True),
-                                "low_obs": json.dumps(rec.get("low_obs", []), ensure_ascii=True),
-                            }
-                        )
 
         # --- Update TB stats & Capture env 0 components ---
         rc_env0 = {}
@@ -746,7 +894,12 @@ class HIROLoggingCallback(BaseCallback):
         goal_phys_arr = np.asarray(loc.get("goal_phys", []), dtype=np.float32)
         done_low_arr = np.asarray(loc.get("done_low", np.zeros_like(replay_mask)), dtype=bool).reshape(-1)
 
-        if self._diagnostic_csv_enabled and infos and replay_mask.size > 0 and bool(replay_mask[0]):
+        write_env_diag = (
+            self._diagnostic_csv_enabled
+            and self.low_debug_env_step_interval_steps > 0
+            and step_now - self._last_env_diag_step >= self.low_debug_env_step_interval_steps
+        )
+        if write_env_diag and infos and replay_mask.size > 0 and bool(replay_mask[0]):
             i = 0
             diag = infos[i].get("env_diagnostics", {}) if isinstance(infos[i], dict) else {}
             row = [
@@ -770,6 +923,7 @@ class HIROLoggingCallback(BaseCallback):
             ]
             row.extend(self._diag_value(diag, k) for k in getattr(self, "env_diag_fields", []))
             self._append_csv(self.env_step_diag_csv_path, row)
+            self._last_env_diag_step = step_now
 
         if self._low_transition_detail_csv_enabled and hasattr(self, "low_transition_detail_csv_path"):
             obs_arr = np.asarray(loc.get("obs", []), dtype=np.float32)

@@ -65,8 +65,8 @@ _SAC_KWARGS_BY_LEVEL: Dict[str, Dict[str, Any]] = {
         "verbose": 0,
         "buffer_size": 1_000_000,
         "batch_size": 256,
-        "gamma": 0.9995,
-        # "gamma": 0.99,
+        # "gamma": 0.9995,
+        "gamma": 0.99,
         "tau": 0.005,
         "learning_rate": 3e-4,
         "train_freq": (1, "step"),
@@ -130,6 +130,9 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "ego_speed": 10.0,
     "ego_speed_range": None,
     "initial_lane_id": "random",
+    # Optional per-lane episode sampling probabilities. When set, this takes
+    # precedence over initial_lane_id and is normalized automatically.
+    "initial_lane_probs": None,
 
     # Observation / Action
     "PERCEPTION_DISTANCE": None,
@@ -188,7 +191,6 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     # RuleBasedController compute_action strategy: "target_speed_lane" | "goal_x_accel" | "goal_x_accel_follow" | "idm_mobil"
     # "rule_based_compute_action_mode": "goal_x_accel",
     "rule_based_compute_action_mode": "goal_x_accel_follow",
-    "rule_follow_mode_enabled": True,
     "rule_follow_enter_gap": 17.0,
     "rule_follow_release_gap": 20.0,
     "rule_follow_enter_ttc": 2.0,
@@ -206,19 +208,19 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
         "module": "scenarios.multi_lane",
         "env_id": "multi-lane-custom-v0",
         "env_overrides": {
-            "spawn_probability": 0.05,
-            # "spawn_probability": 0.07,
+            # "spawn_probability": 0.05,
+            "spawn_probability": 0.07,
             "behavior_lane_probs": [
                 [0.6, 0.3, 0.1],
-                [0.4, 0.3, 0.3],
-                [0.6, 0.3, 0.1],
                 # [0.4, 0.3, 0.3],
+                [0.6, 0.3, 0.1],
+                [0.4, 0.3, 0.3],
             ],
             # Task
-            "initial_lane_id": 2,
+            "initial_lane_id": "random",
             # "initial_lane_id": "1",
-            "goal_lane_id": 1,
-            # "goal_lane_id": 2,
+            # "goal_lane_id": 1,
+            "goal_lane_id": 2,
             "lane_change_reward": -1.0,
             # "lane_change_reward": -0.5,
             # "rule_based_compute_action_mode": "goal_x_accel",
@@ -237,9 +239,9 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
             "spawn_probability": 0.05,
             "behavior_lane_probs": [
                 [0.6, 0.3, 0.1],
-                [0.6, 0.3, 0.1],
-                [0.4, 0.3, 0.3],
                 # [0.6, 0.3, 0.1],
+                [0.4, 0.3, 0.3],
+                [0.6, 0.3, 0.1],
             ],
             "single_road_network": True,
             "intersection_length": 50.0,
@@ -373,14 +375,10 @@ _HIRO_CONFIG: Dict[str, Any] = {
 
     # "low_use_her": False,
     "low_use_her": True,
-    "low_her_ratio": 0.8,
+    "low_her_ratio": 0.6,
     "low_her_strategy": "future",
     "low_her_future_mode": "episode_timeaware",
     "low_her_episode_timeaware_steps_ahead_range": None,
-    "low_her_debug_csv_interval_steps": 1000,
-    "low_her_debug_csv_max_rows_per_flush": 200,
-    "low_her_debug_max_records": 20000,
-    "low_her_debug_sample_prob": 0.05,
 
     # "use_off_policy_correction": True,
     "use_off_policy_correction": False,
@@ -398,6 +396,7 @@ _HIRO_CONFIG: Dict[str, Any] = {
     "high_goal_safe_lane_change_rear_dmin": 10.0,
     "high_goal_safe_min_goal_x_span": 0,
     "high_goal_safe_enable_goal_vx_bounds": False,
+    "high_goal_dynamic_feasible_lane_intervals": False,
 
     "low_safety_violation_penalty": 0.3,
 
@@ -446,45 +445,55 @@ TRAIN_CONFIG: Dict[str, Any] = {
 
     # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_earlyGreen",
     # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_midGreen",
+    # "run_name": "hiro_260612_highonly_ruleFollow_sigFeat_lateGreen_wronglanePen",
+    # "run_name": "hiro_260612_highonly_ruleFollow_sigFeat_lateGreen_wronglanePen_dynaLane",
+    # "run_name": "sac_260612_withPrior_oldEnv_randomto2_wronglanePen",
     # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_varOffset",
     # "run_name": "hiro_260608_sac_base_oldEnv_fixTimeout",
     # "run_name": "hiro_260608_sac_base_oldEnv_fixTimeout_fixGamma",
     # "run_name": "hiro_260608_sac_withPrior_oldEnv_fixTimeout",
     # "run_name": "hiro_260608_sac_withPrior_oldEnv_fixTimeout_fixGamma",
-    # "run_name": "hiro_260611_ruleFollow_augObs_oldEnv_lane2to1_005",
-    # "run_name": "hiro_260611_ruleFollow_oldEnv_lane2to1_005",
-    # "run_name": "hiro_260611_rule_oldEnv_lane2to1_005",
-    # "run_name": "hiro_260611_rule_oldEnv_lane1to2_005",
-    "run_name": "hiro_260611_rule_oldEnv_lane1to2_007",
+    # "run_name": "hiro_260611_rule_oldEnv_lane2to1_005_wronglanePen",
+    "run_name": "hiro_260611_rule_oldEnv_lane2to1_005_randomstart",
+
+    # "run_name": "hiro_260611_lowonly_noSigFeat_varOffset_fixedHER",
+    # "run_name": "hiro_260611_lowonly_noSigFeat_lateGreen_noHER",
+
+
     "scenario_name": "multi_lane",
     # "scenario_name": "multi_lane_stop_to_int",
 
     # Train-time env overrides. Keep empty unless you want to override scenario defaults.
     "env_overrides": {
-        # "rule_based_compute_action_mode": "goal_x_accel_follow",
-        "rule_based_compute_action_mode": "goal_x_accel",
+        "rule_based_compute_action_mode": "goal_x_accel_follow",
+        # "rule_based_compute_action_mode": "goal_x_accel",
         "observation": {
             "append_front_vehicle_features": False,
             # "append_front_vehicle_features": True,
         },
-        "initial_lane_id": 1,
-        "goal_lane_id": 2,
-        # "spawn_probability": 0.05,
-        "spawn_probability": 0.07,
+        "initial_lane_probs": [0.0, 0.3, 0.7],
+        # "initial_lane_id": 2,
+        "goal_lane_id": 1,
+        "spawn_probability": 0.05,
+        # # "spawn_probability": 0.07,
         "behavior_lane_probs": [
             [0.6, 0.3, 0.1],
-            [0.6, 0.3, 0.1],
             [0.4, 0.3, 0.3],
-            # [0.6, 0.3, 0.1],
+            [0.6, 0.3, 0.1],
         ],
+        # "align_ego_spawn_to_signal_offset": True,
+        # # "align_ego_spawn_to_signal_offset": False,
+        # "episode_start_phase_offset": 20.0,   # late green pass
+        # # "episode_start_phase_offset": 90.0,     # mid green pass
+        # # "episode_start_phase_offset": 40.0,     # early green pass
+        # "wrong_lane_terminal_penalty": -5.0,
     },
 
     # SAC-specific env overrides used only when algo="sac".
     "sac_env_overrides": {
         "speed_ref_aux_reward": 0.1,
-        # "speed_ref_aux_reward": 0,
+        "inter_episode_as_steps": False,
     },
-    # 0 disables SAC transition/episode CSV logging; N records every Nth episode.
     "sac_transition_csv_episode_freq": 1,
     "sac_transition_csv_envs": "env0",
 
@@ -500,9 +509,15 @@ TRAIN_CONFIG: Dict[str, Any] = {
     "hiro_high_transition_csv_envs": "all",
     "hiro_low_transition_detail_csv": False,
     "hiro_low_transition_detail_envs": "env0",
+    "hiro_low_her_debug_csv_interval_steps": 5_000,
+    "hiro_low_her_debug_csv_max_rows_per_flush": 200,
+    "hiro_low_her_debug_max_records": 20_000,
+    "hiro_low_her_debug_sample_prob": 0.001,
+    "hiro_low_debug_summary_interval_steps": 10_000,
+    "hiro_low_debug_env_step_interval_steps": 1_000,
 
     # Train-time video recording.
-    "record_video": True,
+    "record_video": False,
     "record_video_envs": "env0",
     "record_video_global_view": True,
     "video_episode_freq": 20,
@@ -534,21 +549,29 @@ def get_scenario_spec(scenario_name: str) -> Dict[str, Any]:
     return get_scenario_spec_from_specs(_SCENARIO_SPECS, scenario_name)
 
 
+def _normalize_rule_follow_mode(config: Dict[str, Any]) -> Dict[str, Any]:
+    mode = str(config.get("rule_based_compute_action_mode", "")).lower().strip()
+    config["rule_follow_mode_enabled"] = mode == "goal_x_accel_follow"
+    return config
+
+
 def get_env_config_for_scenario(
     scenario_name: str,
     overrides: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    return build_env_config_for_scenario(
-        _MULTILANE_BASE_ENV_CONFIG,
-        _SCENARIO_SPECS,
-        scenario_name,
-        overrides,
+    return _normalize_rule_follow_mode(
+        build_env_config_for_scenario(
+            _MULTILANE_BASE_ENV_CONFIG,
+            _SCENARIO_SPECS,
+            scenario_name,
+            overrides,
+        )
     )
 
 
 def get_env_config(overrides: Mapping[str, Any] | None = None) -> Dict[str, Any]:
     """Return a full env config dict for MultiLaneEnv."""
-    return build_env_config(_MULTILANE_BASE_ENV_CONFIG, overrides)
+    return _normalize_rule_follow_mode(build_env_config(_MULTILANE_BASE_ENV_CONFIG, overrides))
 
 
 def get_hiro_config():

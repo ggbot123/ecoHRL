@@ -167,6 +167,10 @@ class HIROPolicyRunner:
                 "high-goal safety layer"
             )
         if high_actor is not None and hasattr(high_actor, "goal_safe_sampling_enabled"):
+            if hasattr(high_actor, "dynamic_feasible_lane_intervals"):
+                high_actor.dynamic_feasible_lane_intervals = bool(
+                    getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+                )
             need_bind_bounds = bool(getattr(high_actor, "goal_safe_bounds_fn", None) is None)
             if need_bind_bounds and use_high_goal_safety:
                 high_actor.goal_safe_eps = float(getattr(self.cfg, "high_goal_safe_eps", 1e-6))
@@ -228,7 +232,14 @@ class HIROPolicyRunner:
             goal_action, _ = self.high_model.predict(high_obs, deterministic=True)
         goal_action = np.asarray(goal_action, dtype=np.float32).reshape(1, -1)
         self.last_goal_action = np.asarray(goal_action[0], dtype=np.float32).copy()
-        goal_phys = utils.goal_action_to_abs(ego_sub[None, :], goal_action, self.lane_center_ys)
+        goal_phys = utils.goal_action_to_abs(
+            ego_sub[None, :],
+            goal_action,
+            self.lane_center_ys,
+            dynamic_feasible_intervals=bool(
+                getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+            ),
+        )
         self.goal_phys = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
         self.ego_start = ego_sub.astype(np.float32, copy=True)
         self.need_high, self.c = False, 0

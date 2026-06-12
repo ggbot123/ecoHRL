@@ -24,8 +24,8 @@ def _atanh_clipped(x: th.Tensor, eps: float) -> th.Tensor:
 class SafeGoalActor(Actor):
     """Actor that samples dim-1 from the base policy and maps dim-0 into safe bounds.
     1) sample a full base squashed-Gaussian action;
-    2) determine k = seg(a1) from dim-1 action using the fixed three segments
-       [-1, -1/3], [-1/3, 1/3], [1/3, 1];
+    2) determine k = seg(a1) from dim-1 action using either fixed thirds or
+       state-dependent feasible intervals at boundary lanes;
     3) conditioned on k, sample latent xi0 ~ N(mu0, sigma0^2), then map
        a0 = m_k + r_k * tanh(xi0), where m_k=(l_k+u_k)/2 and r_k=(u_k-l_k)/2;
      4) keep dim-1 unchanged from the base sample, and map dim-2 (goal vx)
@@ -49,6 +49,7 @@ class SafeGoalActor(Actor):
         goal_safe_eps: float = 1e-6,
         goal_safe_log_eps: float = 1e-30,
         goal_safe_bounds_fn: Optional[Callable[[th.Tensor], dict[str, th.Tensor]]] = None,
+        dynamic_feasible_lane_intervals: bool = False,
     ):
         super().__init__(
             observation_space=observation_space,
@@ -68,6 +69,7 @@ class SafeGoalActor(Actor):
         self.goal_safe_eps = float(goal_safe_eps)
         self.goal_safe_log_eps = float(goal_safe_log_eps)
         self.goal_safe_bounds_fn = goal_safe_bounds_fn
+        self.dynamic_feasible_lane_intervals = bool(dynamic_feasible_lane_intervals)
 
     def forward(self, obs: PyTorchObs, deterministic: bool = False) -> th.Tensor:
         mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
@@ -91,21 +93,73 @@ class SafeGoalActor(Actor):
             return self._safe_action_log_prob_from_params(obs, mean_actions, log_std, deterministic=False)
         return self.action_dist.log_prob_from_params(mean_actions, log_std, **kwargs)
 
-    @staticmethod
-    def _segment_index_from_action(a1: th.Tensor) -> th.Tensor:
-        """Map dim-1 action in [-1, 1] to one of the three fixed segments.
+    def _segment_index_from_action(
+        self,
+        a1: th.Tensor,
+        safe_stats: dict[str, th.Tensor],
+    ) -> th.Tensor:
+        """Map dim-1 action to relative semantic component [LEFT, KEEP, RIGHT].
 
-        Boundary convention:
+        Fixed-third boundary convention:
             a1 <= -1/3 -> 0
             -1/3 < a1 < 1/3 -> 1
             a1 >= 1/3 -> 2
-        Exact-boundary probability is zero under continuous sampling, so this
-        convention only matters for deterministic evaluation.
         """
         k = th.full_like(a1, 2, dtype=th.long)
         k = th.where(a1 < (1.0 / 3.0), th.ones_like(k), k)
         k = th.where(a1 <= (-1.0 / 3.0), th.zeros_like(k), k)
+        if not self.dynamic_feasible_lane_intervals:
+            return k
+
+        lane_idx = safe_stats.get("ego_lane_idx")
+        n_lanes_t = safe_stats.get("n_lanes")
+        if lane_idx is None or n_lanes_t is None:
+            return k
+        lane_idx = lane_idx.to(device=a1.device, dtype=th.long).reshape(-1)
+        n_lanes = int(n_lanes_t.reshape(-1)[0].item())
+        if n_lanes <= 1:
+            return th.ones_like(k)
+
+        left_edge = lane_idx == 0
+        right_edge = lane_idx == (n_lanes - 1)
+        k = th.where(left_edge, th.where(a1 > 0.0, 2, 1), k)
+        k = th.where(right_edge, th.where(a1 < 0.0, 0, 1), k)
         return k
+
+    def _segment_geometry(
+        self,
+        safe_stats: dict[str, th.Tensor],
+        reference: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """Return per-row center/radius for relative semantic y-code intervals."""
+        batch = int(reference.shape[0])
+        seg_m = reference.new_tensor([-2.0 / 3.0, 0.0, 2.0 / 3.0]).repeat(batch, 1)
+        seg_r = reference.new_full((batch, 3), 1.0 / 3.0)
+        if not self.dynamic_feasible_lane_intervals:
+            return seg_m, seg_r
+
+        lane_idx = safe_stats.get("ego_lane_idx")
+        n_lanes_t = safe_stats.get("n_lanes")
+        if lane_idx is None or n_lanes_t is None:
+            return seg_m, seg_r
+        lane_idx = lane_idx.to(device=reference.device, dtype=th.long).reshape(-1)
+        n_lanes = int(n_lanes_t.reshape(-1)[0].item())
+        if n_lanes <= 1:
+            seg_m[:, 1] = 0.0
+            seg_r[:, 1] = 1.0
+            return seg_m, seg_r
+
+        left_edge = lane_idx == 0
+        right_edge = lane_idx == (n_lanes - 1)
+        seg_m[left_edge, 1] = -0.5
+        seg_r[left_edge, 1] = 0.5
+        seg_m[left_edge, 2] = 0.5
+        seg_r[left_edge, 2] = 0.5
+        seg_m[right_edge, 0] = -0.5
+        seg_r[right_edge, 0] = 0.5
+        seg_m[right_edge, 1] = 0.5
+        seg_r[right_edge, 1] = 0.5
+        return seg_m, seg_r
 
     def _safe_action_log_prob_from_params(
         self,
@@ -131,16 +185,15 @@ class SafeGoalActor(Actor):
             z_base = mean_actions + std * th.randn_like(mean_actions)
 
         y_base = th.tanh(z_base)
-        k_base = self._segment_index_from_action(y_base[:, 1])
+        k_base = self._segment_index_from_action(y_base[:, 1], safe_stats)
         valid_k = safe_stats["valid_k"]
         valid_sel_base = valid_k[idx, k_base]
         feasible_any = th.any(valid_k, dim=1)
 
         # If selected segment is infeasible, reroute to the nearest feasible segment.
-        seg_m = th.as_tensor([-2.0 / 3.0, 0.0, 2.0 / 3.0], dtype=mean_actions.dtype, device=mean_actions.device)
-        seg_r = th.as_tensor([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=mean_actions.dtype, device=mean_actions.device)
+        seg_m, seg_r = self._segment_geometry(safe_stats, mean_actions)
         y1_base = y_base[:, 1]
-        dist_to_center = th.abs(y1_base[:, None] - seg_m[None, :])
+        dist_to_center = th.abs(y1_base[:, None] - seg_m)
         inf = th.full_like(dist_to_center, 1e9)
         dist_masked = th.where(valid_k, dist_to_center, inf)
         k_fallback = th.argmin(dist_masked, dim=1)
@@ -165,8 +218,8 @@ class SafeGoalActor(Actor):
 
         # For rerouted rows, map dim-1 latent sample into the selected feasible segment.
         t1 = th.tanh(z_base[:, 1])
-        m1_sel = seg_m[k]
-        r1_sel = seg_r[k]
+        m1_sel = seg_m[idx, k]
+        r1_sel = seg_r[idx, k]
         r1_safe = th.clamp(r1_sel, min=eps)
         a1_safe = m1_sel + r1_sel * t1
         y[:, 1] = th.where(use_fallback, a1_safe, y_base[:, 1])
@@ -272,7 +325,7 @@ class SafeGoalActor(Actor):
             m_vx = th.zeros_like(l2)
             r_vx = th.zeros_like(u2)
 
-        return {
+        out = {
             "l2": l2,
             "u2": u2,
             "valid_k": valid_k,
@@ -284,6 +337,11 @@ class SafeGoalActor(Actor):
             "r_vx": r_vx,
             "has_safe_vx": th.tensor(has_safe_vx, device=mean_actions.device).item(),
         }
+        if "ego_lane_idx" in stats:
+            out["ego_lane_idx"] = stats["ego_lane_idx"].to(device=mean_actions.device, dtype=th.long)
+        if "n_lanes" in stats:
+            out["n_lanes"] = stats["n_lanes"].to(device=mean_actions.device, dtype=th.long)
+        return out
 
     @classmethod
     def _log_prob_base(cls, mean_actions: th.Tensor, log_std: th.Tensor, z: th.Tensor, y: th.Tensor, eps: float) -> th.Tensor:
@@ -335,9 +393,11 @@ class SafeGoalSACPolicy(SACPolicy):
         share_features_extractor: bool = False,
         goal_safe_eps: float = 1e-6,
         goal_safe_log_eps: float = 1e-30,
+        dynamic_feasible_lane_intervals: bool = False,
     ):
         self.goal_safe_eps = float(goal_safe_eps)
         self.goal_safe_log_eps = float(goal_safe_log_eps)
+        self.dynamic_feasible_lane_intervals = bool(dynamic_feasible_lane_intervals)
         super().__init__(
             observation_space=observation_space,
             action_space=action_space,
@@ -363,6 +423,7 @@ class SafeGoalSACPolicy(SACPolicy):
             **actor_kwargs,
             goal_safe_eps=self.goal_safe_eps,
             goal_safe_log_eps=self.goal_safe_log_eps,
+            dynamic_feasible_lane_intervals=self.dynamic_feasible_lane_intervals,
         ).to(self.device)
 
 

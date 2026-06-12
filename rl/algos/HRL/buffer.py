@@ -59,6 +59,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
         n_candidates: int = 10,
         noise_std: float = 0.5,
         enable_off_policy_correction: bool = True,
+        dynamic_feasible_lane_intervals: bool = False,
     ):
         super().__init__(
             buffer_size=buffer_size,
@@ -87,6 +88,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
         self.n_candidates = int(n_candidates)
         self.noise_std = float(noise_std)
         self.enable_off_policy_correction = bool(enable_off_policy_correction)
+        self.dynamic_feasible_lane_intervals = bool(dynamic_feasible_lane_intervals)
         self.low_obs_dim = int(1 + self.kin_flat_dim + self.obs_extra_dim + self.ego_dim)
 
         # [buffer_size, max_seq_len, ...]
@@ -316,7 +318,12 @@ class HiROHighReplayBuffer(ReplayBuffer):
         # --- absolute goal state (x*, y*, vx*, 0) in physical coordinates: (B, n_candidates, ego_dim) ---
         ego0_rep = np.repeat(ego0, repeats=n_cand, axis=0)  # (B*n_cand, ego_dim)
         cand_env_flat = cand_env.reshape(batch_size * n_cand, act_dim)
-        goal_phys_flat = utils.goal_action_to_abs(ego0_rep, cand_env_flat, self.lane_center_ys).astype(np.float32)
+        goal_phys_flat = utils.goal_action_to_abs(
+            ego0_rep,
+            cand_env_flat,
+            self.lane_center_ys,
+            dynamic_feasible_intervals=self.dynamic_feasible_lane_intervals,
+        ).astype(np.float32)
         goal_phys = goal_phys_flat.reshape(batch_size, n_cand, self.ego_dim)
 
         # --- load stored low-level sequences for these transitions ---

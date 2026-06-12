@@ -1088,10 +1088,7 @@ class RuleBasedAgentWrapper:
 
         self.controller = RuleBasedController(env_cfg, low_safety_filter=low_safety_filter)
         mode = str(env_cfg.get("rule_based_compute_action_mode", "")).lower().strip()
-        self.follow_mode_enabled = bool(env_cfg.get("rule_follow_mode_enabled", False)) or mode in {
-            "goal_x_accel_follow",
-            "follow_goal_x_accel",
-        }
+        self.follow_mode_enabled = mode == "goal_x_accel_follow"
         self.follow_enter_gap = float(env_cfg.get("rule_follow_enter_gap", 18.0))
         self.follow_release_gap = float(env_cfg.get("rule_follow_release_gap", 23.0))
         self.follow_enter_ttc = float(env_cfg.get("rule_follow_enter_ttc", 2.0))
