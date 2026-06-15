@@ -9,13 +9,28 @@ from gymnasium import spaces
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
+from stable_baselines3.common.type_aliases import (
+    GymEnv,
+    MaybeCallback,
+    RolloutReturn,
+    Schedule,
+    TrainFreq,
+    TrainFrequencyUnit,
+)
+from stable_baselines3.common.utils import (
+    get_parameters_by_name,
+    polyak_update,
+    should_collect_more_steps,
+)
+from stable_baselines3.common.vec_env import VecEnv
 from rl.algos.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
+from rl.algos.sac.replay_buffer import SkipReplayBuffer
 from rl.utils.numerics_guard import SACNumericsGuard
+from rl.utils.utils import semantic_y_interval
 
 SelfSAC = TypeVar("SelfSAC", bound="SAC")
 
@@ -140,7 +155,7 @@ class SAC(OffPolicyAlgorithm):
             train_freq,
             gradient_steps,
             action_noise,
-            replay_buffer_class=replay_buffer_class,
+            replay_buffer_class=replay_buffer_class or SkipReplayBuffer,
             replay_buffer_kwargs=replay_buffer_kwargs,
             optimize_memory_usage=optimize_memory_usage,
             n_steps=n_steps,
@@ -174,6 +189,130 @@ class SAC(OffPolicyAlgorithm):
 
         if _init_setup_model:
             self._setup_model()
+
+    def collect_rollouts(
+        self,
+        env: VecEnv,
+        callback: BaseCallback,
+        train_freq: TrainFreq,
+        replay_buffer: ReplayBuffer,
+        action_noise: Optional[ActionNoise] = None,
+        learning_starts: int = 0,
+        log_interval: Optional[int] = None,
+    ) -> RolloutReturn:
+        """Collect rollouts while excluding inter-episode dummy transitions."""
+        self.policy.set_training_mode(False)
+        num_collected_steps = 0
+        num_collected_transitions = 0
+        num_collected_episodes = 0
+
+        assert isinstance(env, VecEnv), "You must pass a VecEnv"
+        assert train_freq.frequency > 0, "Should at least collect one step or episode."
+        if env.num_envs > 1:
+            assert train_freq.unit == TrainFrequencyUnit.STEP, (
+                "You must use only one env when doing episodic training."
+            )
+
+        if self.use_sde:
+            self.actor.reset_noise(env.num_envs)  # type: ignore[operator]
+
+        callback.on_rollout_start()
+        target_transitions = int(train_freq.frequency) * int(env.num_envs)
+        while (
+            num_collected_transitions < target_transitions
+            if train_freq.unit == TrainFrequencyUnit.STEP
+            else should_collect_more_steps(
+                train_freq,
+                num_collected_steps,
+                num_collected_episodes,
+            )
+        ):
+            if (
+                self.use_sde
+                and self.sde_sample_freq > 0
+                and num_collected_steps % self.sde_sample_freq == 0
+            ):
+                self.actor.reset_noise(env.num_envs)  # type: ignore[operator]
+
+            actions, buffer_actions = self._sample_action(
+                learning_starts,
+                action_noise,
+                env.num_envs,
+            )
+            new_obs, rewards, dones, infos = env.step(actions)
+            infos = [
+                info if isinstance(info, dict) else {}
+                for info in list(infos)
+            ]
+            replay_mask = np.asarray(
+                [not bool(info.get("skip_replay", False)) for info in infos],
+                dtype=bool,
+            )
+            replay_count = int(np.count_nonzero(replay_mask))
+
+            if replay_count == 0:
+                self._store_transition(
+                    replay_buffer,
+                    buffer_actions,
+                    new_obs,
+                    rewards,
+                    dones,
+                    infos,
+                )
+                continue
+
+            self.num_timesteps += replay_count
+            num_collected_steps += 1
+            num_collected_transitions += replay_count
+
+            callback.update_locals(locals())
+            if not callback.on_step():
+                return RolloutReturn(
+                    num_collected_transitions,
+                    num_collected_episodes,
+                    continue_training=False,
+                )
+
+            valid_infos = [
+                info if replay_mask[i] else {}
+                for i, info in enumerate(infos)
+            ]
+            valid_dones = np.asarray(dones, dtype=bool) & replay_mask
+            self._update_info_buffer(valid_infos, valid_dones)
+
+            self._store_transition(
+                replay_buffer,
+                buffer_actions,
+                new_obs,
+                rewards,
+                dones,
+                infos,
+            )
+
+            self._update_current_progress_remaining(
+                self.num_timesteps,
+                self._total_timesteps,
+            )
+            self._on_step()
+
+            for idx in np.flatnonzero(valid_dones):
+                num_collected_episodes += 1
+                self._episode_num += 1
+                if action_noise is not None:
+                    kwargs = dict(indices=[idx]) if env.num_envs > 1 else {}
+                    action_noise.reset(**kwargs)
+                if (
+                    log_interval is not None
+                    and self._episode_num % log_interval == 0
+                ):
+                    self.dump_logs()
+
+        callback.on_rollout_end()
+        return RolloutReturn(
+            num_collected_transitions,
+            num_collected_episodes,
+            continue_training=True,
+        )
 
     @staticmethod
     def _json_array(x: Any, precision: int = 6) -> str:
@@ -518,9 +657,6 @@ class SAC(OffPolicyAlgorithm):
         high = self.action_space.high.astype(np.float32)
         actions = np.random.uniform(low=low, high=high, size=(n_envs, low.shape[0])).astype(np.float32)
 
-        seg_low = np.asarray([-1.0, -1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)[None, :]
-        seg_high = np.asarray([-1.0 / 3.0, 1.0 / 3.0, 1.0], dtype=np.float32)[None, :]
-
         valid_box2 = u2 > l2
         valid_k = valid_box2
         valid_any = np.any(valid_k, axis=1)
@@ -534,8 +670,37 @@ class SAC(OffPolicyAlgorithm):
             k[i] = int(np.random.choice(candidates))
 
         row = np.arange(n_envs)
-        y_low = seg_low[0, k]
-        y_high = seg_high[0, k]
+        dynamic_intervals = bool(
+            getattr(self.policy.actor, "dynamic_feasible_lane_intervals", False)
+        )
+        if dynamic_intervals:
+            lane_idx_value = bounds.get("ego_lane_idx")
+            n_lanes_value = bounds.get("n_lanes")
+            if lane_idx_value is None or n_lanes_value is None:
+                return None
+            if isinstance(lane_idx_value, th.Tensor):
+                lane_idx_value = lane_idx_value.detach().cpu().numpy()
+            if isinstance(n_lanes_value, th.Tensor):
+                n_lanes_value = n_lanes_value.detach().cpu().numpy()
+            lane_idx = np.asarray(lane_idx_value, dtype=np.int64).reshape(-1)
+            n_lanes = int(np.asarray(n_lanes_value).reshape(-1)[0])
+        else:
+            lane_idx = np.zeros(n_envs, dtype=np.int64)
+            n_lanes = 3
+        y_intervals = np.asarray(
+            [
+                semantic_y_interval(
+                    int(k[i]),
+                    int(lane_idx[i]),
+                    n_lanes,
+                    dynamic_feasible_intervals=dynamic_intervals,
+                )
+                for i in range(n_envs)
+            ],
+            dtype=np.float32,
+        )
+        y_low = y_intervals[:, 0]
+        y_high = y_intervals[:, 1]
         x_low_n = l2[row, k]
         x_high_n = u2[row, k]
 

@@ -172,6 +172,7 @@ class KinematicObservation(ObservationType):
         include_time: bool = False,
         time_range: list[float] | None = None,
         append_front_vehicle_features: bool = False,
+        append_goal_lane_id: bool = False,
         front_vehicle_distance_range: float = 150.0,
         front_vehicle_ttc_range: float = 30.0,
         **kwargs: dict,
@@ -202,12 +203,16 @@ class KinematicObservation(ObservationType):
         self.include_time = include_time
         self.time_range = time_range
         self.append_front_vehicle_features = bool(append_front_vehicle_features)
+        self.append_goal_lane_id = bool(append_goal_lane_id)
         self.front_vehicle_distance_range = float(front_vehicle_distance_range)
         self.front_vehicle_ttc_range = float(front_vehicle_ttc_range)
 
     @property
     def extra_features_dim(self) -> int:
-        return 2 if self.append_front_vehicle_features else 0
+        return (
+            (2 if self.append_front_vehicle_features else 0)
+            + (1 if self.append_goal_lane_id else 0)
+        )
 
     def space(self) -> spaces.Space:
         if self.include_time:
@@ -219,7 +224,7 @@ class KinematicObservation(ObservationType):
                 dtype=np.float32,
             )
         else:
-            if self.append_front_vehicle_features:
+            if self.extra_features_dim > 0:
                 dim = self.vehicles_count * len(self.features) + self.extra_features_dim
                 return spaces.Box(
                     shape=(dim,),
@@ -282,9 +287,34 @@ class KinematicObservation(ObservationType):
         return out.astype(np.float32)
 
     def _append_extra_features(self, obs_flat: np.ndarray) -> np.ndarray:
-        if not self.append_front_vehicle_features:
+        extras = []
+        if self.append_front_vehicle_features:
+            extras.append(self._front_vehicle_features())
+        if self.append_goal_lane_id:
+            extras.append(self._goal_lane_feature())
+        if not extras:
             return obs_flat.astype(np.float32)
-        return np.concatenate([obs_flat.astype(np.float32), self._front_vehicle_features()], axis=0).astype(np.float32)
+        return np.concatenate(
+            [obs_flat.astype(np.float32), *extras],
+            axis=0,
+        ).astype(np.float32)
+
+    def _goal_lane_feature(self) -> np.ndarray:
+        getter = getattr(self.env, "get_goal_lane_id", None)
+        if callable(getter):
+            lane_id = float(getter())
+        else:
+            lane_id = float(self.env.config.get("goal_lane_id", 0))
+        if self.normalize:
+            lanes = max(int(self.env.config.get("lanes_count", 1)), 1)
+            lane_id = utils.lmap(
+                lane_id,
+                [0.0, float(max(lanes - 1, 1))],
+                [-1.0, 1.0],
+            )
+            if self.clip:
+                lane_id = float(np.clip(lane_id, -1.0, 1.0))
+        return np.asarray([lane_id], dtype=np.float32)
 
     def normalize_obs(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -379,7 +409,7 @@ class KinematicObservation(ObservationType):
             return self._append_extra_features(obs_with_time).astype(self.space().dtype)
 
         # Flatten
-        if self.append_front_vehicle_features:
+        if self.extra_features_dim > 0:
             return self._append_extra_features(obs.astype(np.float32).ravel()).astype(self.space().dtype)
         return obs.astype(self.space().dtype)
 
@@ -532,7 +562,7 @@ class LaneSlotKinematicObservation(KinematicObservation):
             obs_with_time = np.concatenate([np.array([t], dtype=np.float32), obs_flat], axis=0)
             return self._append_extra_features(obs_with_time).astype(self.space().dtype)
 
-        if self.append_front_vehicle_features:
+        if self.extra_features_dim > 0:
             return self._append_extra_features(obs.astype(np.float32).ravel()).astype(self.space().dtype)
         return obs.astype(self.space().dtype)
 

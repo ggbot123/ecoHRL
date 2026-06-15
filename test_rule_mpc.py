@@ -347,7 +347,6 @@ def main(
         "punctual_reward",
         "on_road_reward",
     ]
-    goal_lane_id = int(env_config.get("goal_lane_id", 2))
     punctual_time_window = env_config.get("punctual_time_window", [20.0, 30.0])
     t_min = float(punctual_time_window[0])
     t_max = float(punctual_time_window[1])
@@ -378,12 +377,18 @@ def main(
         arrived: bool,
         arrival_time: Optional[float],
         final_lane_id: Optional[int],
+        goal_lane_id: Optional[int],
     ) -> Tuple[bool, bool, bool, bool, bool]:
         if crashed:
             return True, True, False, False, False
         on_time_arrival = bool(arrived and arrival_time is not None and t_min <= float(arrival_time) <= t_max)
         failed = not on_time_arrival
-        wrong_lane = bool(failed and final_lane_id is not None and int(final_lane_id) != goal_lane_id)
+        wrong_lane = bool(
+            failed
+            and final_lane_id is not None
+            and goal_lane_id is not None
+            and int(final_lane_id) != int(goal_lane_id)
+        )
         late = bool(failed and arrived and arrival_time is not None and float(arrival_time) > t_max)
         early = bool(failed and arrived and arrival_time is not None and float(arrival_time) < t_min)
         return failed, False, wrong_lane, late, early
@@ -598,11 +603,13 @@ def main(
                 comp_sum_no_collision[k] += ep_components[k]
 
         final_lane_id = get_terminal_lane_id(base_env_unwrapped)
+        goal_lane_id = int(base_env_unwrapped.get_goal_lane_id())
         failed, failed_collision, failed_wrong_lane, failed_late, failed_early = classify_failure(
             crashed,
             arrived,
             arrival_time,
             final_lane_id,
+            goal_lane_id,
         )
         if arrived:
             arrived_count += 1

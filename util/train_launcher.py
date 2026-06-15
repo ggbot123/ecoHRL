@@ -203,7 +203,6 @@ def run_training(
     hiro_low_pretrained_path: str | None = None,
     hiro_low_target_entropy: str | float = "auto",
     hiro_low_target_entropy_scale: float | None = 0.5,
-    hiro_low_sac_impl: str | None = None,
     hiro_high_transition_csv_all: int = 1,
     hiro_high_transition_csv_envs: str = "env0",
     hiro_low_transition_detail_csv: bool = False,
@@ -323,7 +322,6 @@ def run_training(
             hiro_low_pretrained_path=hiro_low_pretrained_path,
             hiro_low_target_entropy=hiro_low_target_entropy,
             hiro_low_target_entropy_scale=hiro_low_target_entropy_scale,
-            hiro_low_sac_impl=hiro_low_sac_impl,
             hiro_high_transition_csv_all=hiro_high_transition_csv_all,
             hiro_high_transition_csv_envs=hiro_high_transition_csv_envs,
             hiro_low_transition_detail_csv=hiro_low_transition_detail_csv,
@@ -366,7 +364,6 @@ def run_hiro_training(
     hiro_low_pretrained_path: str | None,
     hiro_low_target_entropy: str | float,
     hiro_low_target_entropy_scale: float | None,
-    hiro_low_sac_impl: str | None,
     hiro_high_transition_csv_all: int,
     hiro_high_transition_csv_envs: str,
     hiro_low_transition_detail_csv: bool,
@@ -389,13 +386,11 @@ def run_hiro_training(
         hiro_cfg.high_pretrained_path = hiro_high_pretrained_path
     if hiro_low_pretrained_path:
         hiro_cfg.low_pretrained_path = hiro_low_pretrained_path
-    if hiro_low_sac_impl is not None:
-        hiro_cfg.low_sac_impl = str(hiro_low_sac_impl)
 
     env_overrides = apply_low_safety_filter_overrides(env_overrides, hiro_cfg)
 
     print(f"[HIRO] Train Mode: {hiro_cfg.train_mode}, Goal Sampler: {hiro_cfg.goal_sampler.type}")
-    print(f"[HIRO] Low SAC Impl: {hiro_cfg.low_sac_impl}")
+    print("[HIRO] Low SAC Impl: sac")
     print(f"[HIRO] High pretrained: {hiro_cfg.high_pretrained_path}")
     print(f"[HIRO] Low pretrained: {hiro_cfg.low_pretrained_path}")
 
@@ -457,7 +452,6 @@ def run_hiro_training(
                 "hiro_low_pretrained_path": hiro_low_pretrained_path,
                 "hiro_low_target_entropy": hiro_low_target_entropy,
                 "hiro_low_target_entropy_scale": hiro_low_target_entropy_scale,
-                "hiro_low_sac_impl_arg": hiro_low_sac_impl,
                 "hiro_high_transition_csv_envs": hiro_high_transition_csv_envs,
                 "hiro_low_transition_detail_csv": bool(hiro_low_transition_detail_csv),
                 "hiro_low_transition_detail_envs": hiro_low_transition_detail_envs,

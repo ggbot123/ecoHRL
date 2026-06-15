@@ -9,7 +9,6 @@ import gymnasium as gym
 import numpy as np
 
 from rl.algos.sac.sac import SAC
-from rl.algos.sac.safety_sac import SafetyLayerSAC
 from rl.algos.sac.safe_goal_policies import SafeGoalMlpPolicy
 from rl.utils import utils
 from rl.algos.HRL.rule_based import RuleBasedAgentWrapper
@@ -77,6 +76,7 @@ class SB3AgentWrapper:
         self.batch_size = int(batch_size)
         self.replay_buffer = agent.replay_buffer
         self._last_train_step = 0
+        self._deferred_train_credit = 0.0
 
     @property
     def num_timesteps(self) -> int:
@@ -134,18 +134,150 @@ class SB3AgentWrapper:
         self.agent._last_obs = obs
         self.agent._store_transition(self.replay_buffer, action, next_obs, reward, done, infos)
 
+    def store_transition_direct(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        next_obs: np.ndarray,
+        reward: np.ndarray,
+        done: np.ndarray,
+        infos: List[Dict[str, Any]],
+    ):
+        self.replay_buffer.add(obs, next_obs, action, reward, done, infos)
+
     def train_if_needed(self):
         if self.num_timesteps <= self.agent.learning_starts:
             return
-        if self.num_timesteps // self.train_freq > self._last_train_step // self.train_freq:
-            self.agent.train(gradient_steps=self.gradient_steps, batch_size=self.batch_size)
+        due_updates = int(
+            self.num_timesteps // self.train_freq
+            > self._last_train_step // self.train_freq
+        )
+        if due_updates > 0:
+            self.agent.train(
+                gradient_steps=self.gradient_steps * int(due_updates),
+                batch_size=self.batch_size,
+            )
             self._last_train_step = self.num_timesteps
+
+    def train_from_committed(self, committed_transitions: int, n_envs: int) -> None:
+        """Train at the same rate as one update per original vector env step."""
+        committed_transitions = max(int(committed_transitions), 0)
+        if committed_transitions == 0:
+            return
+
+        previous_steps = self.num_timesteps
+        self.num_timesteps = previous_steps + committed_transitions
+        learning_starts = int(self.agent.learning_starts)
+        eligible_transitions = (
+            max(self.num_timesteps - learning_starts, 0)
+            - max(previous_steps - learning_starts, 0)
+        )
+        self._deferred_train_credit += (
+            float(eligible_transitions)
+            / float(max(int(n_envs), 1) * max(self.train_freq, 1))
+        )
+        due_updates = int(np.floor(self._deferred_train_credit + 1e-12))
+        if due_updates <= 0:
+            return
+
+        self.agent.train(
+            gradient_steps=self.gradient_steps * due_updates,
+            batch_size=self.batch_size,
+        )
+        self._deferred_train_credit -= float(due_updates)
+        self._last_train_step = self.num_timesteps
 
     def save(self, path: str):
         self.agent.save(path)
 
     def __getattr__(self, name):
         return getattr(self.agent, name)
+
+
+def discounted_option_reward_update(
+    accumulated: np.ndarray,
+    step_reward: np.ndarray,
+    gamma: float,
+    elapsed_steps: np.ndarray,
+    high_interval: int,
+) -> np.ndarray:
+    interval_index = np.floor_divide(
+        np.asarray(elapsed_steps, dtype=np.int64),
+        max(int(high_interval), 1),
+    )
+    return accumulated + np.power(
+        float(gamma),
+        interval_index.astype(np.float32),
+    ) * np.asarray(step_reward, dtype=np.float32)
+
+
+def compute_low_level_external_reward(
+    reward_env: np.ndarray,
+    reward_components: List[Dict[str, Any]],
+    replay_mask: np.ndarray,
+    *,
+    exclude_progress: bool,
+) -> np.ndarray:
+    """Remove task-level rewards that should only train the high level."""
+    replay_mask_f = np.asarray(replay_mask, dtype=np.float32)
+    low_reward = np.asarray(reward_env, dtype=np.float32) * replay_mask_f
+    excluded_names = ["punctual_reward", "wrong_lane_terminal_penalty"]
+    if exclude_progress:
+        excluded_names.append("progress_reward")
+    for name in excluded_names:
+        component = np.asarray(
+            [rc.get(name, 0.0) for rc in reward_components],
+            dtype=np.float32,
+        )
+        low_reward -= component * replay_mask_f
+    return low_reward
+
+
+def option_bootstrap_discount(
+    gamma: float,
+    duration: int,
+    high_interval: int,
+) -> float:
+    interval_count = max(
+        1,
+        int(np.ceil(max(int(duration), 0) / max(int(high_interval), 1))),
+    )
+    return float(float(gamma) ** interval_count)
+
+
+@dataclass
+class PendingLowTransition:
+    obs: np.ndarray
+    action: np.ndarray
+    next_obs: np.ndarray
+    reward: float
+    done: bool
+    info: Dict[str, Any]
+
+
+class PendingLowEpisodes:
+    def __init__(self, n_envs: int):
+        self._episodes: list[list[PendingLowTransition]] = [
+            [] for _ in range(int(n_envs))
+        ]
+
+    def append(self, env_i: int, transition: PendingLowTransition) -> None:
+        self._episodes[int(env_i)].append(transition)
+
+    def discard(self, env_i: int) -> int:
+        env_i = int(env_i)
+        count = len(self._episodes[env_i])
+        self._episodes[env_i].clear()
+        return count
+
+    def commit(self, env_i: int) -> list[PendingLowTransition]:
+        env_i = int(env_i)
+        transitions = self._episodes[env_i]
+        self._episodes[env_i] = []
+        return transitions
+
+    def size(self, env_i: int) -> int:
+        return len(self._episodes[int(env_i)])
 
 
 @dataclass
@@ -181,7 +313,6 @@ class HIROConfig:
     train_mode: str  # "joint", "low_only", "high_only"
     goal_sampler: GoalSamplerConfig
     low_level_type: str = "sac" # "sac" | "rule_based"
-    low_sac_impl: str = "auto" # "auto" | "sac" | "safety_sac"
     low_use_her: bool = False
     low_her_ratio: float = 0.8
     low_her_strategy: str = "future"  # "future" | "final"
@@ -244,6 +375,8 @@ class HIROSAC:
         # ---- 从env中获取的必要变量 --- #
         env_cfg = env.get_attr("config", indices=0)[0]
         self.high_use_acc_only_comfort = bool(env_cfg.get("high_use_acc_only_comfort", True))
+        self.queue_takeover_enabled = bool(env_cfg.get("enable_queue_takeover", False))
+        self.high_gamma = float(high_sac_kwargs.get("gamma", 0.99))
         self.punctual_time_target = float(env_cfg.get("punctual_time_target", env_cfg.get("duration", 0.0)))
         self.goal_longitudinal = float(env_cfg.get("goal_longitudinal", env_cfg.get("road_length", 0.0)))
         self.ego_x_idx = int(self.feature_names.index("x"))
@@ -304,6 +437,7 @@ class HIROSAC:
             dx_low=float(goal_low[0]),
             dx_high=float(goal_high[0]),
             feat_dim=int(self.feat_dim),
+            n_veh=int(self.n_veh),
             presence_idx=int(self.feature_names.index("presence")),
             x_idx=int(self.feature_names.index("x")),
             y_idx=int(self.feature_names.index("y")),
@@ -320,9 +454,13 @@ class HIROSAC:
         # ----- Build low-level agent ----- #
         self.train_mode = str(getattr(config, "train_mode", "joint")).lower()
         self.low_level_type = str(getattr(config, "low_level_type", "sac")).lower()
-        self.low_sac_impl = str(getattr(config, "low_sac_impl", "auto")).lower()
         self.low_use_her = bool(getattr(self.cfg, "low_use_her", False))
         self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", False))
+        if self.queue_takeover_enabled and self.use_off_policy_correction:
+            raise ValueError(
+                "enable_queue_takeover is incompatible with HIRO off-policy correction "
+                "because the extended option contains environment-controller actions"
+            )
         self.low_gamma = float(low_sac_kwargs.get("gamma", 0.99))
         if self.low_level_type == "rule_based":
             self.low_agent = RuleBasedAgentWrapper(
@@ -332,15 +470,7 @@ class HIROSAC:
                 low_safety_filter=getattr(config, "low_safety_filter", None),
             )
         elif self.low_level_type == "sac":
-            if self.low_sac_impl not in {"auto", "sac", "safety_sac"}:
-                raise ValueError(f"Unknown low_sac_impl: {self.low_sac_impl}")
-
             use_low_safety_layer = bool(getattr(self.cfg, "use_low_safety_layer", False))
-            use_safety_sac = use_low_safety_layer if self.low_sac_impl == "auto" else (self.low_sac_impl == "safety_sac")
-            if use_safety_sac and not use_low_safety_layer:
-                raise ValueError("low_sac_impl='safety_sac' requires use_low_safety_layer=True")
-
-            low_sac_cls = SafetyLayerSAC if use_safety_sac else SAC
 
             # Resolve scaled auto target entropy for low-level SAC: -scale * action_dim.
             low_sac_kwargs = dict(low_sac_kwargs)
@@ -398,14 +528,17 @@ class HIROSAC:
                 if not os.path.isfile(low_pretrained_path):
                     raise FileNotFoundError(f"Low-level pretrained model not found: {low_pretrained_path}")
                 print(f"[HIRO] Load low-level pretrained model from: {low_pretrained_path}")
-                low_sac = low_sac_cls.load(
+                low_sac = SAC.load(
                     low_pretrained_path,
                     env=_make_dummy_vec_env(low_obs_space, low_act_space, low_sac_n_envs),
                     device=self.device,
                     **low_sac_kwargs,
                 )
             else:
-                low_sac = low_sac_cls(env=_make_dummy_vec_env(low_obs_space, low_act_space, low_sac_n_envs), **low_sac_kwargs)
+                low_sac = SAC(
+                    env=_make_dummy_vec_env(low_obs_space, low_act_space, low_sac_n_envs),
+                    **low_sac_kwargs,
+                )
             self.low_agent = SB3AgentWrapper(low_sac, config.train_freq, config.gradient_steps_low, config.batch_size)
             if use_low_safety_layer:
                 self.low_safety = RuleBasedAgentWrapper(
@@ -414,8 +547,6 @@ class HIROSAC:
                     high_interval=int(config.high_interval),
                     low_safety_filter=getattr(config, "low_safety_filter", None),
                 )
-                if use_safety_sac:
-                    low_sac.target_action_filter = self._low_target_action_filter
         else:
             raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
 
@@ -432,28 +563,25 @@ class HIROSAC:
             )
             high_sac_kwargs["policy_kwargs"] = policy_kwargs
 
-        q_debug_cfg = high_sac_kwargs.get("q_replay_debug", {}) or {}
-        q_debug_enabled = bool(q_debug_cfg.get("enabled", False)) if isinstance(q_debug_cfg, dict) else False
-        if self.use_off_policy_correction or q_debug_enabled:
-            rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
-            rb_kwargs.update(
-                dict(
-                    max_seq_len=int(self.cfg.high_interval),
-                    kin_flat_dim=int(self.local_kin_flat_dim),
-                    obs_extra_dim=int(self.obs_extra_dim),
-                    low_action_dim=int(np.prod(low_act_space.shape)),
-                    feat_dim=int(self.feat_dim),
-                    ego_feature_idx=list(self.ego_feature_idx),
-                    lane_center_ys=self.lane_center_ys,
-                    high_interval=int(self.cfg.high_interval),
-                    dynamic_feasible_lane_intervals=bool(
-                        getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
-                    ),
-                    low_policy=self.low_agent.policy if self.use_off_policy_correction else None,
-                )
+        rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
+        rb_kwargs.update(
+            dict(
+                max_seq_len=int(self.cfg.high_interval),
+                kin_flat_dim=int(self.local_kin_flat_dim),
+                obs_extra_dim=int(self.obs_extra_dim),
+                low_action_dim=int(np.prod(low_act_space.shape)),
+                feat_dim=int(self.feat_dim),
+                ego_feature_idx=list(self.ego_feature_idx),
+                lane_center_ys=self.lane_center_ys,
+                high_interval=int(self.cfg.high_interval),
+                dynamic_feasible_lane_intervals=bool(
+                    getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+                ),
+                low_policy=self.low_agent.policy if self.use_off_policy_correction else None,
             )
-            rb_kwargs["enable_off_policy_correction"] = bool(self.use_off_policy_correction)
-            high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
+        )
+        rb_kwargs["enable_off_policy_correction"] = bool(self.use_off_policy_correction)
+        high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
 
         high_pretrained_path = getattr(self.cfg, "high_pretrained_path", None)
         if high_pretrained_path:
@@ -576,6 +704,34 @@ class HIROSAC:
                 continue
         return out
 
+    def _get_queue_takeover_mask(self) -> np.ndarray:
+        if not self.queue_takeover_enabled or not hasattr(self.env, "env_method"):
+            return np.zeros(self.n_envs, dtype=bool)
+        try:
+            values = self.env.env_method("get_queue_takeover_active")
+        except Exception:
+            return np.zeros(self.n_envs, dtype=bool)
+        out = np.zeros(self.n_envs, dtype=bool)
+        for i, value in enumerate(values or []):
+            if i >= self.n_envs:
+                break
+            out[i] = bool(value)
+        return out
+
+    def _get_queue_takeover_actions(self) -> np.ndarray:
+        actions = np.zeros((self.n_envs, int(np.prod(self.env.action_space.shape))), dtype=np.float32)
+        if not self.queue_takeover_enabled or not hasattr(self.env, "env_method"):
+            return actions
+        try:
+            values = self.env.env_method("get_queue_takeover_action")
+        except Exception:
+            return actions
+        for i, value in enumerate(values or []):
+            if i >= self.n_envs:
+                break
+            actions[i] = np.asarray(value, dtype=np.float32).reshape(-1)
+        return actions
+
     def _build_high_obs(self, obs: np.ndarray, signal_feat: np.ndarray) -> np.ndarray:
         arr = np.asarray(obs, dtype=np.float32)
         t_cur = arr[:, :1]
@@ -623,29 +779,6 @@ class HIROSAC:
             local_kin_flat[:, idx_x] = 0.0
             local_kin_flat[:, idx_y] = 0.0
         return np.concatenate([t_norm, np.asarray(local_kin_flat, dtype=np.float32), extra, goal_rel], axis=1)
-
-    def _low_target_action_filter(self, low_obs: np.ndarray, action: np.ndarray) -> np.ndarray:
-        """
-        Safety-filter next actions for low-level SAC target-Q.
-
-        low_obs format: [t_norm, local_kin_flat, goal_rel].
-        Reconstruct goal_phys = ego_sub + goal_rel, then apply safety layer.
-        """
-        if not bool(getattr(self.cfg, "use_low_safety_layer", False)) or self.low_level_type != "sac":
-            return np.asarray(action, dtype=np.float32)
-
-        low_obs = np.asarray(low_obs, dtype=np.float32)
-        action = np.asarray(action, dtype=np.float32)
-
-        kin_slice = low_obs[:, : 1 + self.local_kin_flat_dim]
-        _, kin, _ = utils.split_time_kinematics(kin_slice, self.n_veh_local, self.feat_dim)
-        ego_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
-
-        goal_start = 1 + self.local_kin_flat_dim + self.obs_extra_dim
-        goal_rel = low_obs[:, goal_start : goal_start + self.ego_dim]
-        goal_phys = (ego_sub + goal_rel).astype(np.float32)
-
-        return self.low_safety.apply_safety_layer(low_obs, goal_phys, action)
 
     def _compute_intrinsic(self, kin: np.ndarray, kin_next: np.ndarray, goal_phys: np.ndarray, ego_start: np.ndarray, is_last_step: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         n_envs = int(kin.shape[0])
@@ -711,6 +844,16 @@ class HIROSAC:
     def _train(self, total_timesteps: int, callback, log_interval: int, progress_bar: bool, train_high: bool, train_low: bool, high_policy: Optional[Callable] = None):
 
         # ========== 0. initialization ========== #
+        if (
+            self.queue_takeover_enabled
+            and train_low
+            and self.low_level_type == "sac"
+            and not self.low_use_her
+        ):
+            raise ValueError(
+                "Training low-level SAC with enable_queue_takeover requires "
+                "low_use_her=True so takeover steps can be excluded from replay"
+            )
         callback = self._init_callback(callback, progress_bar=progress_bar)
         self._propagate_log_interval(callback, log_interval)
         env = self.env
@@ -737,6 +880,7 @@ class HIROSAC:
         high_ret = np.zeros(n_envs, dtype=np.float32)
         low_ret = np.zeros(n_envs, dtype=np.float32)
         low_len = np.zeros(n_envs, dtype=np.int32)
+        high_len = np.zeros(n_envs, dtype=np.int32)
         low_safety_clip_count = np.zeros(n_envs, dtype=np.int32)
         low_comp_sums: dict[str, np.ndarray] = {}
         high_comp_keys = [
@@ -773,6 +917,50 @@ class HIROSAC:
 
         callback.on_training_start(locals(), globals())
         obs_skip_mask = np.zeros(n_envs, dtype=bool)
+        pending_low = PendingLowEpisodes(n_envs)
+        use_pending_low = bool(
+            self.queue_takeover_enabled
+            and train_low
+            and self.low_level_type == "sac"
+        )
+
+        def _commit_pending_low(env_indices: np.ndarray) -> int:
+            committed_by_env = {
+                int(env_i): pending_low.commit(int(env_i))
+                for env_i in np.asarray(env_indices, dtype=np.int64).reshape(-1)
+            }
+            max_rows = max((len(items) for items in committed_by_env.values()), default=0)
+            committed_count = sum(len(items) for items in committed_by_env.values())
+            for row_i in range(max_rows):
+                obs_batch = np.zeros((n_envs, self.low_obs_dim), dtype=np.float32)
+                action_batch = np.zeros(
+                    (n_envs, int(np.prod(env.action_space.shape))),
+                    dtype=np.float32,
+                )
+                next_obs_batch = np.zeros_like(obs_batch)
+                reward_batch = np.zeros(n_envs, dtype=np.float32)
+                done_batch = np.zeros(n_envs, dtype=np.bool_)
+                info_batch = [{"skip_replay": True} for _ in range(n_envs)]
+
+                for env_i, transitions in committed_by_env.items():
+                    if row_i >= len(transitions):
+                        continue
+                    transition = transitions[row_i]
+                    obs_batch[env_i] = transition.obs
+                    action_batch[env_i] = transition.action
+                    next_obs_batch[env_i] = transition.next_obs
+                    reward_batch[env_i] = float(transition.reward)
+                    done_batch[env_i] = bool(transition.done)
+                    info_batch[env_i] = dict(transition.info)
+                self.low_agent.store_transition_direct(
+                    obs_batch,
+                    action_batch,
+                    next_obs_batch,
+                    reward_batch,
+                    done_batch,
+                    info_batch,
+                )
+            return committed_count
 
         # ========== 1. Main Loop ========== #
         while self.total_timesteps < total_timesteps:
@@ -819,6 +1007,7 @@ class HIROSAC:
                 high_ret[idx] = 0.0
                 low_ret[idx] = 0.0
                 low_len[idx] = 0
+                high_len[idx] = 0
                 low_safety_clip_count[idx] = 0
                 for v in low_comp_sums.values():
                     v[idx] = 0.0
@@ -831,6 +1020,8 @@ class HIROSAC:
                 high_acc_count[idx] = 0
                 high_acc_hard_brake[idx] = 0
                 high_acc_hard_accel[idx] = 0
+                goal_err_all[idx] = 0.0
+                intrinsic_unweighted[idx] = 0.0
 
                 if opc_enabled:
                     opc_low_obs_seq[idx] = 0.0
@@ -842,6 +1033,7 @@ class HIROSAC:
                 need_high[idx] = False
 
             # === 1.2 Low Level Decision ===
+            queue_takeover_mask = self._get_queue_takeover_mask() & active_obs_mask
             low_obs = self._build_low_obs(c, kin_flat, kin, goal_phys, obs_extra)
             if obs_skip_mask.any():
                 low_obs[obs_skip_mask] = 0.0
@@ -851,8 +1043,9 @@ class HIROSAC:
                 low_action_raw = self.low_agent.act(low_obs, goal_phys)
                 low_action = self.low_agent.apply_safety_layer(low_obs, goal_phys, low_action_raw)
                 low_safety_clipped = np.any(np.abs(low_action - low_action_raw) > 1e-6, axis=1)
-                if active_obs_mask.any():
-                    low_safety_clip_count[active_obs_mask] += low_safety_clipped[active_obs_mask].astype(np.int32)
+                safety_count_mask = active_obs_mask & (~queue_takeover_mask)
+                if safety_count_mask.any():
+                    low_safety_clip_count[safety_count_mask] += low_safety_clipped[safety_count_mask].astype(np.int32)
                 low_buffer_action = low_action.copy()
             elif self.low_level_type == "sac":
                 if train_low:
@@ -864,12 +1057,17 @@ class HIROSAC:
                     low_action_raw = low_action.copy()
                     low_action = self.low_safety.apply_safety_layer(low_obs, goal_phys, low_action)
                     low_safety_clipped = np.any(np.abs(low_action - low_action_raw) > 1e-6, axis=1)
-                    if active_obs_mask.any():
-                        low_safety_clip_count[active_obs_mask] += low_safety_clipped[active_obs_mask].astype(np.int32)
-                    if self.low_sac_impl == "safety_sac" or self.low_sac_impl == "auto":
-                        low_buffer_action = low_action.copy()
+                    safety_count_mask = active_obs_mask & (~queue_takeover_mask)
+                    if safety_count_mask.any():
+                        low_safety_clip_count[safety_count_mask] += low_safety_clipped[safety_count_mask].astype(np.int32)
             else:
                 raise ValueError(f"Unknown low_level_type: {self.low_level_type}")
+
+            if queue_takeover_mask.any():
+                queue_actions = self._get_queue_takeover_actions()
+                low_action[queue_takeover_mask] = queue_actions[queue_takeover_mask]
+                low_buffer_action[queue_takeover_mask] = queue_actions[queue_takeover_mask]
+                low_safety_clipped[queue_takeover_mask] = False
 
             if obs_skip_mask.any():
                 low_action = np.asarray(low_action, dtype=np.float32)
@@ -896,6 +1094,13 @@ class HIROSAC:
             replay_mask = ~skip_replay_mask
             next_obs_is_dummy = np.asarray([bool(info.get("next_obs_is_dummy", False)) for info in infos], dtype=bool)
             inter_episode_mask = np.asarray([bool(info.get("inter_episode", False)) for info in infos], dtype=bool)
+            queue_takeover_next_mask = np.asarray(
+                [bool(info.get("queue_takeover_active", False)) for info in infos],
+                dtype=bool,
+            )
+            queue_enter_mask = replay_mask & (~queue_takeover_mask) & queue_takeover_next_mask
+            queue_exit_mask = replay_mask & queue_takeover_mask & (~queue_takeover_next_mask)
+            low_replay_mask = replay_mask & (~queue_takeover_mask)
             dummy_finished_mask = skip_replay_mask & inter_episode_mask & (~next_obs_is_dummy)
             replay_count = int(np.sum(replay_mask))
 
@@ -945,26 +1150,40 @@ class HIROSAC:
                     [rc.get("comfort_reward_acc_only_for_high", rc.get("comfort_reward", 0.0)) for rc in r_components],
                     dtype=np.float32,
                 ) * replay_mask_f
-                high_ret += reward_env * replay_mask_f - comfort_mixed + comfort_acc_only
+                high_step_reward = (
+                    reward_env * replay_mask_f - comfort_mixed + comfort_acc_only
+                )
             else:
-                high_ret += reward_env * replay_mask_f
+                high_step_reward = reward_env * replay_mask_f
+            high_ret = discounted_option_reward_update(
+                high_ret,
+                high_step_reward,
+                self.high_gamma,
+                high_len,
+                hi,
+            )
+            high_step_discount = np.power(
+                self.high_gamma,
+                np.floor_divide(high_len, hi).astype(np.float32),
+            )
 
             if replay_mask.any():
                 for i, rc in enumerate(r_components):
                     if not replay_mask[i]:
                         continue
-                    high_comp_sums["collision_reward"][i] += float(rc.get("collision_reward", 0.0))
-                    high_comp_sums["progress_reward"][i] += float(rc.get("progress_reward", 0.0))
-                    high_comp_sums["speed_ref_aux_reward"][i] += float(rc.get("speed_ref_aux_reward", 0.0))
+                    discount_i = float(high_step_discount[i])
+                    high_comp_sums["collision_reward"][i] += discount_i * float(rc.get("collision_reward", 0.0))
+                    high_comp_sums["progress_reward"][i] += discount_i * float(rc.get("progress_reward", 0.0))
+                    high_comp_sums["speed_ref_aux_reward"][i] += discount_i * float(rc.get("speed_ref_aux_reward", 0.0))
                     if self.high_use_acc_only_comfort:
-                        high_comp_sums["comfort_reward_for_high"][i] += float(
+                        high_comp_sums["comfort_reward_for_high"][i] += discount_i * float(
                             rc.get("comfort_reward_acc_only_for_high", rc.get("comfort_reward", 0.0))
                         )
                     else:
-                        high_comp_sums["comfort_reward_for_high"][i] += float(rc.get("comfort_reward", 0.0))
-                    high_comp_sums["lane_change_reward"][i] += float(rc.get("lane_change_reward", 0.0))
-                    high_comp_sums["punctual_reward"][i] += float(rc.get("punctual_reward", 0.0))
-                    high_comp_sums["wrong_lane_terminal_penalty"][i] += float(rc.get("wrong_lane_terminal_penalty", 0.0))
+                        high_comp_sums["comfort_reward_for_high"][i] += discount_i * float(rc.get("comfort_reward", 0.0))
+                    high_comp_sums["lane_change_reward"][i] += discount_i * float(rc.get("lane_change_reward", 0.0))
+                    high_comp_sums["punctual_reward"][i] += discount_i * float(rc.get("punctual_reward", 0.0))
+                    high_comp_sums["wrong_lane_terminal_penalty"][i] += discount_i * float(rc.get("wrong_lane_terminal_penalty", 0.0))
                 idx_replay = np.flatnonzero(replay_mask)
                 acc_replay = physical_acc[idx_replay]
                 high_acc_min[idx_replay] = np.minimum(high_acc_min[idx_replay], acc_replay)
@@ -975,54 +1194,75 @@ class HIROSAC:
                 high_acc_hard_brake[idx_replay] += (acc_replay <= -3.0).astype(np.int32)
                 high_acc_hard_accel[idx_replay] += (acc_replay >= 3.0).astype(np.int32)
 
-            punctual = np.asarray([rc.get("punctual_reward", 0.0) for rc in r_components], dtype=np.float32) * replay_mask_f
-            low_reward_ext = reward_env * replay_mask_f - punctual
-            if str(getattr(self.cfg, "intrinsic_type", "l2")).lower() == "huber_shaping":
-                progress = np.asarray([rc.get("progress_reward", 0.0) for rc in r_components], dtype=np.float32) * replay_mask_f
-                low_reward_ext = low_reward_ext - progress
+            low_reward_ext = compute_low_level_external_reward(
+                reward_env,
+                r_components,
+                replay_mask,
+                exclude_progress=(
+                    str(getattr(self.cfg, "intrinsic_type", "l2")).lower()
+                    == "huber_shaping"
+                ),
+            )
 
             safety_penalty_coef = float(getattr(self.cfg, "low_safety_violation_penalty", 0.0))
             safety_penalty = np.where(replay_mask & low_safety_clipped, safety_penalty_coef, 0.0).astype(np.float32)
             low_reward_ext = low_reward_ext - safety_penalty
 
             # calculate intrinsic reward
-            is_last_step = ((c == hi - 1) | done) & replay_mask
-            intrinsic, goal_err, intrinsic_unw = self._compute_intrinsic(kin, kin_next, goal_phys, ego_start, is_last_step)
-            intrinsic[~replay_mask] = 0.0
-            if is_last_step.any():
-                idx_last = np.flatnonzero(is_last_step)
+            regular_interval_end = (c == hi - 1) & (~queue_takeover_next_mask)
+            low_transition_end = (
+                regular_interval_end | done
+            ) & low_replay_mask & (~queue_enter_mask)
+            high_interval_end = (
+                regular_interval_end | done | queue_exit_mask
+            ) & replay_mask
+            # Callback-facing name retained for compatibility: it denotes the
+            # end of the current high/low option, not the low replay terminal.
+            done_low = high_interval_end
+            intrinsic, goal_err, intrinsic_unw = self._compute_intrinsic(
+                kin,
+                kin_next,
+                goal_phys,
+                ego_start,
+                low_transition_end,
+            )
+            intrinsic[~low_replay_mask] = 0.0
+            if low_transition_end.any():
+                idx_last = np.flatnonzero(low_transition_end)
                 goal_err_all[idx_last] = goal_err[idx_last]
                 intrinsic_unweighted[idx_last] = intrinsic_unw[idx_last]
 
             low_reward_total = low_reward_ext + intrinsic
+            if low_replay_mask.any():
+                low_ret[low_replay_mask] += low_reward_total[low_replay_mask]
+                low_len[low_replay_mask] += 1
             if replay_mask.any():
-                low_ret[replay_mask] += low_reward_total[replay_mask]
-                low_len[replay_mask] += 1
+                high_len[replay_mask] += 1
 
             # record logs in callbacks
             for i, rc in enumerate(r_components):
-                if not replay_mask[i]:
+                if not low_replay_mask[i]:
                     continue
                 for name, val in rc.items():
-                    if name == "punctual_reward":
+                    if name in {"punctual_reward", "wrong_lane_terminal_penalty"}:
                         continue
                     low_comp_sums.setdefault(name, np.zeros(n_envs, dtype=np.float32))[i] += float(val)
-            if is_last_step.any():
-                low_comp_sums.setdefault("intrinsic_reward", np.zeros(n_envs, dtype=np.float32))[is_last_step] += intrinsic[is_last_step]
-            if np.any((safety_penalty > 0.0) & replay_mask):
-                low_comp_sums.setdefault("safety_violation_penalty", np.zeros(n_envs, dtype=np.float32))[replay_mask] += (-safety_penalty[replay_mask])
+            if low_transition_end.any():
+                low_comp_sums.setdefault("intrinsic_reward", np.zeros(n_envs, dtype=np.float32))[low_transition_end] += intrinsic[low_transition_end]
+            if np.any((safety_penalty > 0.0) & low_replay_mask):
+                low_comp_sums.setdefault("safety_violation_penalty", np.zeros(n_envs, dtype=np.float32))[low_replay_mask] += (-safety_penalty[low_replay_mask])
 
             # === 1.4 Low Level Store & Train ===
             next_low_obs = self._build_low_obs(c + 1, kin_flat_next, kin_next, goal_phys, next_obs_extra)
             if next_obs_is_dummy.any():
                 next_low_obs[next_obs_is_dummy] = 0.0
-            done_low = is_last_step.astype(np.bool_)
+            done_low_store = low_transition_end.astype(np.bool_)
             ego_now_sub = utils.extract_ego_substate(kin, self.ego_feature_idx)
             ego_next_sub = utils.extract_ego_substate(kin_next, self.ego_feature_idx)
 
             low_infos = [dict(info) for info in infos]
-            if done_low.any():
-                for i in np.flatnonzero(done_low):
+            if done_low_store.any():
+                for i in np.flatnonzero(done_low_store):
                     low_infos[i]["terminal_observation"] = next_low_obs[i]
 
             if train_low and self.low_level_type == "sac":
@@ -1036,19 +1276,55 @@ class HIROSAC:
                     low_infos[i]["low_ego_next"] = np.asarray(ego_next_sub[i], dtype=np.float32)
                     low_infos[i]["low_r_ext"] = float(low_reward_ext[i])
 
-            if train_low and self.low_level_type == "sac" and replay_mask.any():
+            committed_low_count = 0
+            if use_pending_low:
                 reward_for_store = (low_reward_ext if self.low_use_her else low_reward_total).astype(np.float32)
+                for i in np.flatnonzero(low_replay_mask):
+                    pending_low.append(
+                        int(i),
+                        PendingLowTransition(
+                            obs=np.asarray(low_obs[i], dtype=np.float32).copy(),
+                            action=np.asarray(low_buffer_action[i], dtype=np.float32).copy(),
+                            next_obs=np.asarray(next_low_obs[i], dtype=np.float32).copy(),
+                            reward=float(reward_for_store[i]),
+                            done=bool(done_low_store[i]),
+                            info=dict(low_infos[i]),
+                        ),
+                    )
+
+                for i in np.flatnonzero(queue_enter_mask):
+                    pending_low.discard(int(i))
+                    low_ret[i] = 0.0
+                    low_len[i] = 0
+                    low_safety_clip_count[i] = 0
+                    goal_err_all[i] = 0.0
+                    intrinsic_unweighted[i] = 0.0
+                    for values in low_comp_sums.values():
+                        values[i] = 0.0
+
+                commit_env_indices = np.flatnonzero(low_transition_end)
+                if commit_env_indices.size > 0:
+                    committed_low_count = _commit_pending_low(commit_env_indices)
+
+                if committed_low_count > 0:
+                    self.low_agent.train_from_committed(
+                        committed_low_count,
+                        n_envs=n_envs,
+                    )
+            elif train_low and self.low_level_type == "sac" and low_replay_mask.any():
+                reward_for_store = (low_reward_ext if self.low_use_her else low_reward_total).astype(np.float32)
+                for i in np.flatnonzero(~low_replay_mask):
+                    low_infos[i]["skip_replay"] = True
                 self.low_agent.store_transition(
                     low_obs,
                     low_buffer_action,
                     next_low_obs,
                     reward_for_store,
-                    done_low,
+                    done_low_store,
                     low_infos,
                 )
-                self.low_agent.num_timesteps += int(replay_count)
-                if self.low_level_type == "sac":
-                    self.low_agent.train_if_needed()
+                self.low_agent.num_timesteps += int(np.sum(low_replay_mask))
+                self.low_agent.train_if_needed()
 
             self.total_timesteps += replay_count
             target_reached = self.total_timesteps >= total_timesteps
@@ -1068,8 +1344,8 @@ class HIROSAC:
                 ep_step[idx_done_env] = 0
 
             # === 1.5. High Level Store & Train ===
-            if done_low.any():
-                idx_end = np.flatnonzero(done_low)
+            if high_interval_end.any():
+                idx_end = np.flatnonzero(high_interval_end)
                 low_ret_end = low_ret[idx_end].copy()
                 low_len_end = low_len[idx_end].copy()
                 low_safety_clip_ratio_end = (
@@ -1094,7 +1370,15 @@ class HIROSAC:
                         # ensure it matches high-level observation shape instead of raw env obs shape.
                         if bool(done[j]):
                             info_h["terminal_observation"] = np.asarray(next_high_obs[j], dtype=np.float32).copy()
-                        info_h["high_interval_len"] = int(low_len[j])
+                        info_h["high_interval_len"] = int(high_len[j])
+                        info_h["high_transition_discount"] = option_bootstrap_discount(
+                            self.high_gamma,
+                            int(high_len[j]),
+                            hi,
+                        )
+                        info_h["queue_takeover_used"] = bool(
+                            high_len[j] > low_len[j]
+                        )
                         info_h["high_env_id"] = int(j)
                         info_h["high_global_step"] = int(self.total_timesteps)
                         info_h["high_segment_id"] = int(seg_id[j])
@@ -1132,6 +1416,7 @@ class HIROSAC:
                 high_ret[idx_end] = 0.0
                 low_ret[idx_end] = 0.0
                 low_len[idx_end] = 0
+                high_len[idx_end] = 0
                 low_safety_clip_count[idx_end] = 0
                 for v in low_comp_sums.values():
                     v[idx_end] = 0.0
@@ -1147,7 +1432,11 @@ class HIROSAC:
 
                 c[idx_end] = 0
 
-            c[replay_mask & (~done_low)] += 1
+            c[
+                replay_mask
+                & (~high_interval_end)
+                & (~queue_takeover_next_mask)
+            ] += 1
             if dummy_finished_mask.any():
                 idx_dummy_done = np.flatnonzero(dummy_finished_mask)
                 need_high[idx_dummy_done] = True
@@ -1155,6 +1444,7 @@ class HIROSAC:
                 high_ret[idx_dummy_done] = 0.0
                 low_ret[idx_dummy_done] = 0.0
                 low_len[idx_dummy_done] = 0
+                high_len[idx_dummy_done] = 0
                 low_safety_clip_count[idx_dummy_done] = 0
                 for v in low_comp_sums.values():
                     v[idx_dummy_done] = 0.0

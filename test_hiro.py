@@ -335,9 +335,8 @@ def main(
         )
         runner.high_policy = high_policy
 
-    reward_keys_high = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "punctual_reward", "on_road_reward"]
+    reward_keys_high = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "punctual_reward", "wrong_lane_terminal_penalty", "on_road_reward"]
     reward_keys_low = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "on_road_reward", "intrinsic_reward"]
-    goal_lane_id = int(env_config.get("goal_lane_id", 2))
     punctual_time_window = env_config.get("punctual_time_window", [20.0, 30.0])
     t_min = float(punctual_time_window[0])
     t_max = float(punctual_time_window[1])
@@ -387,7 +386,8 @@ def main(
     low_comp_sum_no_collision = {k: 0.0 for k in exclude_collision_mean_keys}
     non_collision_episode_count = 0
 
-    lane_group_stats: Dict[int, Dict[str, Any]] = {}
+    initial_lane_group_stats: Dict[int, Dict[str, Any]] = {}
+    goal_lane_group_stats: Dict[int, Dict[str, Any]] = {}
 
     def get_terminal_lane_id(base_env: Any) -> Optional[int]:
         ego_vehicle = getattr(base_env, "vehicle", None)
@@ -410,12 +410,17 @@ def main(
                 )
         return None
 
-    def classify_failure(crashed: bool, arrived: bool, arrival_time: Optional[float], final_lane_id: Optional[int]) -> Tuple[bool, bool, bool, bool, bool]:
+    def classify_failure(crashed: bool, arrived: bool, arrival_time: Optional[float], final_lane_id: Optional[int], goal_lane_id: Optional[int]) -> Tuple[bool, bool, bool, bool, bool]:
         if crashed:
             return True, True, False, False, False
         on_time_arrival = bool(arrived and arrival_time is not None and t_min <= float(arrival_time) <= t_max)
         failed = not on_time_arrival
-        wrong_lane = bool(failed and final_lane_id is not None and int(final_lane_id) != goal_lane_id)
+        wrong_lane = bool(
+            failed
+            and final_lane_id is not None
+            and goal_lane_id is not None
+            and int(final_lane_id) != int(goal_lane_id)
+        )
         late = bool(failed and arrived and arrival_time is not None and float(arrival_time) > t_max)
         early = bool(failed and arrived and arrival_time is not None and float(arrival_time) < t_min)
         return failed, False, wrong_lane, late, early
@@ -451,9 +456,12 @@ def main(
             return "N/A (all episodes collided)"
         return f"{total_sum / total_count: .6f}"
 
-    def ensure_lane_group(lane_id: int) -> Dict[str, Any]:
-        if lane_id not in lane_group_stats:
-            lane_group_stats[lane_id] = {
+    def ensure_lane_group(
+        group_stats: Dict[int, Dict[str, Any]],
+        lane_id: int,
+    ) -> Dict[str, Any]:
+        if lane_id not in group_stats:
+            group_stats[lane_id] = {
                 "episodes": 0,
                 "ep_lens": [],
                 "high_ep_rets": [],
@@ -473,7 +481,112 @@ def main(
                 "failed_late_count": 0,
                 "failed_early_count": 0,
             }
-        return lane_group_stats[lane_id]
+        return group_stats[lane_id]
+
+    def update_lane_group(
+        group: Dict[str, Any],
+        *,
+        steps: int,
+        high_ret: float,
+        low_ext_mean: float,
+        low_int_mean: float,
+        low_total_mean: float,
+        high_comp: Mapping[str, float],
+        low_comp: Mapping[str, float],
+        n_low_intervals: int,
+        crashed: bool,
+        arrived: bool,
+        arrival_time: Optional[float],
+        failed: bool,
+        failed_collision: bool,
+        failed_wrong_lane: bool,
+        failed_late: bool,
+        failed_early: bool,
+    ) -> None:
+        group["episodes"] += 1
+        group["ep_lens"].append(int(steps))
+        group["high_ep_rets"].append(float(high_ret))
+        group["low_ep_ext_rets"].append(float(low_ext_mean))
+        group["low_ep_int_rets"].append(float(low_int_mean))
+        group["low_ep_total_rets"].append(float(low_total_mean))
+        for key in reward_keys_high:
+            group["high_comp_sum"][key] += float(high_comp[key])
+        for key in reward_keys_low:
+            group["low_comp_sum"][key] += float(low_comp[key]) / float(n_low_intervals)
+        if not crashed:
+            group["non_collision_episode_count"] += 1
+            for key in exclude_collision_mean_keys:
+                group["high_comp_sum_no_collision"][key] += float(high_comp[key])
+                group["low_comp_sum_no_collision"][key] += (
+                    float(low_comp[key]) / float(n_low_intervals)
+                )
+        if arrived:
+            group["arrived_count"] += 1
+            if arrival_time is not None:
+                group["arrival_times"].append(float(arrival_time))
+        if failed:
+            group["failed_count"] += 1
+        if failed_collision:
+            group["failed_collision_count"] += 1
+        if failed_wrong_lane:
+            group["failed_wrong_lane_count"] += 1
+        if failed_late:
+            group["failed_late_count"] += 1
+        if failed_early:
+            group["failed_early_count"] += 1
+
+    def log_lane_group_summary(
+        title: str,
+        group_stats: Mapping[int, Dict[str, Any]],
+        lanes_count: int,
+    ) -> None:
+        log("=" * 80)
+        log(title)
+        for lane_id in range(lanes_count):
+            group = group_stats.get(lane_id)
+            if group is None or int(group["episodes"]) == 0:
+                log(f"  lane {lane_id}: no episodes")
+                continue
+
+            n_lane = int(group["episodes"])
+            log("-" * 80)
+            log(f"  lane {lane_id}:")
+            log(f"    episodes              : {n_lane}")
+            log(f"    mean length           : {float(np.mean(group['ep_lens'])):.3f} steps")
+            log(f"    mean high total reward: {float(np.mean(group['high_ep_rets'])):.6f}")
+            log(f"    mean low ext          : {float(np.mean(group['low_ep_ext_rets'])):.6f}")
+            log(f"    mean low intrinsic    : {float(np.mean(group['low_ep_int_rets'])):.6f}")
+            log(f"    mean low total        : {float(np.mean(group['low_ep_total_rets'])):.6f}")
+            log("    mean high reward components (per episode):")
+            for key in reward_keys_high:
+                log(
+                    f"      {key:16s}: "
+                    f"{format_component_mean(key, group['high_comp_sum'][key], n_lane, group['high_comp_sum_no_collision'].get(key, 0.0), int(group['non_collision_episode_count']))}"
+                )
+            log("    mean low reward components (per interval):")
+            for key in reward_keys_low:
+                log(
+                    f"      {key:16s}: "
+                    f"{format_component_mean(key, group['low_comp_sum'][key], n_lane, group['low_comp_sum_no_collision'].get(key, 0.0), int(group['non_collision_episode_count']))}"
+                )
+
+            lane_arrive_rate = group["arrived_count"] / n_lane if n_lane else 0.0
+            log(f"    arrival rate          : {lane_arrive_rate * 100:.2f}%")
+            if group["arrived_count"] > 0:
+                log(
+                    f"    mean arrival time     : {float(np.mean(group['arrival_times'])):.3f} s "
+                    f"(over {int(group['arrived_count'])} success episodes)"
+                )
+            else:
+                log("    mean arrival time     : N/A (no successful episodes)")
+            log_failed_breakdown(
+                "    ",
+                int(group["failed_count"]),
+                int(group["failed_collision_count"]),
+                int(group["failed_wrong_lane_count"]),
+                int(group["failed_late_count"]),
+                int(group["failed_early_count"]),
+            )
 
     arrived_count, arrival_times = 0, []
     failed_count = 0
@@ -721,9 +834,17 @@ def main(
 
             rc = info.get("reward_components", {})
             punctual = float(rc.get("punctual_reward", 0.0))
-            low_ext = float(reward) - punctual
+            wrong_lane_penalty = float(rc.get("wrong_lane_terminal_penalty", 0.0))
+            low_ext = float(reward) - punctual - wrong_lane_penalty
 
-            last_step = bool(done or runner.c == runner.hi - 1)
+            queue_takeover_next = bool(info.get("queue_takeover_active", False))
+            last_step = bool(
+                done
+                or (
+                    runner.c == runner.hi - 1
+                    and not queue_takeover_next
+                )
+            )
             intrinsic = runner.intrinsic_if_last(obs_next) if last_step else 0.0
             
             if last_step:
@@ -741,8 +862,10 @@ def main(
                     "done": int(done),
                     "terminated": int(terminated),
                     "truncated": int(truncated),
+                    "queue_takeover_active": int(queue_takeover_next),
                     "reward": float(reward),
                     "punctual_reward": float(punctual),
+                    "wrong_lane_terminal_penalty": float(wrong_lane_penalty),
                     "low_ext_reward": float(low_ext),
                     "intrinsic_reward": float(intrinsic),
                     "low_total_step_reward": float(low_ext + intrinsic),
@@ -779,7 +902,7 @@ def main(
                 high_interval_rets.append(float(cur_high_interval_ret))
                 low_interval_rets.append(float(cur_low_interval_ret))
                 cur_high_interval_ret, cur_low_interval_ret = 0.0, 0.0
-            runner.step_end(done)
+            runner.step_end(done, queue_takeover_active=queue_takeover_next)
             obs = obs_next
 
         if enable_rendering:
@@ -819,7 +942,14 @@ def main(
         arrived = bool(getattr(base_env, "_has_arrived", False))
         arrival_time = getattr(base_env, "_arrival_time", None)
         final_lane_id = get_terminal_lane_id(base_env)
-        failed, failed_collision, failed_wrong_lane, failed_late, failed_early = classify_failure(crashed, arrived, arrival_time, final_lane_id)
+        goal_lane_id = int(base_env.get_goal_lane_id())
+        failed, failed_collision, failed_wrong_lane, failed_late, failed_early = classify_failure(
+            crashed,
+            arrived,
+            arrival_time,
+            final_lane_id,
+            goal_lane_id,
+        )
         if arrived:
             arrived_count += 1
             if arrival_time is not None:
@@ -843,11 +973,12 @@ def main(
             log(f"  start phase offset      : {actual_offset:.6f} s")
         log(f"  punctual window         : [{t_min:.3f}, {t_max:.3f}] s")
         log(f"  initial lane            : {init_lane}")
+        log(f"  goal lane               : {goal_lane_id}")
         log(f"  terminal lane           : {final_lane_id if final_lane_id is not None else 'N/A'}")
         log(f"  length (steps)          : {steps}")
         log(f"  terminated info         : {reason}")
         log(f"  high total reward       : {high_ret:.6f}")
-        log(f"  low  ext reward (per interval mean)       : {low_ext_mean:.6f}   (env_reward - punctual)")
+        log(f"  low  ext reward (per interval mean)       : {low_ext_mean:.6f}   (env_reward - high-only task rewards)")
         log(f"  low  intrinsic reward (per interval mean) : {low_int_mean:.6f}")
         log(f"  low  total reward (per interval mean)     : {low_total_mean:.6f}   (ext + intrinsic)")
         if high_interval_rets:
@@ -883,90 +1014,49 @@ def main(
             else:
                 log(f"  saved trajectory csv    : skipped (episode {ep} has no trajectory rows)")
 
-        group = ensure_lane_group(int(init_lane))
-        group["episodes"] += 1
-        group["ep_lens"].append(int(steps))
-        group["high_ep_rets"].append(float(high_ret))
-        group["low_ep_ext_rets"].append(float(low_ext_mean))
-        group["low_ep_int_rets"].append(float(low_int_mean))
-        group["low_ep_total_rets"].append(float(low_total_mean))
-        for k in reward_keys_high:
-            group["high_comp_sum"][k] += high_comp[k]
-        for k in reward_keys_low:
-            group["low_comp_sum"][k] += low_comp[k] / float(n_low_intervals)
-        if not crashed:
-            group["non_collision_episode_count"] += 1
-            for k in exclude_collision_mean_keys:
-                group["high_comp_sum_no_collision"][k] += high_comp[k]
-                group["low_comp_sum_no_collision"][k] += low_comp[k] / float(n_low_intervals)
-        if arrived:
-            group["arrived_count"] += 1
-            if arrival_time is not None:
-                group["arrival_times"].append(float(arrival_time))
-        if failed:
-            group["failed_count"] += 1
-        if failed_collision:
-            group["failed_collision_count"] += 1
-        if failed_wrong_lane:
-            group["failed_wrong_lane_count"] += 1
-        if failed_late:
-            group["failed_late_count"] += 1
-        if failed_early:
-            group["failed_early_count"] += 1
+        group_update = {
+            "steps": int(steps),
+            "high_ret": float(high_ret),
+            "low_ext_mean": float(low_ext_mean),
+            "low_int_mean": float(low_int_mean),
+            "low_total_mean": float(low_total_mean),
+            "high_comp": high_comp,
+            "low_comp": low_comp,
+            "n_low_intervals": int(n_low_intervals),
+            "crashed": crashed,
+            "arrived": arrived,
+            "arrival_time": arrival_time,
+            "failed": failed,
+            "failed_collision": failed_collision,
+            "failed_wrong_lane": failed_wrong_lane,
+            "failed_late": failed_late,
+            "failed_early": failed_early,
+        }
+        update_lane_group(
+            ensure_lane_group(initial_lane_group_stats, int(init_lane)),
+            **group_update,
+        )
+        update_lane_group(
+            ensure_lane_group(goal_lane_group_stats, int(goal_lane_id)),
+            **group_update,
+        )
 
         if independent_episodes:
             final_ep_vid = int(env.unwrapped.config.get("vid", initial_vid))
             generated_vehicle_count += max(final_ep_vid - initial_vid, 0)
 
     n = int(episodes)
-    log("=" * 80)
-    log("Summary by initial lane:")
     lanes_for_summary = int(env_config.get("lanes_count", 3))
-    for lane_id in range(lanes_for_summary):
-        group = lane_group_stats.get(lane_id)
-        if group is None or int(group["episodes"]) == 0:
-            log(f"  lane {lane_id}: no episodes")
-            continue
-
-        n_lane = int(group["episodes"])
-        log("-" * 80)
-        log(f"  lane {lane_id}:")
-        log(f"    episodes              : {n_lane}")
-        log(f"    mean length           : {float(np.mean(group['ep_lens'])):.3f} steps")
-        log(f"    mean high total reward: {float(np.mean(group['high_ep_rets'])):.6f}")
-        log(f"    mean low ext          : {float(np.mean(group['low_ep_ext_rets'])):.6f}")
-        log(f"    mean low intrinsic    : {float(np.mean(group['low_ep_int_rets'])):.6f}")
-        log(f"    mean low total        : {float(np.mean(group['low_ep_total_rets'])):.6f}")
-        log("    mean high reward components (per episode):")
-        for k in reward_keys_high:
-            log(
-                f"      {k:16s}: "
-                f"{format_component_mean(k, group['high_comp_sum'][k], n_lane, group['high_comp_sum_no_collision'].get(k, 0.0), int(group['non_collision_episode_count']))}"
-            )
-        log("    mean low reward components (per interval):")
-        for k in reward_keys_low:
-            log(
-                f"      {k:16s}: "
-                f"{format_component_mean(k, group['low_comp_sum'][k], n_lane, group['low_comp_sum_no_collision'].get(k, 0.0), int(group['non_collision_episode_count']))}"
-            )
-
-        lane_arrive_rate = group["arrived_count"] / n_lane if n_lane else 0.0
-        log(f"    arrival rate          : {lane_arrive_rate * 100:.2f}%")
-        if group["arrived_count"] > 0:
-            log(
-                f"    mean arrival time     : {float(np.mean(group['arrival_times'])):.3f} s "
-                f"(over {int(group['arrived_count'])} success episodes)"
-            )
-        else:
-            log("    mean arrival time     : N/A (no successful episodes)")
-        log_failed_breakdown(
-            "    ",
-            int(group["failed_count"]),
-            int(group["failed_collision_count"]),
-            int(group["failed_wrong_lane_count"]),
-            int(group["failed_late_count"]),
-            int(group["failed_early_count"]),
-        )
+    log_lane_group_summary(
+        "Summary by initial lane:",
+        initial_lane_group_stats,
+        lanes_for_summary,
+    )
+    log_lane_group_summary(
+        "Summary by goal lane:",
+        goal_lane_group_stats,
+        lanes_for_summary,
+    )
 
     log("=" * 80)
     log("Overall summary:")
@@ -1050,9 +1140,10 @@ def run_batch(
     episode_seeds: Optional[Sequence[int]] = None,
     batch_output_dir: str = "./results/hiro_batch",
     shared_env_config_model_dir: Optional[str] = None,
+    use_each_model_env_config: bool = False,
     **eval_kwargs: Any,
 ) -> Dict[str, str]:
-    """Evaluate several model pairs on identical per-episode random conditions."""
+    """Evaluate several model pairs with identical per-episode seeds."""
     if not models:
         raise ValueError("models must contain at least one HIROEvalModel")
     eval_kwargs.pop("independent_episodes", None)
@@ -1073,23 +1164,33 @@ def run_batch(
     os.makedirs(batch_dir, exist_ok=True)
     results: Dict[str, str] = {}
     manifest_models = []
-    shared_env_source = (
-        shared_env_config_model_dir
-        or models[0].config_model_dir
-        or models[0].high_model_dir
-        or models[0].model_dir
-    )
+    shared_env_source = None
+    if not use_each_model_env_config:
+        shared_env_source = (
+            shared_env_config_model_dir
+            or models[0].config_model_dir
+            or models[0].high_model_dir
+            or models[0].model_dir
+        )
 
     for spec in models:
         if spec.name in results:
             raise ValueError(f"Duplicate model name in batch: {spec.name}")
+        if use_each_model_env_config:
+            env_config_source = (
+                spec.config_model_dir
+                or spec.high_model_dir
+                or spec.model_dir
+            )
+        else:
+            env_config_source = shared_env_source
         eval_dir = main(
             model_dir=spec.model_dir,
             high_model_dir=spec.high_model_dir,
             low_model_dir=spec.low_model_dir,
             model_suffix=spec.model_suffix,
             config_model_dir=spec.config_model_dir,
-            env_config_model_dir=shared_env_source,
+            env_config_model_dir=env_config_source,
             episodes=int(episodes),
             episode_seeds=seeds,
             independent_episodes=True,
@@ -1104,6 +1205,7 @@ def run_batch(
                 "low_model_dir": spec.low_model_dir,
                 "model_suffix": spec.model_suffix,
                 "config_model_dir": spec.config_model_dir,
+                "env_config_model_dir": env_config_source,
                 "eval_dir": eval_dir,
             }
         )
@@ -1114,6 +1216,7 @@ def run_batch(
                 "episodes": int(episodes),
                 "episode_seeds": seeds,
                 "shared_env_config_model_dir": shared_env_source,
+                "use_each_model_env_config": use_each_model_env_config,
                 "config_overrides": deepcopy(eval_kwargs.get("config_overrides", {})),
                 "models": manifest_models,
             },
@@ -1125,47 +1228,53 @@ def run_batch(
 
 
 if __name__ == "__main__":
-    main(
-        model_dir="./models",
-        # high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_earlyGreen",
-        # high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_midGreen",
-        # high_model_dir="./models/hiro_260604_highonly_ruleFollow_augObs_SigFeat_newFlowProbs",
-        # high_model_dir="./models/hiro_260607_highonly_ruleFollow_sigFeat_varOffset",
-        # high_model_dir="./models/hiro_260611_ruleFollow_oldEnv_lane2to1_005",
-        high_model_dir="./models/hiro_260611_rule_oldEnv_lane1to2_005",
-        low_model_dir="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10",
-        # model_suffix="step_6400000",
-
-        episodes=30,
-        # record_episodes=[],
-        # record_trajectory_episodes=[],
-        record_episodes=[i for i in range(1, 31)],
-        record_trajectory_episodes=[i for i in range(1, 31)],
+    run_batch(
+        models=[
+            # HIROEvalModel(
+            #     name="oldEnv_lane2to1_randomstart",
+            #     model_dir="./models/hiro_260611_rule_oldEnv_lane2to1_005_randomstart",
+            # ),
+            # HIROEvalModel(
+            #     name="oldEnv_lane2to1_wronglanePen",
+            #     model_dir="./models/hiro_260611_rule_oldEnv_lane2to1_005_wronglanePen",
+            # ),
+            # HIROEvalModel(
+            #     name="lateGreen_lane2to2",
+            #     model_dir="./models/hiro_260613_highonly_lateGreen_2to2",
+            # ),
+            HIROEvalModel(
+                name="lateGreen_lane2to0",
+                model_dir="./models/hiro_260613_highonly_lateGreen_2to0",
+            ),
+        ],
+        episodes=100,
+        record_episodes=[i for i in range(1, 101)],
+        record_trajectory_episodes=[i for i in range(1, 101)],
         # enable_rendering=False,
-
-        scenario_name="multi_lane",
-        # scenario_name="multi_lane_stop_to_int",
-
-        config_overrides={
-            "environment": {
-                # "align_ego_spawn_to_signal_offset": True,
-                # "episode_start_phase_offset": 40.0,
-                # "observation": {
-                #     "append_front_vehicle_features": False,
-                #     # "append_front_vehicle_features": True,
-                # },
-                # "initial_lane_id": 2,
-                # "goal_lane_id": 1,
-            },
-            "hiro": {
-                "use_low_safety_layer": True,
-                "goal_sampler": {
-                    "type": "reachable_uniform",
-                },
-            },
-            "evaluation": {
-                "high_policy_source": "high_model",
-                # "high_policy_source": "goal_sampler",
-            },
-        },
+        # scenario_name="multi_lane",
+        scenario_name="multi_lane_stop_to_int",
+        # shared_env_config_model_dir=(
+        #     "./models/hiro_260611_rule_oldEnv_lane2to1_005_randomstart"
+        # ),
+        # use_each_model_env_config=False,
+        # config_overrides={
+        #     "environment": {
+        #         # Probability configs take precedence over fixed lane IDs.
+        #         "initial_lane_id": 2,
+        #         "initial_lane_probs": None,
+        #         "goal_lane_id": 1,
+        #         # Use one reward definition so total returns are comparable.
+        #         "wrong_lane_terminal_penalty": 0,
+        #     },
+        #     "hiro": {
+        #         "use_low_safety_layer": True,
+        #         "goal_sampler": {
+        #             "type": "reachable_uniform",
+        #         },
+        #     },
+        #     "evaluation": {
+        #         "high_policy_source": "high_model",
+        #         # "high_policy_source": "goal_sampler",
+        #     },
+        # },
     )

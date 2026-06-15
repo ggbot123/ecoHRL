@@ -46,13 +46,25 @@ class RewardComponentsTensorboardCallback(BaseCallback):
             self._ep_len = np.zeros(n_envs, dtype=np.int32)
             self._ep_comp_sums = {}
 
-        # Accumulate rewards
-        self._ep_ret += rewards
-        self._ep_len += 1
+        replay_mask = np.asarray(
+            [
+                not bool(info.get("skip_replay", False))
+                if isinstance(info, dict)
+                else True
+                for info in (infos or [{} for _ in range(n_envs)])
+            ],
+            dtype=bool,
+        )
+
+        # Accumulate only transitions eligible for replay/training.
+        self._ep_ret[replay_mask] += rewards[replay_mask]
+        self._ep_len[replay_mask] += 1
 
         # Accumulate components
         if infos:
             for i, info in enumerate(infos):
+                if not replay_mask[i]:
+                    continue
                 rc = info.get("reward_components", {})
                 for name, val in rc.items():
                     self._ep_comp_sums.setdefault(name, np.zeros(n_envs, dtype=np.float32))[i] += float(val)
@@ -188,6 +200,8 @@ class SACTransitionLoggingCallback(BaseCallback):
 
         for env_i in range(n_envs):
             info = infos[env_i] if env_i < len(infos) and isinstance(infos[env_i], dict) else {}
+            if bool(info.get("skip_replay", False)):
+                continue
             reward_components = info.get("reward_components", {})
             env_diagnostics = info.get("env_diagnostics", {})
             timeout = bool(info.get("TimeLimit.truncated", False))

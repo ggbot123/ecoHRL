@@ -208,7 +208,10 @@ def main(
                 high_interval_rets.append(float(cur_high_interval_ret))
                 low_interval_rets.append(float(cur_low_interval_ret))
                 cur_high_interval_ret, cur_low_interval_ret = 0.0, 0.0
-            runner.step_end(done)
+            runner.step_end(
+                done,
+                queue_takeover_active=bool(info.get("queue_takeover_active", False)),
+            )
             obs = obs_next
 
         n_low_intervals = len(low_interval_rets) or 1

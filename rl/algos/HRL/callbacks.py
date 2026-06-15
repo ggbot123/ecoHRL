@@ -207,6 +207,7 @@ class HIROLoggingCallback(BaseCallback):
                 "signal_time_global",
                 "signal_episode_base",
                 "initial_lane",
+                "goal_lane",
                 "ego_x",
                 "ego_y",
                 "ego_speed",

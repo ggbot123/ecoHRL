@@ -8,6 +8,7 @@ from custom_env import utils
 from custom_env.vehicle.objects import Obstacle, Landmark
 
 from configs.conf import get_env_config
+from scenarios.goal_lane_logic import sample_goal_lane_id
 from scenarios.reward_logic import wrong_lane_terminal_triggered
 from util.config_utils import sync_punctual_time_with_phase_offset
 from util.safety_utils import compute_ego_clear_distance_for_front_vehicle
@@ -233,6 +234,8 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._episodes_started = 0
         self._inter_episode_active = False
         self._inter_episode_remaining = 0.0
+        self._queue_takeover_active = False
+        self._queue_takeover_enter_count = 0
 
     # ----------------- 配置 ----------------- #
     @classmethod
@@ -369,6 +372,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         first_reset = not getattr(self, "_did_global_warmup", False)
         has_previous_episode = int(getattr(self, "_episodes_started", 0)) > 0
         self._episode_initial_lane_id = self._sample_initial_lane_id()
+        self._episode_goal_lane_id = self._sample_goal_lane_id()
         self._inter_episode_active = False
         self._inter_episode_remaining = 0.0
 
@@ -400,6 +404,8 @@ class MultiLaneStopToIntEnv(AbstractEnv):
                 self.controlled_vehicles = []
                 self._clear_virtual_stops()
                 self._clear_background()
+
+        self._update_goal_highlight_regions()
 
         # First episode: align to target offset (may be zero extra wait if already aligned).
         # Later episodes: optionally defer long alignment into inter-episode dummy env.step calls.
@@ -534,6 +540,154 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._episodes_started += 1
         self._update_signal_virtual_stops(query_time=0.0)
 
+    def _nearest_same_lane_front(self):
+        ego = getattr(self, "vehicle", None)
+        if ego is None or not hasattr(self, "road") or self.road is None:
+            return None, None
+        ego_lane = getattr(ego, "lane_index", None)
+        if ego_lane is None or len(ego_lane) < 3:
+            return None, None
+
+        ego_x = float(np.asarray(ego.position, dtype=float)[0])
+        best_vehicle = None
+        best_gap = None
+        for vehicle in self.road.vehicles:
+            if vehicle is ego or any(
+                vehicle is controlled for controlled in self.controlled_vehicles
+            ):
+                continue
+            lane_index = getattr(vehicle, "lane_index", None)
+            if lane_index is None or len(lane_index) < 3:
+                continue
+            if tuple(lane_index[:3]) != tuple(ego_lane[:3]):
+                continue
+            gap = float(np.asarray(vehicle.position, dtype=float)[0]) - ego_x
+            if gap <= 0.0:
+                continue
+            if best_gap is None or gap < best_gap:
+                best_vehicle = vehicle
+                best_gap = gap
+        return best_vehicle, best_gap
+
+    def _queue_takeover_enter_candidate(self) -> bool:
+        if not bool(self.config.get("enable_queue_takeover", False)):
+            return False
+        ego = getattr(self, "vehicle", None)
+        if ego is None:
+            return False
+
+        stop_x = float(self._goal_longitudinal())
+
+        front, front_gap = self._nearest_same_lane_front()
+        if front is None or front_gap is None:
+            return False
+
+        front_x = float(np.asarray(front.position, dtype=float)[0])
+        front_speed = max(float(getattr(front, "speed", 0.0)), 0.0)
+        return bool(
+            front_gap <= float(self.config.get("queue_takeover_front_gap", 30.0))
+            and front_speed <= float(self.config.get("queue_takeover_front_speed", 2.0))
+            and front_x
+            <= stop_x + float(self.config.get("queue_takeover_release_x_margin", 3.0))
+        )
+
+    def _update_queue_takeover_state(self) -> None:
+        if not bool(self.config.get("enable_queue_takeover", False)):
+            self._queue_takeover_active = False
+            self._queue_takeover_enter_count = 0
+            return
+
+        ego = getattr(self, "vehicle", None)
+        if ego is None:
+            return
+        if bool(getattr(self, "_queue_takeover_active", False)):
+            release_x = float(self._goal_longitudinal()) + float(
+                self.config.get("queue_takeover_release_x_margin", 3.0)
+            )
+            if float(np.asarray(ego.position, dtype=float)[0]) >= release_x:
+                self._queue_takeover_active = False
+                self._queue_takeover_enter_count = 0
+            return
+
+        if self._queue_takeover_enter_candidate():
+            self._queue_takeover_enter_count += 1
+        else:
+            self._queue_takeover_enter_count = 0
+        required = max(int(self.config.get("queue_takeover_enter_steps", 3)), 1)
+        if self._queue_takeover_enter_count >= required:
+            self._queue_takeover_active = True
+
+    def get_queue_takeover_active(self) -> bool:
+        return bool(
+            self.config.get("enable_queue_takeover", False)
+            and getattr(self, "_queue_takeover_active", False)
+        )
+
+    def get_queue_takeover_action(self) -> np.ndarray:
+        """Return a lane-keeping IDM-like action for the latched queue phase."""
+        ego = getattr(self, "vehicle", None)
+        if ego is None:
+            return np.zeros(2, dtype=np.float32)
+
+        speed = max(float(getattr(ego, "speed", 0.0)), 0.0)
+        desired_speed = max(
+            float(self.config.get("queue_takeover_desired_speed", 10.0)),
+            1e-3,
+        )
+        max_accel = max(
+            float(self.config.get("queue_takeover_max_accel", 2.0)),
+            1e-3,
+        )
+        comfort_brake = max(
+            float(self.config.get("queue_takeover_comfort_brake", 3.0)),
+            1e-3,
+        )
+        min_gap = max(float(self.config.get("queue_takeover_min_gap", 4.0)), 0.0)
+        time_headway = max(
+            float(self.config.get("queue_takeover_time_headway", 1.2)),
+            0.0,
+        )
+
+        obstacle_gap = None
+        obstacle_speed = 0.0
+        front, front_gap = self._nearest_same_lane_front()
+        if front is not None and front_gap is not None:
+            obstacle_gap = max(float(front_gap), 1e-3)
+            obstacle_speed = max(float(getattr(front, "speed", 0.0)), 0.0)
+
+        signal_is_green, _ = self.get_hiro_signal_features()
+        if signal_is_green < 0.5:
+            stop_gap = float(self._goal_longitudinal()) - float(
+                np.asarray(ego.position, dtype=float)[0]
+            )
+            if stop_gap > 0.0 and (obstacle_gap is None or stop_gap < obstacle_gap):
+                obstacle_gap = max(stop_gap, 1e-3)
+                obstacle_speed = 0.0
+
+        free_road_term = (speed / desired_speed) ** 4
+        interaction_term = 0.0
+        if obstacle_gap is not None:
+            closing_speed = speed - obstacle_speed
+            dynamic_gap = (
+                min_gap
+                + speed * time_headway
+                + speed
+                * closing_speed
+                / (2.0 * np.sqrt(max_accel * comfort_brake))
+            )
+            desired_gap = max(dynamic_gap, min_gap)
+            interaction_term = (desired_gap / obstacle_gap) ** 2
+
+        acc_phys = max_accel * (1.0 - free_road_term - interaction_term)
+        acc_range = self.config.get("action", {}).get(
+            "acceleration_range",
+            [-5.0, 5.0],
+        )
+        acc_min, acc_max = float(acc_range[0]), float(acc_range[1])
+        acc_phys = float(np.clip(acc_phys, acc_min, acc_max))
+        acc_norm = 2.0 * (acc_phys - acc_min) / max(acc_max - acc_min, 1e-6) - 1.0
+        return np.asarray([0.0, np.clip(acc_norm, -1.0, 1.0)], dtype=np.float32)
+
     def _step_inter_episode_dummy(self, action):
         del action
         chunk = min(self._inter_episode_step_seconds(), float(self._inter_episode_remaining))
@@ -556,6 +710,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             "inter_episode": True,
             "skip_replay": True,
             "next_obs_is_dummy": not finished,
+            "queue_takeover_active": False,
             "env_diagnostics": self._env_diagnostics(),
         }
         return obs, 0.0, False, False, info
@@ -650,6 +805,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         # 维持渲染与下一步前的一致信号状态
         self._update_signal_virtual_stops(query_time=self.time)
+        self._update_queue_takeover_state()
 
         # 把“加权后的分项奖励”塞进 info，方便 callback 从 infos 里读
         weighted = getattr(self, "_last_weighted_rewards", None)
@@ -667,6 +823,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             info["inter_episode"] = False
             info["skip_replay"] = False
             info["next_obs_is_dummy"] = bool(next_obs_is_dummy)
+            info["queue_takeover_active"] = self.get_queue_takeover_active()
             info["env_diagnostics"] = self._env_diagnostics()
             if bool(terminated or truncated):
                 info["terminal_signal_features"] = tuple(self.get_hiro_signal_features())
@@ -703,6 +860,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             "punctual_time_window_start": float(punctual_window[0]),
             "punctual_time_window_end": float(punctual_window[1]),
             "initial_lane": int(self._initial_lane_id()),
+            "goal_lane": int(self._goal_lane_id()),
             "ego_x": float(ego_pos[0]),
             "ego_y": float(ego_pos[1]),
             "ego_speed": float(getattr(self.vehicle, "speed", 0.0)),
@@ -718,6 +876,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             "virtual_stop_count": int(len(getattr(self, "_virtual_stops", {}) or {})),
             "signal_is_green": float(signal_is_green),
             "signal_remaining": float(signal_remaining),
+            "queue_takeover_active": float(self.get_queue_takeover_active()),
             "inter_episode_active": float(bool(getattr(self, "_inter_episode_active", False))),
         }
 
@@ -1017,6 +1176,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             longitudinal_reached=longitudinal_reached,
             goal_reached=self._goal_reached(),
             episode_ending=bool(episode_ending),
+            only_at_goal_longitudinal=bool(
+                self.config.get("wrong_lane_penalty_only_at_goal_longitudinal", False)
+            ),
         )
 
     # ----------------- 入口生成环境车（安全间距版） ----------------- #
@@ -1261,6 +1423,8 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._last_longitudinal = longi0
         self._has_arrived = False
         self._arrival_time = None
+        self._queue_takeover_active = False
+        self._queue_takeover_enter_count = 0
 
     def _goal_reached(self) -> bool:
         """在目标车道且 x >= goal_longitudinal（默认路口前）"""
@@ -1437,10 +1601,20 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         return float(cfg.get("goal_longitudinal", default_target))
 
     def _goal_lane_id(self) -> int:
-        cfg = self.config
-        lanes = int(cfg["lanes_count"])
-        lane_id = int(cfg["goal_lane_id"])
-        return int(np.clip(lane_id, 0, lanes - 1))
+        if not hasattr(self, "_episode_goal_lane_id"):
+            self._episode_goal_lane_id = self._sample_goal_lane_id()
+        return int(self._episode_goal_lane_id)
+
+    def _sample_goal_lane_id(self) -> int:
+        return sample_goal_lane_id(
+            self.np_random,
+            goal_lane_id=self.config.get("goal_lane_id", 0),
+            lanes_count=int(self.config["lanes_count"]),
+            goal_lane_probs=self.config.get("goal_lane_probs", None),
+        )
+
+    def get_goal_lane_id(self) -> int:
+        return self._goal_lane_id()
 
     def set_hiro_goal(self, goal_phys: np.ndarray):
         """

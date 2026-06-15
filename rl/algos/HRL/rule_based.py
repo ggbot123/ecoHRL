@@ -1081,7 +1081,13 @@ class RuleBasedAgentWrapper:
         self.n_veh_local = int(obs_cfg.get("vehicles_count_local", obs_cfg.get("vehicles_count", 5)))
         self.feature_names = list(obs_cfg.get("features", ["presence", "x", "y", "vx", "vy", "acceleration"]))
         self.feat_dim = int(len(self.feature_names))
-        self.obs_extra_dim = 2 if bool(obs_cfg.get("append_front_vehicle_features", False)) else 0
+        self.append_front_vehicle_features = bool(
+            obs_cfg.get("append_front_vehicle_features", False)
+        )
+        self.obs_extra_dim = (
+            (2 if self.append_front_vehicle_features else 0)
+            + (1 if bool(obs_cfg.get("append_goal_lane_id", False)) else 0)
+        )
         self.obs_extra_normalize = bool(obs_cfg.get("normalize", False))
         self.front_distance_range = float(obs_cfg.get("front_vehicle_distance_range", 150.0))
         self.front_ttc_range = float(obs_cfg.get("front_vehicle_ttc_range", 30.0))
@@ -1113,7 +1119,7 @@ class RuleBasedAgentWrapper:
         self.goal_dim = 4
 
     def _decode_front_extra(self, extra: np.ndarray) -> tuple[float, float] | None:
-        if self.obs_extra_dim < 2:
+        if not self.append_front_vehicle_features:
             return None
         vals = np.asarray(extra, dtype=np.float32).reshape(-1)
         if vals.size < 2:

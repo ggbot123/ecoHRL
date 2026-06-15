@@ -8,30 +8,7 @@ from typing import Callable, Optional, Union
 import gymnasium as gym
 import numpy as np
 
-
-def _semantic_y_interval(
-    component: int,
-    lane_idx: int,
-    n_lanes: int,
-    dynamic_feasible_intervals: bool,
-) -> tuple[float, float]:
-    """Return the y-code interval for relative [LEFT, KEEP, RIGHT]."""
-    fixed = ((-1.0, -1.0 / 3.0), (-1.0 / 3.0, 1.0 / 3.0), (1.0 / 3.0, 1.0))
-    if not dynamic_feasible_intervals:
-        return fixed[component]
-    if n_lanes <= 1:
-        return (-1.0, 1.0) if component == 1 else fixed[component]
-    if lane_idx == 0:
-        if component == 1:
-            return -1.0, 0.0
-        if component == 2:
-            return 0.0, 1.0
-    if lane_idx == n_lanes - 1:
-        if component == 0:
-            return -1.0, 0.0
-        if component == 1:
-            return 0.0, 1.0
-    return fixed[component]
+from rl.utils.utils import semantic_y_interval
 
 
 @dataclass(frozen=True)
@@ -127,7 +104,7 @@ class ReachableUniformGoalSampler(GoalSampler):
             }.issubset(stats)
             y_intervals = np.asarray(
                 [
-                    _semantic_y_interval(
+                    semantic_y_interval(
                         int(comp),
                         int(lane_idx[obs_idx]),
                         n_lanes,
@@ -260,7 +237,7 @@ class ReachableGaussianGoalSampler(GoalSampler):
                 x_env = float(self._gauss.inv_cdf(p))
                 x_env = float(np.clip(x_env, lo, hi))
 
-            y_low, y_high = _semantic_y_interval(
+            y_low, y_high = semantic_y_interval(
                 k,
                 int(lane_idx[i]),
                 n_lanes,

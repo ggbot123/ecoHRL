@@ -29,6 +29,7 @@ class HighGoalSafeBoundsCalculator:
         dx_low: float = 0.0,
         dx_high: float = 37.5,
         feat_dim: int = 5,
+        n_veh: int | None = None,
         presence_idx: int = 0,
         x_idx: int = 1,
         y_idx: int = 2,
@@ -51,6 +52,7 @@ class HighGoalSafeBoundsCalculator:
         self.dx_high = float(dx_high)
 
         self.feat_dim = int(feat_dim)
+        self.n_veh = None if n_veh is None else int(n_veh)
         self.presence_idx = int(presence_idx)
         self.x_idx = int(x_idx)
         self.y_idx = int(y_idx)
@@ -137,6 +139,18 @@ class HighGoalSafeBoundsCalculator:
         return rear_dx.astype(np.float32), front_dx.astype(np.float32)
 
     def _extract_kinematics(self, high_obs_np: np.ndarray) -> np.ndarray:
+        if self.n_veh is not None:
+            kin_dim = int(self.n_veh * self.feat_dim)
+            kin_flat = np.asarray(
+                high_obs_np[:, 1 : 1 + kin_dim],
+                dtype=np.float32,
+            )
+            if kin_flat.shape[1] != kin_dim:
+                raise ValueError(
+                    f"high_obs has {kin_flat.shape[1]} kinematics values, expected {kin_dim}"
+                )
+            return kin_flat.reshape(high_obs_np.shape[0], self.n_veh, self.feat_dim)
+
         kin_flat = np.asarray(high_obs_np[:, 1:], dtype=np.float32)
         total_dim = int(kin_flat.shape[1])
         if total_dim % self.feat_dim != 0:

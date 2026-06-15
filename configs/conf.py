@@ -154,6 +154,9 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
         "include_time": True,
         "time_range": [0.0, 50.0],
         "append_front_vehicle_features": True,
+        # Appends the current episode goal lane ID to SAC observations and the
+        # HIRO high-level observation. Forced on when goal_lane_id="random".
+        "append_goal_lane_id": False,
         "front_vehicle_distance_range": 150.0,
         "front_vehicle_ttc_range": 30.0,
     },
@@ -166,11 +169,13 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     # Task / goal
     "goal_longitudinal": 400.0,
     "goal_lane_id": 2,
+    # Optional per-lane goal sampling probabilities, normalized automatically.
+    "goal_lane_probs": None,
     "punctual_time_window": [30.0, 40.0],
     "punctual_time_target": 35.0,
     "punctual_reward": 10.0,
-    # "wrong_lane_terminal_penalty": -5.0,
     "wrong_lane_terminal_penalty": 0,
+    "wrong_lane_penalty_only_at_goal_longitudinal": False,
 
     # Termination
     "offroad_terminal": False,
@@ -197,6 +202,19 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     "rule_follow_release_ttc": 4.0,
     "rule_follow_max_acc": 0.0,
     "rule_follow_reset_on_high_interval": True,
+
+    # Optional environment-owned queue controller. Scenarios that enable it
+    # may take over after ego has joined a stopped signal queue.
+    "enable_queue_takeover": False,
+    "queue_takeover_front_speed": 2.0,
+    "queue_takeover_front_gap": 30.0,
+    "queue_takeover_enter_steps": 3,
+    "queue_takeover_release_x_margin": 3.0,
+    "queue_takeover_desired_speed": 10.0,
+    "queue_takeover_max_accel": 2.0,
+    "queue_takeover_comfort_brake": 3.0,
+    "queue_takeover_min_gap": 4.0,
+    "queue_takeover_time_headway": 1.2,
 
     # SAC can optionally reuse HIRO low-safety-filter lane-change constraints.
     "enable_sac_low_safety_filter": True,
@@ -250,6 +268,7 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
             },
             "background_vehicle_respect_movement_lanes": False,
             "enable_signal_virtual_stops": True,
+            "enable_queue_takeover": True,
             "spawn_check_adjacent_cutins": True,
             "spawn_adjacent_cutin_front_gap": 15.0,
             "spawn_adjacent_cutin_back_gap": 5.0,
@@ -371,7 +390,6 @@ _HIRO_CONFIG: Dict[str, Any] = {
 
     "low_level_type": "rule_based",
     # "low_level_type": "sac",
-    # "low_sac_impl": "sac",
 
     # "low_use_her": False,
     "low_use_her": True,
@@ -436,63 +454,85 @@ TRAIN_CONFIG: Dict[str, Any] = {
     # "algo": "sac",
     "log_root": "./logs/current",
     "save_root": "./models",
-    "total_timesteps": 5_000_000,
-    # "total_timesteps": 10_000_000,
+    # "total_timesteps": 5_000_000,
+    "total_timesteps": 10_000_000,
     "eval_freq": 10_000,
     "save_freq": 50_000,
     "n_envs": 8,
     "render": False,
 
-    # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_earlyGreen",
-    # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_midGreen",
-    # "run_name": "hiro_260612_highonly_ruleFollow_sigFeat_lateGreen_wronglanePen",
-    # "run_name": "hiro_260612_highonly_ruleFollow_sigFeat_lateGreen_wronglanePen_dynaLane",
-    # "run_name": "sac_260612_withPrior_oldEnv_randomto2_wronglanePen",
+    # "run_name": "hiro_260612_highonly_earlyGreen_wronglanePen_queue",
+    # "run_name": "hiro_260612_highonly_midGreen_wronglanePen_queue",
+    # "run_name": "hiro_260612_highonly_lateGreen_wronglanePen_queue",
+    # "run_name": "hiro_260614_highonly_lateGreen_2toRandom",
+    # "run_name": "sac_260613_withPrior_oldEnv_randomto2_wronglanePen_1e7",
     # "run_name": "hiro_260607_highonly_ruleFollow_sigFeat_varOffset",
-    # "run_name": "hiro_260608_sac_base_oldEnv_fixTimeout",
-    # "run_name": "hiro_260608_sac_base_oldEnv_fixTimeout_fixGamma",
-    # "run_name": "hiro_260608_sac_withPrior_oldEnv_fixTimeout",
-    # "run_name": "hiro_260608_sac_withPrior_oldEnv_fixTimeout_fixGamma",
     # "run_name": "hiro_260611_rule_oldEnv_lane2to1_005_wronglanePen",
-    "run_name": "hiro_260611_rule_oldEnv_lane2to1_005_randomstart",
+    # "run_name": "hiro_260611_rule_oldEnv_lane2to1_005_randomstart",
+    # "run_name": "sac_260615_withPrior_lateGreen_2to2",
+    # "run_name": "sac_260615_withPrior_lateGreen_2to0",
+    "run_name": "hiro_260615_highonly_lateGreen_2to1_newFlowProb",
+    # "run_name": "hiro_260615_highonly_midGreen_2to2",
+    # "run_name": "hiro_260615_highonly_midGreen_2to0",
+
 
     # "run_name": "hiro_260611_lowonly_noSigFeat_varOffset_fixedHER",
+    # "run_name": "hiro_260612_lowonly_noSigFeat_varOffset_fixedHER_queue_randomstart",
     # "run_name": "hiro_260611_lowonly_noSigFeat_lateGreen_noHER",
 
 
-    "scenario_name": "multi_lane",
-    # "scenario_name": "multi_lane_stop_to_int",
+    # "scenario_name": "multi_lane",
+    "scenario_name": "multi_lane_stop_to_int",
 
     # Train-time env overrides. Keep empty unless you want to override scenario defaults.
     "env_overrides": {
         "rule_based_compute_action_mode": "goal_x_accel_follow",
         # "rule_based_compute_action_mode": "goal_x_accel",
         "observation": {
-            "append_front_vehicle_features": False,
-            # "append_front_vehicle_features": True,
+            # "append_front_vehicle_features": False,
+            "append_front_vehicle_features": True,
         },
-        "initial_lane_probs": [0.0, 0.3, 0.7],
-        # "initial_lane_id": 2,
+        # "initial_lane_probs": [0.0, 0.3, 0.7],
+        # "spawn_probability": 0.05,
+        # "spawn_probability": 0.07,
+        # "initial_lane_id": "random",
+        "initial_lane_id": 2,
+        # "goal_lane_id": 0,
         "goal_lane_id": 1,
-        "spawn_probability": 0.05,
-        # # "spawn_probability": 0.07,
+        # "goal_lane_id": 2,
+        # "goal_lane_id": "random",
+        # "goal_lane_probs": [1.0, 1.0, 1.0],
+        # "behavior_lane_probs": [
+        #     [0.4, 0.3, 0.3],
+        #     [0.6, 0.3, 0.1],
+        #     [0.6, 0.3, 0.1],
+        # ],
         "behavior_lane_probs": [
             [0.6, 0.3, 0.1],
-            [0.4, 0.3, 0.3],
             [0.6, 0.3, 0.1],
+            [0.4, 0.3, 0.3],
         ],
-        # "align_ego_spawn_to_signal_offset": True,
-        # # "align_ego_spawn_to_signal_offset": False,
-        # "episode_start_phase_offset": 20.0,   # late green pass
-        # # "episode_start_phase_offset": 90.0,     # mid green pass
-        # # "episode_start_phase_offset": 40.0,     # early green pass
+        # "behavior_lane_probs": [
+        #     [0.4, 0.3, 0.3],
+        #     [0.6, 0.3, 0.1],
+        #     [0.4, 0.3, 0.3],
+        # ],
+
+        "align_ego_spawn_to_signal_offset": True,
+        # "align_ego_spawn_to_signal_offset": False,
+        # "inter_episode_as_steps": False,
+        "episode_start_phase_offset": 20.0,   # late green pass
+        # "episode_start_phase_offset": 90.0,     # mid green pass
+        # "episode_start_phase_offset": 40.0,     # early green pass
         # "wrong_lane_terminal_penalty": -5.0,
+        # "wrong_lane_penalty_only_at_goal_longitudinal": True,
+        "enable_queue_takeover": False,
     },
 
     # SAC-specific env overrides used only when algo="sac".
     "sac_env_overrides": {
         "speed_ref_aux_reward": 0.1,
-        "inter_episode_as_steps": False,
+        "inter_episode_as_steps": True,
     },
     "sac_transition_csv_episode_freq": 1,
     "sac_transition_csv_envs": "env0",
@@ -502,10 +542,9 @@ TRAIN_CONFIG: Dict[str, Any] = {
     "hiro_low_pretrained_path": None,
     "hiro_low_target_entropy": "auto",
     "hiro_low_target_entropy_scale": 1,
-    "hiro_low_sac_impl": None,
 
     # HIRO debug CSV switches.
-    "hiro_high_transition_csv_all": True,
+    "hiro_high_transition_csv_all": False,
     "hiro_high_transition_csv_envs": "all",
     "hiro_low_transition_detail_csv": False,
     "hiro_low_transition_detail_envs": "env0",

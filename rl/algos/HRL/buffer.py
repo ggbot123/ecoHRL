@@ -34,6 +34,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
 
     # Keys used in infos dict passed to ReplayBuffer.add()
     _INFO_KEY_SEQ_LEN = "high_interval_len"
+    _INFO_KEY_DISCOUNT = "high_transition_discount"
     _INFO_KEY_LOW_OBS_SEQ = "opc_low_obs_seq"
     _INFO_KEY_ACT_SEQ = "opc_low_act_seq"
 
@@ -99,6 +100,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
         self._debug_global_step = np.full((self.buffer_size,), -1, dtype=np.int64)
         self._debug_segment_id = np.full((self.buffer_size,), -1, dtype=np.int64)
         self._debug_interval_len = np.zeros((self.buffer_size,), dtype=np.int32)
+        self._transition_discounts = np.ones((self.buffer_size,), dtype=np.float32)
         self._debug_comp_names = [
             "collision_reward",
             "progress_reward",
@@ -148,6 +150,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
 
         # Extras are provided through infos[0]
         info = infos[0] if isinstance(infos, list) and len(infos) > 0 else {}
+        self._transition_discounts[pos] = float(info.get(self._INFO_KEY_DISCOUNT, 1.0))
         self._store_debug_info(pos, info)
         seq_len = int(info.get(self._INFO_KEY_SEQ_LEN, 0))
         seq_len = max(0, min(seq_len, self.max_seq_len))
@@ -374,10 +377,20 @@ class HiROHighReplayBuffer(ReplayBuffer):
         upper_bound = self.buffer_size if self.full else self.pos
         batch_inds = self.rng.integers(0, upper_bound, size=batch_size)
         samples = self._get_samples(batch_inds, env=env)
+        discounts = self.to_torch(
+            self._transition_discounts[batch_inds].reshape(-1, 1)
+        )
 
         if not self.enable_off_policy_correction:
             self.last_sample_debug = self._build_sample_debug(batch_inds, samples.actions, samples.actions)
-            return samples
+            return ReplayBufferSamples(
+                observations=samples.observations,
+                actions=samples.actions,
+                next_observations=samples.next_observations,
+                dones=samples.dones,
+                rewards=samples.rewards,
+                discounts=discounts,
+            )
 
         corrected_actions = self._apply_off_policy_correction(batch_inds, samples)
         self.last_sample_debug = self._build_sample_debug(batch_inds, samples.actions, corrected_actions)
@@ -388,4 +401,5 @@ class HiROHighReplayBuffer(ReplayBuffer):
             next_observations=samples.next_observations,
             dones=samples.dones,
             rewards=samples.rewards,
+            discounts=discounts,
         )

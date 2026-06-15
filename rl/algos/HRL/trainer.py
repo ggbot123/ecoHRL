@@ -150,22 +150,21 @@ def train_hiro(
     )
 
     high_sac_kwargs = dict(high_sac_kwargs)
-    rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
-    q_debug_cfg = high_sac_kwargs.get("q_replay_debug", {}) or {}
-    q_debug_enabled = bool(q_debug_cfg.get("enabled", False)) if isinstance(q_debug_cfg, dict) else False
+    if train_mode == "low_only":
+        # The high agent is construction-only in this mode; goals come from the
+        # configured sampler, so a full high replay buffer only wastes memory.
+        high_sac_kwargs["buffer_size"] = 1
+        q_debug_cfg = dict(high_sac_kwargs.get("q_replay_debug", {}) or {})
+        q_debug_cfg["enabled"] = False
+        high_sac_kwargs["q_replay_debug"] = q_debug_cfg
 
-    if opc_enabled or q_debug_enabled:
-        high_sac_kwargs["replay_buffer_class"] = HiROHighReplayBuffer
-        rb_kwargs["enable_off_policy_correction"] = bool(opc_enabled)
-        high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
-    else:
-        high_sac_kwargs.pop("replay_buffer_class", None)
-        for k in ("n_candidates", "noise_std", "enable_off_policy_correction"):
-            rb_kwargs.pop(k, None)
-        if rb_kwargs:
-            high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
-        else:
-            high_sac_kwargs.pop("replay_buffer_kwargs", None)
+    rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
+
+    # High-level transitions may span multiple standard high intervals during
+    # queue takeover. The custom buffer carries gamma**interval_count.
+    high_sac_kwargs["replay_buffer_class"] = HiROHighReplayBuffer
+    rb_kwargs["enable_off_policy_correction"] = bool(opc_enabled)
+    high_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs
 
     low_debug_config = {
         "her_debug_enabled": int(low_her_debug_csv_interval_steps) > 0,

@@ -48,6 +48,16 @@ def sync_lane_slot_observation_switch(cfg: Dict[str, Any]) -> None:
     obs_cfg["include_obstacles"] = False
 
 
+def sync_goal_lane_observation_switch(cfg: Dict[str, Any]) -> None:
+    """Expose the episode goal lane whenever random goals are configured."""
+    obs_cfg = cfg.setdefault("observation", {})
+    goal_lane = cfg.get("goal_lane_id", None)
+    if isinstance(goal_lane, str) and goal_lane.strip().lower() == "random":
+        obs_cfg["append_goal_lane_id"] = True
+    else:
+        obs_cfg.setdefault("append_goal_lane_id", False)
+
+
 def sync_punctual_time_with_phase_offset(
     cfg: Dict[str, Any],
     phase_offset: float | None = None,
@@ -121,6 +131,7 @@ def build_env_config(
         deep_update(cfg, overrides)
     sync_observation_with_comfort_switch(cfg)
     sync_lane_slot_observation_switch(cfg)
+    sync_goal_lane_observation_switch(cfg)
     sync_punctual_time_with_phase_offset(cfg)
     return cfg
 

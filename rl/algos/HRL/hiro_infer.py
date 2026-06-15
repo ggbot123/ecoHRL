@@ -60,6 +60,8 @@ class HIROPolicyRunner:
         self.high_goal_safe_bounds: Optional[HighGoalSafeBoundsCalculator] = None
         self.punctual_time_target = 0.0
         self.goal_longitudinal_default = 0.0
+        self.queue_takeover_enabled = False
+        self._last_action_queue_takeover = False
 
     def init_from_env(self, env, obs0: np.ndarray, intrinsic_coef: float):
         keep = ("x", "y", "vx", "vy")
@@ -73,6 +75,7 @@ class HIROPolicyRunner:
         cfg = getattr(env.unwrapped, "config", getattr(env, "config", {}))
         self.punctual_time_target = float(cfg.get("punctual_time_target", cfg.get("duration", 0.0)))
         self.goal_longitudinal_default = float(cfg.get("goal_longitudinal", cfg.get("road_length", 0.0)))
+        self.queue_takeover_enabled = bool(cfg.get("enable_queue_takeover", False))
         lanes, lane_w = int(cfg["lanes_count"]), float(cfg.get("lane_width", 4.0))
         self.lane_center_ys = (np.arange(lanes, dtype=np.float32) * lane_w).astype(np.float32)
         self.dt = 1.0 / float(cfg.get("policy_frequency", 10.0))
@@ -144,6 +147,7 @@ class HIROPolicyRunner:
             dx_low=float(dx_low),
             dx_high=float(dx_high),
             feat_dim=int(self.feat_dim),
+            n_veh=int(self.n_veh),
             presence_idx=int(_idx("presence", 0)),
             x_idx=int(self.idx_x),
             y_idx=int(self.idx_y),
@@ -193,6 +197,7 @@ class HIROPolicyRunner:
         if not self._inited:
             self.init_from_env(env, obs0, intrinsic_coef)
         self.need_high, self.c = True, 0
+        self._last_action_queue_takeover = False
 
     def _split(self, obs: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         arr = np.asarray(obs, dtype=np.float32)
@@ -290,6 +295,20 @@ class HIROPolicyRunner:
                 return float(self.punctual_time_target)
         return float(self.punctual_time_target)
 
+    def _queue_takeover_active(self, env) -> bool:
+        if not self.queue_takeover_enabled or env is None:
+            return False
+        base = getattr(env, "unwrapped", env)
+        fn = getattr(base, "get_queue_takeover_active", None)
+        return bool(fn()) if callable(fn) else False
+
+    def _queue_takeover_action(self, env) -> np.ndarray:
+        base = getattr(env, "unwrapped", env)
+        fn = getattr(base, "get_queue_takeover_action", None)
+        if not callable(fn):
+            raise RuntimeError("Queue takeover is active but the environment has no controller action")
+        return np.asarray(fn(), dtype=np.float32).reshape(-1)
+
     def _build_high_obs(self, obs: np.ndarray, env=None) -> np.ndarray:
         arr = np.asarray(obs, dtype=np.float32).reshape(1, -1)
         punctual_target = self._get_punctual_time_target(env)
@@ -303,6 +322,7 @@ class HIROPolicyRunner:
         return np.concatenate([t_remaining, kin_flat, extra, signal], axis=1).astype(np.float32)
 
     def act(self, env, obs: np.ndarray) -> np.ndarray:
+        self._last_action_queue_takeover = False
         _, kin, kin_flat = self._split(obs)
         if self.need_high:
             self._sample_goal(obs, kin, env)
@@ -327,6 +347,13 @@ class HIROPolicyRunner:
                 local_kin_flat[idx_x] = 0.0
                 local_kin_flat[idx_y] = 0.0
         low_obs = np.concatenate([t_norm, local_kin_flat, extra, goal_rel]).astype(np.float32)
+
+        if self._queue_takeover_active(env):
+            action = self._queue_takeover_action(env)
+            self._last_action_queue_takeover = True
+            self.last_action_pre_safety = action.copy()
+            self.last_action_post_safety = action.copy()
+            return action
 
         if low_level_type == "rule_based":
             if self.rule_based_agent is None:
@@ -377,7 +404,9 @@ class HIROPolicyRunner:
         r, _, _ = utils.intrinsic_reward_l2(ego_rel[None, :], goal_rel[None, :], self.norm_ranges, self.intrinsic_coef, self.weights)
         return float(np.asarray(r, dtype=np.float32).reshape(-1)[0])
 
-    def step_end(self, done: bool):
-        self.c += 1
-        if done or self.c >= self.hi:
+    def step_end(self, done: bool, queue_takeover_active: bool = False):
+        queue_released = self._last_action_queue_takeover and not queue_takeover_active
+        if not queue_takeover_active:
+            self.c += 1
+        if done or queue_released or (not queue_takeover_active and self.c >= self.hi):
             self.need_high, self.c = True, 0

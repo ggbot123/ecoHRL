@@ -108,7 +108,25 @@ def _fill_missing_dataclass_defaults(
 
 
 def _hiro_config_from_mapping(saved: Mapping[str, Any]) -> HIROConfig:
-    kwargs = _fill_missing_dataclass_defaults(saved, HIROConfig, "HIRO config")
+    saved_compat = deepcopy(dict(saved))
+    deprecated_fields = {
+        name: saved_compat.pop(name)
+        for name in ("low_sac_impl",)
+        if name in saved_compat
+    }
+    if deprecated_fields:
+        warnings.warn(
+            "HIRO config contains deprecated fields that are no longer used; "
+            f"ignoring: {sorted(deprecated_fields)}",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    kwargs = _fill_missing_dataclass_defaults(
+        saved_compat,
+        HIROConfig,
+        "HIRO config",
+    )
     goal_sampler = kwargs.get("goal_sampler")
     low_safety_filter = kwargs.get("low_safety_filter")
     if not isinstance(goal_sampler, Mapping):

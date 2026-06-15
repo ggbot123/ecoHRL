@@ -7,6 +7,7 @@ from custom_env import utils
 from custom_env.vehicle.objects import Obstacle, Landmark
 
 from configs.conf import get_env_config
+from scenarios.goal_lane_logic import sample_goal_lane_id
 from scenarios.reward_logic import wrong_lane_terminal_triggered
 from util.safety_utils import compute_ego_clear_distance_for_front_vehicle
 
@@ -85,6 +86,7 @@ class MultiLaneEnv(AbstractEnv):
         """
         # 每次都重置交通流，用于测试，以保证各个episode之间独立
         self._episode_initial_lane_id = self._sample_initial_lane_id()
+        self._episode_goal_lane_id = self._sample_goal_lane_id()
 
         if self.config["warmup_each_episode"] is True:
             self._create_road()
@@ -194,6 +196,7 @@ class MultiLaneEnv(AbstractEnv):
         return {
             "time": float(getattr(self, "time", 0.0)),
             "initial_lane": int(self._initial_lane_id()),
+            "goal_lane": int(self._goal_lane_id()),
             "ego_x": float(ego_pos[0]),
             "ego_y": float(ego_pos[1]),
             "ego_speed": float(getattr(self.vehicle, "speed", 0.0)),
@@ -363,6 +366,9 @@ class MultiLaneEnv(AbstractEnv):
             longitudinal_reached=longitudinal_reached,
             goal_reached=self._goal_reached(),
             episode_ending=bool(episode_ending),
+            only_at_goal_longitudinal=bool(
+                self.config.get("wrong_lane_penalty_only_at_goal_longitudinal", False)
+            ),
         )
 
     # ----------------- 入口生成环境车（安全间距版） ----------------- #
@@ -558,6 +564,22 @@ class MultiLaneEnv(AbstractEnv):
             self._episode_initial_lane_id = self._sample_initial_lane_id()
         return int(self._episode_initial_lane_id)
 
+    def _sample_goal_lane_id(self) -> int:
+        return sample_goal_lane_id(
+            self.np_random,
+            goal_lane_id=self.config.get("goal_lane_id", 0),
+            lanes_count=int(self.config["lanes_count"]),
+            goal_lane_probs=self.config.get("goal_lane_probs", None),
+        )
+
+    def _goal_lane_id(self) -> int:
+        if not hasattr(self, "_episode_goal_lane_id"):
+            self._episode_goal_lane_id = self._sample_goal_lane_id()
+        return int(self._episode_goal_lane_id)
+
+    def get_goal_lane_id(self) -> int:
+        return self._goal_lane_id()
+
     def _create_ego(self):
         cfg = self.config
         lane_id = self._initial_lane_id()
@@ -610,7 +632,7 @@ class MultiLaneEnv(AbstractEnv):
 
     def _goal_reached(self) -> bool:
         """在目标车道且 x >= goal_longitudinal"""
-        if self.vehicle.lane_index[2] != int(self.config["goal_lane_id"]):
+        if self.vehicle.lane_index[2] != self._goal_lane_id():
             return False
         return self._goal_longitudinal_reached()
     

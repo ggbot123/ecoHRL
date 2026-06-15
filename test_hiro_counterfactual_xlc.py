@@ -398,7 +398,10 @@ def _run_episode(
             done = bool(terminated or truncated)
             last_interval_step = bool(done or runner.c == runner.hi - 1)
             steps += 1
-            runner.step_end(done)
+            runner.step_end(
+                done,
+                queue_takeover_active=bool(info.get("queue_takeover_active", False)),
+            )
             obs = obs_next
             if step_callback is not None:
                 step_callback(

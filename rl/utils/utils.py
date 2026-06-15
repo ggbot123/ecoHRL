@@ -5,6 +5,42 @@ from typing import Sequence, List, Tuple
 import numpy as np
 
 
+def semantic_y_interval(
+    component: int,
+    lane_idx: int,
+    n_lanes: int,
+    dynamic_feasible_intervals: bool = False,
+) -> tuple[float, float]:
+    """Return the y-code interval for relative [LEFT, KEEP, RIGHT]."""
+    component = int(component)
+    if component not in (0, 1, 2):
+        raise ValueError(f"component must be 0, 1, or 2, got {component}")
+
+    fixed = (
+        (-1.0, -1.0 / 3.0),
+        (-1.0 / 3.0, 1.0 / 3.0),
+        (1.0 / 3.0, 1.0),
+    )
+    if not dynamic_feasible_intervals:
+        return fixed[component]
+
+    n_lanes = max(int(n_lanes), 1)
+    lane_idx = int(np.clip(int(lane_idx), 0, n_lanes - 1))
+    if n_lanes == 1:
+        return (-1.0, 1.0) if component == 1 else fixed[component]
+    if lane_idx == 0:
+        if component == 1:
+            return -1.0, 0.0
+        if component == 2:
+            return 0.0, 1.0
+    if lane_idx == n_lanes - 1:
+        if component == 0:
+            return -1.0, 0.0
+        if component == 1:
+            return 0.0, 1.0
+    return fixed[component]
+
+
 def init_kinematics_meta(
     env,
     obs_flat: np.ndarray,
