@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from stable_baselines3.common.buffers import ReplayBuffer
 
-from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
+from configs.builders import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 from rl.algos.sac.sac import SAC
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.HRL.goal_samplers import UniformGoalSampler
@@ -36,10 +36,10 @@ from util.hiro_low_batch_utils import run_batch_random_neighbors_acc_eval
 
 
 class _DummyHigh:
-    """占位高层模型，避免低层测试时强制依赖高层模型。"""
+    """占位高层模型，避免低层测试时强制依赖高层模型�?""
 
     def predict(self, obs: np.ndarray, deterministic: bool = True):
-        # HIRO high action 维度通常为 3：[dx, y_code, vx]
+        # HIRO high action 维度通常�?3：[dx, y_code, vx]
         return np.zeros((1, 3), dtype=np.float32), None
 
 
@@ -186,7 +186,7 @@ def run_mpc_theoretical_optimal(
     fig.savefig(speed_fig, dpi=150)
     plt.close(fig)
 
-    # 2) 加速度曲线（物理 + 归一化）
+    # 2) 加速度曲线（物�?+ 归一化）
     acc_fig = os.path.join(out_dir, "mpc_acc_curve.png")
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(t, acc_phys[:n_steps], linewidth=1.6, label="acc_phys (m/s^2)")
@@ -204,7 +204,7 @@ def run_mpc_theoretical_optimal(
     fig.savefig(acc_fig, dpi=150)
     plt.close(fig)
 
-    # 3) 换道曲线（lane_scalar + lane_id）
+    # 3) 换道曲线（lane_scalar + lane_id�?
     lane_fig = os.path.join(out_dir, "mpc_lane_change_curve.png")
     fig, ax1 = plt.subplots(figsize=(8, 3))
     ax1.plot(t, lane_scalar, color="tab:blue", linewidth=1.6, label="lane_scalar")
@@ -254,7 +254,7 @@ def run_mpc_theoretical_optimal(
     fig.savefig(lane_fig, dpi=150)
     plt.close(fig)
 
-    print("MPC low-level 理论最优解结果：")
+    print("MPC low-level 理论最优解结果�?)
     print(f"  success         : {summary['success']}")
     print(f"  message         : {summary['message']}")
     print(f"  horizon         : {summary['horizon']}")
@@ -375,13 +375,13 @@ def run_uniform_goal_trials(
     summary_path = os.path.join(out_dir, "goal_trials_summary.png")
     save_goal_metric_summary(env, goals_phys, metrics, summary_path, metric_name=metric_name)
 
-    # 打印 goal_phys 的 y 分布（0/4/8）
+    # 打印 goal_phys �?y 分布�?/4/8�?
     y_counts = {0.0: 0, 4.0: 0, 8.0: 0}
     for g in goals_phys:
         if g is None or len(g) < 2:
             continue
         y = float(g[1])
-        # 允许微小数值误差，按最近值归类
+        # 允许微小数值误差，按最近值归�?
         closest = min(y_counts.keys(), key=lambda v: abs(y - v))
         if abs(y - closest) <= 1e-3:
             y_counts[closest] += 1
@@ -480,7 +480,7 @@ def run_mpc_action_sequence_evaluation(
             writer.writeheader()
             writer.writerows(trajectory_rows)
 
-    print("MPC 动作序列评估结果：")
+    print("MPC 动作序列评估结果�?)
     print(f"  success         : {summary['success']}")
     print(f"  message         : {summary['message']}")
     print(f"  horizon         : {summary['horizon']}")
@@ -636,10 +636,10 @@ def main(
     n_local = int(env_config.get("observation", {}).get("vehicles_count_local", 1))
     if len(neighbors_state) > max(0, n_local - 1):
         raise ValueError(
-            f"neighbors_state 数量 ({len(neighbors_state)}) 超过 vehicles_count_local-1 ({max(0, n_local - 1)})。"
+            f"neighbors_state 数量 ({len(neighbors_state)}) 超过 vehicles_count_local-1 ({max(0, n_local - 1)})�?
         )
     if len(goal_phys) < 4:
-        raise ValueError("goal_phys 需要至少包含 [x, y, vx, vy] 四个元素。")
+        raise ValueError("goal_phys 需要至少包�?[x, y, vx, vy] 四个元素�?)
     env = gym.make(env_id, render_mode=None, config=env_config)
 
     obs0, _ = env.reset(seed=seed)
@@ -668,7 +668,7 @@ def main(
     goal_phys_arr = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
     runner.goal_phys = goal_phys_arr.copy()
 
-    # 初始化 ego_start，用于可视化范围框
+    # 初始�?ego_start，用于可视化范围�?
     _, kin0, _ = runner._split(obs0)
     runner.ego_start = runner._ego_sub(kin0).copy()
     runner.need_high = False
@@ -803,7 +803,7 @@ def main(
 
     if bool(run_mpc_optimal) or (mpc_eval_actions_cont is not None):
 
-        # 重新设置一次环境状态，确保后续 RL rollout 从同一起点开始
+        # 重新设置一次环境状态，确保后续 RL rollout 从同一起点开�?
         base_env, ego, neighbors = setup_env_with_state(env, ego_state, neighbors_state)
         obs0 = base_env.observation_type.observe()
         runner.init_from_env(env, obs0, float(getattr(get_hiro_config(), "intrinsic_coef", 1.0)))
@@ -973,7 +973,7 @@ def main(
 
         obs = obs_next
 
-    # 保存三组对比曲线：RL 输出 / Safety Layer 上界 / MPC 最优
+    # 保存三组对比曲线：RL 输出 / Safety Layer 上界 / MPC 最�?
     mpc_speed_curve = np.asarray([], dtype=np.float32)
     mpc_acc_curve = np.asarray([], dtype=np.float32)
     mpc_lane_curve = np.asarray([], dtype=np.float32)
@@ -1143,14 +1143,14 @@ def main(
 
 
 if __name__ == "__main__":
-    # 用法示例：
+    # 用法示例�?
     # 1) 指定低层模型路径
-    # 2) 指定 ego + 观测车辆初始状态（x, y, vx, vy）
-    # 3) 指定 goal_phys（x, y, vx, vy）
-    # 4) 若需要批量测试，可传 batch_cases_csv（列支持：
-    #    - ego_state / neighbors_state / goal_phys 三列，值为列表字符串；或
-    #    - ego_x,ego_y,ego_vx,ego_vy + goal_x,goal_y,goal_vx,goal_vy + neighbors_state(可选)
-    #    - 可选 case_id 列作为输出目录名）
+    # 2) 指定 ego + 观测车辆初始状态（x, y, vx, vy�?
+    # 3) 指定 goal_phys（x, y, vx, vy�?
+    # 4) 若需要批量测试，可传 batch_cases_csv（列支持�?
+    #    - ego_state / neighbors_state / goal_phys 三列，值为列表字符串；�?
+    #    - ego_x,ego_y,ego_vx,ego_vy + goal_x,goal_y,goal_vx,goal_vy + neighbors_state(可�?
+    #    - 可�?case_id 列作为输出目录名�?
 
     main(
         low_model_path="./models/hiro_260416_lowonly_reUni_amax3_dmin15_10_newEnv/hiro_low_final.zip",

@@ -173,6 +173,7 @@ class KinematicObservation(ObservationType):
         time_range: list[float] | None = None,
         append_front_vehicle_features: bool = False,
         append_goal_lane_id: bool = False,
+        goal_lane_feature_encoding: str = "scalar",
         front_vehicle_distance_range: float = 150.0,
         front_vehicle_ttc_range: float = 30.0,
         **kwargs: dict,
@@ -204,14 +205,21 @@ class KinematicObservation(ObservationType):
         self.time_range = time_range
         self.append_front_vehicle_features = bool(append_front_vehicle_features)
         self.append_goal_lane_id = bool(append_goal_lane_id)
+        self.goal_lane_feature_encoding = str(goal_lane_feature_encoding).lower().strip()
         self.front_vehicle_distance_range = float(front_vehicle_distance_range)
         self.front_vehicle_ttc_range = float(front_vehicle_ttc_range)
 
     @property
     def extra_features_dim(self) -> int:
+        goal_lane_dim = 0
+        if self.append_goal_lane_id:
+            if self.goal_lane_feature_encoding in {"one_hot", "onehot"}:
+                goal_lane_dim = max(int(self.env.config.get("lanes_count", 1)), 1)
+            else:
+                goal_lane_dim = 1
         return (
             (2 if self.append_front_vehicle_features else 0)
-            + (1 if self.append_goal_lane_id else 0)
+            + goal_lane_dim
         )
 
     def space(self) -> spaces.Space:
@@ -305,8 +313,13 @@ class KinematicObservation(ObservationType):
             lane_id = float(getter())
         else:
             lane_id = float(self.env.config.get("goal_lane_id", 0))
+        lanes = max(int(self.env.config.get("lanes_count", 1)), 1)
+        if self.goal_lane_feature_encoding in {"one_hot", "onehot"}:
+            out = np.zeros(lanes, dtype=np.float32)
+            idx = int(np.clip(int(round(lane_id)), 0, lanes - 1))
+            out[idx] = 1.0
+            return out
         if self.normalize:
-            lanes = max(int(self.env.config.get("lanes_count", 1)), 1)
             lane_id = utils.lmap(
                 lane_id,
                 [0.0, float(max(lanes - 1, 1))],

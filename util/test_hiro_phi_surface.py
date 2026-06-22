@@ -8,7 +8,7 @@ from typing import Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 
-from configs.conf import get_env_config, get_hiro_config
+from configs.builders import get_env_config, get_hiro_config
 from rl.utils import utils
 
 
@@ -167,7 +167,7 @@ def plot_phi_surface(
     env_cfg = get_env_config()
 
     if str(getattr(hiro_cfg, "intrinsic_type", "")).lower() != "huber_shaping":
-        raise ValueError("当前 conf 未启用 huber_shaping，请先设置 ENABLE_HIRO_REWARD_SHAPING=True。")
+        raise ValueError("当前 conf 未启�?huber_shaping，请先设�?ENABLE_HIRO_REWARD_SHAPING=True�?)
 
     dt = 1.0 / float(env_cfg["policy_frequency"])
     simulation_frequency = float(env_cfg["simulation_frequency"])
@@ -318,7 +318,7 @@ def plot_phi_xy_surface(
     hiro_cfg = get_hiro_config()
 
     if str(getattr(hiro_cfg, "intrinsic_type", "")).lower() != "huber_shaping":
-        raise ValueError("当前 conf 未启用 huber_shaping，请先设置 ENABLE_HIRO_REWARD_SHAPING=True。")
+        raise ValueError("当前 conf 未启�?huber_shaping，请先设�?ENABLE_HIRO_REWARD_SHAPING=True�?)
 
     norm_ranges = np.asarray(hiro_cfg.intrinsic_norm_ranges, dtype=np.float32)
     weights = np.asarray(hiro_cfg.intrinsic_weights, dtype=np.float32)
@@ -394,7 +394,7 @@ def plot_phi_xvy_surface(
     hiro_cfg = get_hiro_config()
 
     if str(getattr(hiro_cfg, "intrinsic_type", "")).lower() != "huber_shaping":
-        raise ValueError("当前 conf 未启用 huber_shaping，请先设置 ENABLE_HIRO_REWARD_SHAPING=True。")
+        raise ValueError("当前 conf 未启�?huber_shaping，请先设�?ENABLE_HIRO_REWARD_SHAPING=True�?)
 
     norm_ranges = np.asarray(hiro_cfg.intrinsic_norm_ranges, dtype=np.float32)
     weights = np.asarray(hiro_cfg.intrinsic_weights, dtype=np.float32)
@@ -470,7 +470,7 @@ def plot_phi_yvy_surface(
     hiro_cfg = get_hiro_config()
 
     if str(getattr(hiro_cfg, "intrinsic_type", "")).lower() != "huber_shaping":
-        raise ValueError("当前 conf 未启用 huber_shaping，请先设置 ENABLE_HIRO_REWARD_SHAPING=True。")
+        raise ValueError("当前 conf 未启�?huber_shaping，请先设�?ENABLE_HIRO_REWARD_SHAPING=True�?)
 
     norm_ranges = np.asarray(hiro_cfg.intrinsic_norm_ranges, dtype=np.float32)
     weights = np.asarray(hiro_cfg.intrinsic_weights, dtype=np.float32)
@@ -554,7 +554,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # --------------------
-    # 可在这里替换你的给定状态 s 与 goal_phys
+    # 可在这里替换你的给定状�?s �?goal_phys
     # --------------------
     state = SceneState(
         ego=np.asarray([0, 4.0, 10.0, 0.0], dtype=np.float32),

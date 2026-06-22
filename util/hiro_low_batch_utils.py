@@ -7,7 +7,7 @@ import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 
-from configs.conf import get_env_config, get_hiro_config
+from configs.builders import get_env_config, get_hiro_config
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.sac.sac import SAC
 from util.hiro_low_test_utils import setup_env_with_state

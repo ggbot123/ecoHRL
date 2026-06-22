@@ -7,7 +7,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium.wrappers import RecordVideo
 
-from configs.conf import get_env_config_for_scenario, get_scenario_spec
+from configs.builders import get_env_config_for_scenario, get_scenario_spec
 from custom_env.vehicle.behavior import IDMVehicle, NormalIDMVehicle
 
 
@@ -31,8 +31,8 @@ EXPLICIT_RENDER_EACH_STEP = True
 EGO_HIGHLIGHT_COLOR = (255, 215, 0)  # Yellow
 
 # Video capture (records exactly one episode by index)
-SAVE_EPISODE_VIDEO = False
-# SAVE_EPISODE_VIDEO = True
+# SAVE_EPISODE_VIDEO = False
+SAVE_EPISODE_VIDEO = True
 VIDEO_EPISODE_INDEX = 2  # 0-based: 0 means the first episode
 VIDEO_OUTPUT_DIR = os.path.join("results", "videos")
 VIDEO_NAME_PREFIX = "scenario"

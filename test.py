@@ -7,7 +7,7 @@ import csv
 from datetime import datetime
 from typing import Any, Dict, Optional, Sequence, Tuple
 from util.plot_result import *
-from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
+from configs.builders import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 
 from rl.algos.ppo.ppo import PPO
 from rl.algos.sac.sac import SAC
@@ -118,7 +118,7 @@ def main(
             )
             env_config = get_env_config_for_scenario(scenario_name, test_overrides)
 
-    # 视频录制触发器
+    # 视频录制触发�?
     if record_episodes is None or len(record_episodes) == 0:
         def trigger(ep_id: int) -> bool:
             return False
@@ -139,7 +139,7 @@ def main(
     # 加载模型
     model = load_model(algo, os.path.join(model_path, model_name), env)
 
-    # reward key 列表，保持与 MultiLaneEnv._rewards 一致
+    # reward key 列表，保持与 MultiLaneEnv._rewards 一�?
     reward_keys = [
         "collision_reward",
         "progress_reward",
@@ -248,7 +248,7 @@ def main(
     log(f"Low safety filter  : {bool(env_config.get('enable_low_safety_filter', False))}")
     log("=" * 80)
 
-    # 用于统计均值
+    # 用于统计均�?
     episode_lengths: list[int] = []
     episode_total_rewards: list[float] = []
     agg_components = {k: 0.0 for k in reward_keys}
@@ -265,7 +265,7 @@ def main(
     seed_base = 42
     viewer_initialized = False
     for ep in range(1, int(episodes) + 1):
-        episode_seed = seed_base + ep   # 按 ep 设置 seed
+        episode_seed = seed_base + ep   # �?ep 设置 seed
         obs, _ = env.reset(seed=episode_seed)
         reset_base_env = env.unwrapped
         init_lane = get_terminal_lane_id(reset_base_env)
@@ -281,7 +281,7 @@ def main(
         trajectory_rows: list[Dict[str, Any]] = []
 
         if enable_rendering and not viewer_initialized:
-            # 定义一个“假车”，把摄像头锁在中心点
+            # 定义一个“假车”，把摄像头锁在中心�?
             class Dummy:
                 def __init__(self, pos):
                     self.position = np.array(pos, dtype=float)
@@ -296,7 +296,7 @@ def main(
             obs_next, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
 
-            # 从 env 中取出刚刚这个 step 的 reward 分量
+            # �?env 中取出刚刚这�?step �?reward 分量
             r_dict = info.get("reward_components", None)
             if r_dict is None:
                 r_dict = getattr(env.unwrapped, "_last_weighted_rewards", None)
@@ -327,7 +327,7 @@ def main(
             step_count += 1
             obs = obs_next
 
-        # Episode 结束，判断是否成功到达
+        # Episode 结束，判断是否成功到�?
         base_env = env.unwrapped
         crashed = getattr(base_env.vehicle, "crashed", False)
         arrived = bool(getattr(base_env, "_has_arrived", False))
@@ -339,7 +339,7 @@ def main(
             bool(crashed), bool(arrived), arrival_time, final_lane_id, goal_lane_id
         )
 
-        # 打印本 episode 结果
+        # 打印�?episode 结果
         reason = "unknown"
         if truncated:
             reason = "truncated(time limit)"
@@ -432,7 +432,7 @@ def main(
             else:
                 log(f"  saved trajectory csv    : skipped (episode {ep} has no trajectory rows)")
     
-    # ====== 统计所有 episode 的均值并打印 ======
+    # ====== 统计所�?episode 的均值并打印 ======
     n = int(episodes)
     mean_len = float(np.mean(episode_lengths)) if n > 0 else 0.0
     mean_total_rew = float(np.mean(episode_total_rewards)) if n > 0 else 0.0

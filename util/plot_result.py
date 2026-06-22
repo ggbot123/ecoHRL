@@ -11,7 +11,7 @@ import numpy as np
 from typing import Any
 from pathlib import Path
 from datetime import datetime
-from configs.conf import get_hiro_config
+from configs.builders import get_hiro_config
 from rl.algos.HRL.high_goal_safe_bounds import HighGoalSafeBoundsCalculator
 
 
@@ -1058,7 +1058,7 @@ def save_goal_metric_summary(
     plt.close()
 
 def plot_ego_speed_history(env):
-    ego = env.unwrapped.vehicle          # ego 车对象
+    ego = env.unwrapped.vehicle          # ego vehicle
     hist = list(reversed(ego.history))   # deque -> list
     speeds = [v.speed for v in hist]
     dt = 1.0 / env.unwrapped.config["simulation_frequency"]
@@ -1071,7 +1071,7 @@ def plot_ego_speed_history(env):
 
 def plot_all_speed_history(env):
     dt = 1.0 / env.unwrapped.config["simulation_frequency"]
-    vehs = env.unwrapped.road.vehicles  # 所有车辆
+    vehs = env.unwrapped.road.vehicles  # all vehicles
     for v in vehs:
         hist = list(reversed(v.history))
         speeds = [t.speed for t in hist]
@@ -1092,7 +1092,9 @@ def plot_warmup_avg_speed(env, show=True, save_path=None):
     times = getattr(base_env, "_warmup_times", None)
     avg_speeds = getattr(base_env, "_warmup_avg_speeds", None)
     if times is None or avg_speeds is None:
-        raise RuntimeError("env 中没有 warmup 统计信息，请确认已经执行过第一次 reset。")
+        raise RuntimeError(
+            "env has no warmup statistics; make sure reset() has run first"
+        )
     plt.figure()
     plt.plot(times, avg_speeds)
     plt.xlabel("Time [s]")
@@ -1109,15 +1111,15 @@ def plot_warmup_avg_speed(env, show=True, save_path=None):
 
 def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: dict | None = None):
     """
-    在 show_trajectories 打开的情况下，将当前 episode 的
-    车速曲线、加速度曲线和所在车道随时间变化曲线保存到：
+    Save speed, acceleration, and lane-id curves for the current episode when
+    show_trajectories is enabled:
         model_path/speed_curve/epXXX_speed.png
         model_path/acc_curve/epXXX_acc.png
         model_path/lane_curve/epXXX_lane.png
 
-    - show_trajectories == 'all'：一张图上画所有车辆（ego 为红色，其它车辆为蓝色）
-    - show_trajectories == True：只画 ego 车辆
-    - show_trajectories == False：不做任何事
+    - show_trajectories == 'all': plot all vehicles.
+    - show_trajectories == True: plot ego only.
+    - show_trajectories == False: do nothing.
     """
     base_env = env.unwrapped
     road = base_env.road
@@ -1139,7 +1141,7 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
     acc_path = os.path.join(acc_dir, f"ep{ep_idx:03d}_acc.png")
     lane_path = os.path.join(lane_dir, f"ep{ep_idx:03d}_lane.png")
 
-    # 时间步长按 simulation_frequency 计算（与 history 记录频率一致）
+    # Match the timestep used by history sampling.
     dt = 1.0 / float(base_env.config["simulation_frequency"])
 
     # 对比模式：RL / RL+safety / RL safety upper / MPC / MPC safety upper
@@ -1342,7 +1344,7 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         plt.close()
         return
 
-    # 根据 show_trajectories 的取值决定绘制哪些车辆
+    # Choose which vehicles to plot from show_trajectories.
     if show_mode == "all":
         vehicles = list(road.vehicles)
         title_prefix = "All vehicles"
@@ -1385,7 +1387,7 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         speeds = np.asarray([snap.speed for snap in hist], dtype=float)
         if speeds.size < 2:
             continue
-        # 数值微分：a_t ≈ (v_t - v_{t-1}) / dt
+        # Numerical differentiation: a_t ~= (v_t - v_{t-1}) / dt.
         accs = np.diff(speeds) / dt          # 长度 N-1
         t_acc = np.arange(accs.size, dtype=float) * dt
 
@@ -1406,7 +1408,7 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
     plt.savefig(acc_path)
     plt.close()
 
-    # --------- 车道随时间变化曲线 --------- #
+    # --------- lane id over time --------- #
     def _get_lane_id(snap):
         li = getattr(snap, "lane_index", None)
         if li is None:
@@ -1415,7 +1417,7 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         try:
             if isinstance(li, (tuple, list)) and len(li) >= 3:
                 return float(li[2])
-            # 其他情况尝试直接转为数值
+            # Otherwise try to convert directly to a number.
             return float(li)
         except Exception:
             return np.nan
@@ -1448,8 +1450,7 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
 
 def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev_goal_phys=None, intrinsic_reward=None, folder_name="goal_distribution"):
     """
-    保存 HIRO Goal 可视化快照 (Vector Graphics version).
-    使用 Matplotlib 直接绘制道路和车辆，获得清晰的矢量图/高分辨率位图，
+    Save a HIRO goal visualization snapshot using Matplotlib.
     """
     import itertools
     import matplotlib.transforms as transforms
@@ -1479,7 +1480,7 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
         p_dist = 200.0
     p_dist = float(p_dist)
 
-    # 视野窗口配置：仅显示 ego 前方/后方指定范围，可通过 config 开关关闭
+    # Focus window: show only a configured range in front of/behind ego.
     use_focus_window = bool(base_env.config.get("goal_snapshot_use_focus_window", True))
     front_dist = float(base_env.config.get("goal_snapshot_front_distance", 200.0))
     back_dist = float(base_env.config.get("goal_snapshot_back_distance", 50.0))
@@ -1493,18 +1494,17 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
         longi = float(np.dot(rel, forward))
         return (-back_dist <= longi <= front_dist)
     
-    # 获取范围内车辆
+    # Get vehicles in range.
     # close_vehicles_to 返回按距离排序的车辆列表 (不含 ego)
     neighbors = road.close_vehicles_to(ego, p_dist)
     neighbors = [v for v in neighbors if _in_focus_window(v.position)]
     
-    # 确定哪些是 "Local Prob" (Observation 内的车辆)
-    # runner.n_veh_local 是观察空间中包含的邻车数量
+    # Mark the neighbors included in the local observation.
     n_local = getattr(runner, "n_veh_local", 0)
     local_neighbors_set = set(neighbors[:n_local])
     
     # 绘图列表：ego + neighbors
-    # 注意：绘制顺序影响遮挡，这里不严格区分，因为大家都在车道上
+    # Draw order affects occlusion, but lane-aligned vehicles are acceptable here.
     all_draw_vehs = [ego] + neighbors
 
     # 2. Setup Plot
@@ -1611,11 +1611,11 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
         ax.add_patch(rect_obj)
 
     # 6. Draw Vehicles
-    # 动态 Colorbar Range: 使用 HIRO High-Level Output 绝对速度范围 [0, speed_limit]
-    # 索引获取: init_kinematics_meta 中 keep = ("x", "y", "vx", "vy")
+    # Dynamic colorbar range from HIRO high-level absolute speed [0, speed_limit].
+    # Index mapping comes from init_kinematics_meta keep = ("x", "y", "vx", "vy").
     sx, sy, svx, svy = runner.ego_start[:4]
     
-    # 获取速度上限 (默认 30 m/s，如果 config 中未定义)
+    # Use 30 m/s as fallback speed limit if config does not define one.
     speed_limit = float(base_env.config.get("speed_limit", 30.0))
     norm = mcolors.Normalize(vmin=0.0, vmax=speed_limit)
     cmap = mcolors.LinearSegmentedColormap.from_list(
@@ -1668,7 +1668,7 @@ def save_goal_snapshot(env, runner, ep_idx: int, step: int, model_dir: str, prev
     # Draw Previous Goal (Transparent Dot)
     if show_prev_goal and prev_goal_phys is not None and len(prev_goal_phys) >= 4:
          px, py, pvx, pvy = prev_goal_phys[:4]
-         if pvx != 0 or px != 0: # 简单过滤初始全0的情况
+         if pvx != 0 or px != 0: # Filter the initial all-zero placeholder.
             p_color = cmap(norm(pvx))
             ax.scatter([px], [py], c=[p_color], marker='o', s=prev_goal_marker_size, linewidth=1.0, edgecolors='white', zorder=9, alpha=0.45)
 

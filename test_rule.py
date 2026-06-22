@@ -14,7 +14,7 @@ from rl.utils import utils
 from custom_env import utils as c_utils
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.HRL.rule_based import RuleBasedController
-from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
+from configs.builders import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 from custom_env.vehicle.controller import ControlledVehicle
 from custom_env.vehicle.behavior import NormalIDMVehicle
 from custom_env.road.road import LaneIndex

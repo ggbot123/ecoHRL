@@ -1084,9 +1084,19 @@ class RuleBasedAgentWrapper:
         self.append_front_vehicle_features = bool(
             obs_cfg.get("append_front_vehicle_features", False)
         )
+        self.append_goal_lane_id = bool(obs_cfg.get("append_goal_lane_id", False))
+        self.goal_lane_feature_encoding = str(
+            obs_cfg.get("goal_lane_feature_encoding", "scalar")
+        ).lower().strip()
+        goal_lane_extra_dim = 0
+        if self.append_goal_lane_id:
+            if self.goal_lane_feature_encoding in {"one_hot", "onehot"}:
+                goal_lane_extra_dim = max(int(env_cfg.get("lanes_count", 1)), 1)
+            else:
+                goal_lane_extra_dim = 1
         self.obs_extra_dim = (
             (2 if self.append_front_vehicle_features else 0)
-            + (1 if bool(obs_cfg.get("append_goal_lane_id", False)) else 0)
+            + goal_lane_extra_dim
         )
         self.obs_extra_normalize = bool(obs_cfg.get("normalize", False))
         self.front_distance_range = float(obs_cfg.get("front_vehicle_distance_range", 150.0))

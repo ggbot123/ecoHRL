@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from util.plot_result import *
+from util.plot_result import save_goal_snapshot, save_speed_acc_curves
 from util.config_utils import deep_update
 from util.hiro_utils import (
     apply_hiro_config_overrides,
@@ -26,7 +26,7 @@ from util.hiro_utils import (
 )
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig, get_goal_sampler
-from configs.conf import get_env_config_for_scenario, get_scenario_spec
+from configs.builders import get_env_config_for_scenario, get_scenario_spec
 
 
 class OneBasedEvalRecordVideo(RecordVideo):
@@ -121,6 +121,9 @@ def main(
         if env_config_model_dir
         else (run_config, run_config_path)
     )
+    hiro_cfg = hiro_config_from_run_config(run_config)
+    if hiro_overrides:
+        hiro_cfg = apply_hiro_config_overrides(hiro_cfg, hiro_overrides)
     saved_metadata = env_run_config.get("run_metadata")
     if not isinstance(saved_metadata, Mapping):
         raise ValueError("run_config.json is missing the 'run_metadata' object")
@@ -209,7 +212,8 @@ def main(
         else env_config_from_run_config(env_run_config)
     )
     if saved_env_config is not None:
-        env_config = saved_env_config
+        env_config = get_env_config_for_scenario(effective_scenario_name)
+        deep_update(env_config, saved_env_config)
         env_config.pop("_env_seed", None)
         env_config.pop("actual_episode_start_phase_offset", None)
     else:
@@ -259,7 +263,11 @@ def main(
             episode_trigger = lambda _episode_id, enabled=should_record: enabled
         return OneBasedEvalRecordVideo(
             base,
-            video_folder=eval_dir,
+            video_folder=os.path.join(
+                eval_dir,
+                "videos",
+                f"ep_{int(episode_number):04d}" if episode_number is not None else "all",
+            ),
             episode_trigger=episode_trigger,
             name_prefix="hiro",
             eval_episode_number=episode_number,
@@ -267,9 +275,6 @@ def main(
 
     env = make_eval_env(1 if independent_episodes else None)
 
-    hiro_cfg = hiro_config_from_run_config(run_config)
-    if hiro_overrides:
-        hiro_cfg = apply_hiro_config_overrides(hiro_cfg, hiro_overrides)
     low_level_type = str(getattr(hiro_cfg, "low_level_type", "sac")).lower()
     if low_level_type not in {"sac", "rule_based"}:
         raise ValueError(f"Unknown low_level_type: {low_level_type}")
@@ -335,7 +340,7 @@ def main(
         )
         runner.high_policy = high_policy
 
-    reward_keys_high = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "punctual_reward", "wrong_lane_terminal_penalty", "on_road_reward"]
+    reward_keys_high = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "goal_lane_dense_reward", "punctual_reward", "wrong_lane_terminal_penalty", "on_road_reward"]
     reward_keys_low = ["collision_reward", "progress_reward", "comfort_reward", "lane_change_reward", "on_road_reward", "intrinsic_reward"]
     punctual_time_window = env_config.get("punctual_time_window", [20.0, 30.0])
     t_min = float(punctual_time_window[0])
@@ -635,6 +640,14 @@ def main(
     warmup_each_episode = bool(env_config.get("warmup_each_episode", False))
     initial_vid = int(env.unwrapped.config.get("vid", 0))
     generated_vehicle_count = 0
+    observed_background_only_time = 0.0
+    observed_background_time_available = True
+
+    def get_background_only_time(current_env) -> Optional[float]:
+        value = getattr(current_env.unwrapped, "_background_only_sim_time", None)
+        if value is None:
+            return None
+        return float(value)
 
     for ep in range(1, int(episodes) + 1):
         if independent_episodes and ep > 1:
@@ -652,6 +665,7 @@ def main(
         th.manual_seed(episode_seed)
         if th.cuda.is_available():
             th.cuda.manual_seed_all(episode_seed)
+        background_time_before_reset = get_background_only_time(env)
         obs, _ = env.reset(seed=episode_seed)
         reset_base_env = env.unwrapped
         episode_time_window = reset_base_env.config.get(
@@ -834,8 +848,9 @@ def main(
 
             rc = info.get("reward_components", {})
             punctual = float(rc.get("punctual_reward", 0.0))
+            goal_lane_dense = float(rc.get("goal_lane_dense_reward", 0.0))
             wrong_lane_penalty = float(rc.get("wrong_lane_terminal_penalty", 0.0))
-            low_ext = float(reward) - punctual - wrong_lane_penalty
+            low_ext = float(reward) - goal_lane_dense - punctual - wrong_lane_penalty
 
             queue_takeover_next = bool(info.get("queue_takeover_active", False))
             last_step = bool(
@@ -864,6 +879,7 @@ def main(
                     "truncated": int(truncated),
                     "queue_takeover_active": int(queue_takeover_next),
                     "reward": float(reward),
+                    "goal_lane_dense_reward": float(goal_lane_dense),
                     "punctual_reward": float(punctual),
                     "wrong_lane_terminal_penalty": float(wrong_lane_penalty),
                     "low_ext_reward": float(low_ext),
@@ -1044,6 +1060,14 @@ def main(
         if independent_episodes:
             final_ep_vid = int(env.unwrapped.config.get("vid", initial_vid))
             generated_vehicle_count += max(final_ep_vid - initial_vid, 0)
+            background_time_after_episode = get_background_only_time(env)
+            if background_time_before_reset is None or background_time_after_episode is None:
+                observed_background_time_available = False
+            else:
+                observed_background_only_time += max(
+                    background_time_after_episode - background_time_before_reset,
+                    0.0,
+                )
 
     n = int(episodes)
     lanes_for_summary = int(env_config.get("lanes_count", 3))
@@ -1099,6 +1123,11 @@ def main(
     if not independent_episodes:
         final_vid = int(env.unwrapped.config.get("vid", initial_vid))
         generated_vehicle_count = max(final_vid - initial_vid, 0)
+        background_time_after_eval = get_background_only_time(env)
+        if background_time_after_eval is None:
+            observed_background_time_available = False
+        else:
+            observed_background_only_time = max(background_time_after_eval, 0.0)
     warmup_runs = (
         int(episodes)
         if independent_episodes or warmup_each_episode
@@ -1106,14 +1135,19 @@ def main(
     )
     total_warmup_time = warmup_time * float(warmup_runs)
     total_episode_time = float(total_env_steps) / max(policy_frequency, 1e-6)
-    total_sim_time = total_episode_time + total_warmup_time
+    total_background_only_time = (
+        observed_background_only_time
+        if observed_background_time_available
+        else total_warmup_time
+    )
+    total_sim_time = total_episode_time + total_background_only_time
     traffic_flow_veh_per_s = (
         float(generated_vehicle_count) / total_sim_time if total_sim_time > 0.0 else 0.0
     )
 
     log("  traffic flow stats      :")
     log(f"    generated vehicles    : {generated_vehicle_count}")
-    log(f"    total sim time        : {total_sim_time:.3f} s (episode={total_episode_time:.3f} s, warmup={total_warmup_time:.3f} s)")
+    log(f"    total sim time        : {total_sim_time:.3f} s (episode={total_episode_time:.3f} s, background-only={total_background_only_time:.3f} s)")
     log(f"    flow                  : {traffic_flow_veh_per_s:.6f} veh/s ({traffic_flow_veh_per_s * 3600.0:.3f} veh/h)")
     log("=" * 80)
 
@@ -1231,25 +1265,26 @@ if __name__ == "__main__":
     run_batch(
         models=[
             # HIROEvalModel(
-            #     name="oldEnv_lane2to1_randomstart",
-            #     model_dir="./models/hiro_260611_rule_oldEnv_lane2to1_005_randomstart",
+            #     name="lateGreen_lane2to1_newReset_dyna_buf100k_randStart",
+            #     model_dir="./models/hiro_260618_highonly_lateGreen_2to1_newReset_dyna_buf100k_randStart",
             # ),
             # HIROEvalModel(
-            #     name="oldEnv_lane2to1_wronglanePen",
-            #     model_dir="./models/hiro_260611_rule_oldEnv_lane2to1_005_wronglanePen",
-            # ),
-            # HIROEvalModel(
-            #     name="lateGreen_lane2to2",
-            #     model_dir="./models/hiro_260613_highonly_lateGreen_2to2",
+            #     name="lateGreen_lane2to2_newReset",
+            #     model_dir="./models/hiro_260618_highonly_lateGreen_2to2_newReset",
             # ),
             HIROEvalModel(
-                name="lateGreen_lane2to0",
-                model_dir="./models/hiro_260613_highonly_lateGreen_2to0",
+                name="lateGreen_lane2to2_newReset_largeBuf",
+                model_dir="./models/hiro_260618_highonly_lateGreen_2to2_newReset_largeBuf",
             ),
+            # HIROEvalModel(
+            #     name="lateGreen_lane2toR_latest",
+            #     model_dir="./models/hiro_260614_highonly_lateGreen_2toRandom",
+            #     # model_suffix="step_3961479",
+            # ),
         ],
-        episodes=100,
-        record_episodes=[i for i in range(1, 101)],
-        record_trajectory_episodes=[i for i in range(1, 101)],
+        episodes=30,
+        record_episodes=[i for i in range(1, 31)],
+        record_trajectory_episodes=[i for i in range(1, 31)],
         # enable_rendering=False,
         # scenario_name="multi_lane",
         scenario_name="multi_lane_stop_to_int",
@@ -1257,24 +1292,18 @@ if __name__ == "__main__":
         #     "./models/hiro_260611_rule_oldEnv_lane2to1_005_randomstart"
         # ),
         # use_each_model_env_config=False,
-        # config_overrides={
-        #     "environment": {
-        #         # Probability configs take precedence over fixed lane IDs.
-        #         "initial_lane_id": 2,
-        #         "initial_lane_probs": None,
-        #         "goal_lane_id": 1,
-        #         # Use one reward definition so total returns are comparable.
-        #         "wrong_lane_terminal_penalty": 0,
-        #     },
-        #     "hiro": {
-        #         "use_low_safety_layer": True,
-        #         "goal_sampler": {
-        #             "type": "reachable_uniform",
-        #         },
-        #     },
-        #     "evaluation": {
-        #         "high_policy_source": "high_model",
-        #         # "high_policy_source": "goal_sampler",
-        #     },
-        # },
+        config_overrides={
+            "environment": {
+            },
+            "hiro": {
+                "use_low_safety_layer": True,
+                "goal_sampler": {
+                    "type": "reachable_uniform",
+                },
+            },
+            "evaluation": {
+                "high_policy_source": "high_model",
+                # "high_policy_source": "goal_sampler",
+            },
+        },
     )

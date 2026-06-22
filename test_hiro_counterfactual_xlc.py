@@ -22,7 +22,7 @@ import torch as th
 from gymnasium.wrappers import RecordVideo
 from tqdm.auto import tqdm
 
-from configs.conf import get_scenario_spec
+from configs.builders import get_scenario_spec
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from util.hiro_utils import (
     env_config_from_run_config,

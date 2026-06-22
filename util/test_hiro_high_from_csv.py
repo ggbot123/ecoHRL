@@ -8,8 +8,8 @@ from typing import Any
 
 import numpy as np
 
-from configs.conf import get_env_config
-from configs.conf import get_hiro_config
+from configs.builders import get_env_config
+from configs.builders import get_hiro_config
 from rl.algos.HRL.high_goal_safe_bounds import HighGoalSafeBoundsCalculator
 from rl.algos.sac.sac import SAC
 from rl.utils.utils import goal_action_to_abs

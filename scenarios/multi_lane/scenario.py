@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 
 from custom_env.envs.common.abstract import AbstractEnv
 from custom_env.road.road import Road, RoadNetwork
@@ -6,9 +6,9 @@ from custom_env.envs.common.action import Action
 from custom_env import utils
 from custom_env.vehicle.objects import Obstacle, Landmark
 
-from configs.conf import get_env_config
+from configs.builders import get_env_config
 from scenarios.goal_lane_logic import sample_goal_lane_id
-from scenarios.reward_logic import wrong_lane_terminal_triggered
+from scenarios.reward_logic import goal_lane_dense_progress, wrong_lane_terminal_triggered
 from util.safety_utils import compute_ego_clear_distance_for_front_vehicle
 
 Observation = np.ndarray
@@ -31,12 +31,12 @@ class BusStop(Obstacle):
     length: 沿道路方向长度
     width:  垂直道路方向宽度（从路缘向右侧延伸）
     """
-    LENGTH = 20.0  # m，沿 x 方向
-    WIDTH = 3.0    # m，可以自己调宽一点，比如 3~4m
+    LENGTH = 20.0  # m x
+    WIDTH = 3.0    # m 3~4m
 
     def __init__(self, road, position, heading=0, speed=0):
         super().__init__(road, position, heading, speed)
-        self.collidable = False  # 设为 False，使其成为纯视觉物体，避免意外碰撞
+        self.collidable = False  #  False?
 
 class MultiLaneEnv(AbstractEnv):
     """
@@ -47,21 +47,22 @@ class MultiLaneEnv(AbstractEnv):
     """
     metadata = {
         "render_modes": ["human", "rgb_array"],
-        "render_fps": 10,  # 例如 10fps，对应你的 policy_frequency=10Hz
+        "render_fps": 10,  #  10fps?policy_frequency=10Hz
     }
     def __init__(self, config: dict = None, render_mode: str | None = None):
         super().__init__(config=config, render_mode=render_mode)
         if self.config['PERCEPTION_DISTANCE'] is not None:
             self.PERCEPTION_DISTANCE = self.config['PERCEPTION_DISTANCE']
+        self._background_only_sim_time = 0.0
 
-    # ----------------- 配置 ----------------- #
+    # -----------------  ----------------- #
     @classmethod
     def default_config(cls):
         cfg = super().default_config()
         cfg.update(get_env_config())
         return cfg
 
-    # ----------------- 建路 ----------------- #
+    # -----------------  ----------------- #
     def _create_road(self):
         # 四车道直路，从节点 "0" 到 "1"
         net = RoadNetwork.straight_road_network(
@@ -78,13 +79,13 @@ class MultiLaneEnv(AbstractEnv):
         )
         self._create_bus_stop()
 
-    # ----------------- reset：预热 + 插入 ego ----------------- #
+    # ----------------- reset?+  ego ----------------- #
     def _reset(self):
         """
         - 第一次 reset：建路 + 全局 warmup 交通流 + 插入 ego；
         - 后续 reset：保留现有路网和交通流，只移除旧 ego、清理一下车流，再插入新的 ego。
         """
-        # 每次都重置交通流，用于测试，以保证各个episode之间独立
+        # episode
         self._episode_initial_lane_id = self._sample_initial_lane_id()
         self._episode_goal_lane_id = self._sample_goal_lane_id()
 
@@ -104,7 +105,7 @@ class MultiLaneEnv(AbstractEnv):
                 # 只跑环境车 warmup_time 秒
                 self._warmup(render=self.config.get("warmup_render", False))
 
-                # 打标记：后续 reset 不再重建 & warmup
+                #  reset  & warmup
                 self._did_global_warmup = True
             else:
                 # 把上一回合的 ego 从 road.vehicles 里移除
@@ -118,7 +119,7 @@ class MultiLaneEnv(AbstractEnv):
         self._create_ego()
 
     def _warmup(self, render: bool = False):
-        """只跑环境车 warmup_time 秒，可以选择是否渲染出来看。"""
+        """Warm up background traffic before inserting ego."""
         warmup_time = float(self.config["warmup_time"])
         sim_freq = float(self.config["simulation_frequency"])
         steps = int(warmup_time * sim_freq)
@@ -138,23 +139,24 @@ class MultiLaneEnv(AbstractEnv):
                 avg_speed = float(np.mean(speeds))
             else:
                 avg_speed = 0.0
-            t = k / sim_freq  # 当前 warmup 时间 [s]
+            t = k / sim_freq  #  warmup  [s]
             times.append(t)
             avg_speeds.append(avg_speed)
-            
+
             self.road.act()
             self.road.step(1.0 / sim_freq)
-            # 调试模式：在 reset 期间也渲染 warmup 的画面
+            #  reset ?warmup ?
             if render and self.render_mode is not None:
                 self.render()
 
         # 再做一次清理，避免 warmup 结束时残留 crash 车辆
         self._clear_background()
 
+        self._background_only_sim_time += float(steps) / max(sim_freq, 1e-6)
         self._warmup_times = np.asarray(times, dtype=float)
         self._warmup_avg_speeds = np.asarray(avg_speeds, dtype=float)
 
-    # ----------------- RL step：在 AbstractEnv 的基础上维护车流 ----------------- #
+    # ----------------- RL step AbstractEnv ?----------------- #
     def step(self, action):
         # 让 AbstractEnv 完成 ego 控制 + 仿真
         obs, reward, terminated, truncated, info = super().step(action)
@@ -215,8 +217,7 @@ class MultiLaneEnv(AbstractEnv):
         }
 
     def get_hiro_signal_features(self) -> tuple[float, float]:
-        """Return (is_green, remaining_seconds) for HIRO observation.
-
+        """
         Base multi-lane scenario has no traffic light control.
         Use fixed sentinel values to indicate "no signal": (-1, -1).
         """
@@ -235,8 +236,8 @@ class MultiLaneEnv(AbstractEnv):
         """Return the configured punctual arrival window."""
         window = self.config.get("punctual_time_window", [0.0, 0.0])
         return float(window[0]), float(window[1])
-    
-    # ----------------- RL task 定义 ----------------- #
+
+    # ----------------- RL task  ----------------- #
     def _reward(self, action: Action) -> float:
         raw = self._rewards(action)
         on_road = float(raw["on_road_reward"])
@@ -258,7 +259,7 @@ class MultiLaneEnv(AbstractEnv):
         weighted["on_road_reward"] = on_road
         self._last_raw_rewards = raw
         self._last_weighted_rewards = weighted
-        
+
         return total
 
     def _rewards(self, action: Action) -> dict[str, float]:
@@ -294,28 +295,20 @@ class MultiLaneEnv(AbstractEnv):
         a_max = float(self.config["comfort_max_accel"])
         acc_term = (abs(acc) / max(a_max, 1e-6)) ** 2
 
-        use_jerk = bool(self.config.get("comfort_use_jerk", False))
-        comfort_acc_only = -(acc_term) * dt
-        if use_jerk:
-            last_acc = float(getattr(self, "_last_acc", acc))
-            jerk = (acc - last_acc) / dt
-            j_max = float(self.config.get("comfort_max_jerk", 5.0))
-            jerk_term = (abs(jerk) / max(j_max, 1e-6)) ** 2
-
-            w_acc = float(self.config.get("comfort_acc_weight", 1.0))
-            w_jerk = float(self.config.get("comfort_jerk_weight", 1.0))
-            w_sum = max(w_acc + w_jerk, 1e-6)
-            comfort = -((w_acc * acc_term + w_jerk * jerk_term) / w_sum) * dt
-        else:
-            comfort = -(acc_term) * dt
+        comfort = -(acc_term) * dt
         # comfort = - (min(abs(acc) / a_max, 1.0) ** 2) * dt
 
-        # ---------- 3) 换道惩罚 ----------
+        # ---------- 3)  ----------
         curr_lane_id = self.vehicle.lane_index[2]
         last_lane_id = getattr(self, "_last_lane_id", curr_lane_id)
         lane_changed = 1.0 if curr_lane_id != last_lane_id else 0.0
+        goal_lane_dense = goal_lane_dense_progress(
+            previous_lane_id=last_lane_id,
+            current_lane_id=curr_lane_id,
+            goal_lane_id=self._goal_lane_id(),
+        )
 
-        # ---------- 4) 准时性奖励（只在首次到达目标时给） ----------
+        # ---------- 4) ?----------
         punctual = 0.0
         if not getattr(self, "_has_arrived", False) and self._goal_reached():
             self._has_arrived = True
@@ -324,7 +317,6 @@ class MultiLaneEnv(AbstractEnv):
         wrong_lane_terminal = float(self._wrong_lane_terminal_triggered())
 
         self._last_speed = cur_speed
-        self._last_acc = acc
         self._last_lane_id = curr_lane_id
         self._last_longitudinal = longi
         return {
@@ -332,22 +324,21 @@ class MultiLaneEnv(AbstractEnv):
             "progress_reward": progress,
             "speed_ref_aux_reward": float(speed_ref_aux),
             "comfort_reward": comfort,
-            "comfort_reward_acc_only": comfort_acc_only,
             "lane_change_reward": lane_changed,
+            "goal_lane_dense_reward": goal_lane_dense,
             "punctual_reward": punctual,
             "wrong_lane_terminal_penalty": wrong_lane_terminal,
             "on_road_reward": float(self.vehicle.on_road),
         }
-    
+
 
     def _is_terminated(self) -> bool:
-        """The episode is over if the ego vehicle crashed, reached the goal, or went off-road."""
+        """Compute punctuality factor in [0, 1]."""
         return (
             self.vehicle.crashed
             or self._goal_longitudinal_reached()
             # or self._goal_reached()
-            or self.config["offroad_terminal"]
-            and not self.vehicle.on_road
+            or not self.vehicle.on_road
         )
 
     def _is_truncated(self) -> bool:
@@ -359,8 +350,7 @@ class MultiLaneEnv(AbstractEnv):
         episode_ending = (
             self.vehicle.crashed
             or self._is_truncated()
-            or self.config["offroad_terminal"]
-            and not self.vehicle.on_road
+            or not self.vehicle.on_road
         )
         return wrong_lane_terminal_triggered(
             longitudinal_reached=longitudinal_reached,
@@ -371,7 +361,7 @@ class MultiLaneEnv(AbstractEnv):
             ),
         )
 
-    # ----------------- 入口生成环境车（安全间距版） ----------------- #
+    # -----------------  ----------------- #
     def _spawn_background(self, spawn_probability=None):
         cfg = self.config
         if spawn_probability is None:
@@ -379,21 +369,17 @@ class MultiLaneEnv(AbstractEnv):
         if self.np_random.uniform() > spawn_probability:
             return
         lanes = int(cfg["lanes_count"])
-        
+
         behavior_types = cfg.get(
             "behavior_vehicle_types",
             [cfg["other_vehicles_type"]],
         )
         n_types = len(behavior_types)
-        lane_probs_all = cfg.get("behavior_lane_probs", None)   # 各车道独立的行为分布（可选）
-        global_probs = np.array(
-            cfg.get("behavior_probs", [1.0] * n_types),
-            dtype=float,
-        )
-        global_probs = global_probs / global_probs.sum()
+        lane_probs_all = cfg.get("behavior_lane_probs", None)   #
+        uniform_probs = np.full(n_types, 1.0 / max(n_types, 1), dtype=float)
 
         def _get_lane_behavior_probs(lane_id: int) -> np.ndarray:
-            """返回当前 lane_id 的 behavior 概率向量"""
+            """Return behavior probabilities for a lane."""
             if lane_probs_all is not None:
                 try:
                     lane_row = np.asarray(lane_probs_all[lane_id], dtype=float)
@@ -402,8 +388,7 @@ class MultiLaneEnv(AbstractEnv):
                         return lane_row
                 except (IndexError, TypeError, ValueError):
                     pass
-            # 回退：使用全局分布
-            return global_probs
+            return uniform_probs
 
         # 尝试若干次（不同车道+速度），找一个符合安全间距的插入点，成功生成一辆就退出循环
         for _ in range(2 * lanes):
@@ -441,7 +426,7 @@ class MultiLaneEnv(AbstractEnv):
             v.vid = cfg["vid"]
             if hasattr(v, "randomize_behavior"):    # 随机化车辆参数
                 v.randomize_behavior()
-                
+
             self.road.vehicles.append(v)
             break
 
@@ -452,8 +437,8 @@ class MultiLaneEnv(AbstractEnv):
         - 最近前车与入口距离 >= min_gap + new_speed * min_t_headway（时间车头时距约束）
         """
         cfg = self.config
-        min_gap = float(cfg.get("spawn_min_gap", 10.0))          # 纯空间
-        min_t_headway = float(cfg.get("spawn_min_t_headway", 1.5))  # 车头时距
+        min_gap = float(cfg.get("spawn_min_gap", 10.0))          # ?
+        min_t_headway = float(cfg.get("spawn_min_t_headway", 1.5))  #
         check_cutins = bool(cfg.get("spawn_check_adjacent_cutins", False))
         cutin_front_gap = float(cfg.get("spawn_adjacent_cutin_front_gap", 15.0))
         cutin_back_gap = float(cfg.get("spawn_adjacent_cutin_back_gap", 5.0))
@@ -625,7 +610,6 @@ class MultiLaneEnv(AbstractEnv):
 
         # 初始化奖励相关的历史量
         self._last_speed = ego_speed
-        self._last_acc = 0.0
         self._last_longitudinal = longi0
         self._has_arrived = False
         self._arrival_time = None
@@ -635,16 +619,16 @@ class MultiLaneEnv(AbstractEnv):
         if self.vehicle.lane_index[2] != self._goal_lane_id():
             return False
         return self._goal_longitudinal_reached()
-    
+
     def _goal_longitudinal_reached(self) -> bool:
         """x >= goal_longitudinal（不要求在目标车道）"""
         lane = self.road.network.get_lane(self.vehicle.lane_index)
         longi, _ = lane.local_coordinates(self.vehicle.position)
         goal_long = float(self.config["goal_longitudinal"])
         return longi >= goal_long
-    
+
     def _punctual_factor(self, t: float) -> float:
-        """根据到达时间 t 计算 [0,1] 上的准时性系数"""
+        """Compute punctuality factor in [0, 1]."""
         t_min, t_max = self.config.get("punctual_time_window", [20.0, 30.0])
         t_target = float(self.config.get("punctual_time_target", 25.0))
 
@@ -658,16 +642,16 @@ class MultiLaneEnv(AbstractEnv):
         d = abs(t - t_target) / half_width   # in [0,1]
         d = min(d, 1.0)
         return 1.0 - 0.5 * d
-    
+
     def _create_bus_stop(self):
         lane_index = ("0", "1", int(self.config["lanes_count"]) - 1)
         lane = self.road.network.get_lane(lane_index)
 
-        center_long = float(self.config.get("goal_longitudinal", 300.0))  # 以 x=300 为中心
+        center_long = float(self.config.get("goal_longitudinal", 300.0))  # ?x=300 ?
         bus_length = BusStop.LENGTH
         bus_width = BusStop.WIDTH
         lane_half_width = getattr(lane, "width", 4.0) / 2.0
-        margin = 0.5  # 车道右缘和站台中线之间留一点间隙
+        margin = 0.5  # ?
         lateral_center = lane_half_width + margin + bus_width / 2.0
 
         position = lane.position(center_long, lateral_center)
@@ -686,20 +670,20 @@ class MultiLaneEnv(AbstractEnv):
         """
         if not hasattr(self, "road") or self.road is None:
             return
-            
+
         # Remove existing goal marker
         if hasattr(self, "_goal_marker") and self._goal_marker in self.road.objects:
             self.road.objects.remove(self._goal_marker)
-            
+
         # Create new marker
         # goal_phys is absolute [x, y, vx, vy]
         position = np.array([goal_phys[0], goal_phys[1]])
-        
+
         # We can use heading 0 for point goal, or calculate if needed
         heading = 0
-        
+
         self._goal_marker = GoalMarker(self.road, position, heading)
-        
+
         if not hasattr(self.road, "objects"):
             self.road.objects = []
         self.road.objects.append(self._goal_marker)

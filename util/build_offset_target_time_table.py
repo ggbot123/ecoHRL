@@ -9,7 +9,8 @@ from typing import Iterable
 
 import numpy as np
 
-from configs.conf import MASTER_SEED, get_env_config_for_scenario
+from configs.builders import get_env_config_for_scenario
+from configs.conf import MASTER_SEED
 from custom_env.vehicle.behavior import IDMVehicle
 from scenarios.multi_lane_stop_to_int.scenario import MultiLaneStopToIntEnv
 
@@ -32,10 +33,21 @@ TEST_CONFIG = {
     "episodes": 10,
     "workers": 0,  # 0: min(cpu_count, 8); 1: serial
     "target_speed": 12.0,
-    "spawn_probability": None,  # None: use scenario default
+    "spawn_probability": 0.06,
+    "behavior_lane_probs": None,  # None: use scenario default
     "warmup_time": None,  # None: use scenario default
     "duration": 160.0,
-    "out_dir": Path("debug") / "offset_target_time_table_with_traffic",
+    "out_root": Path("debug") / "offset_target_time_table_spawn006",
+    "profiles": [
+        {
+            "name": "lane_probs_060_030_010",
+            "behavior_lane_probs": [0.6, 0.3, 0.1],
+        },
+        {
+            "name": "lane_probs_040_030_030",
+            "behavior_lane_probs": [0.4, 0.3, 0.3],
+        },
+    ],
 }
 
 
@@ -103,7 +115,6 @@ def _replace_ego_with_idm(env: MultiLaneStopToIntEnv, target_speed: float) -> ID
     env.controlled_vehicles = [ego]
     env.action_type.controlled_vehicle = ego
     env._last_speed = float(ego.speed)
-    env._last_acc = 0.0
     env._last_longitudinal = float(ego.position[0])
     env._last_lane_id = int(lane_index[2])
     env._has_arrived = False
@@ -158,6 +169,7 @@ def run_condition(
     episodes: int,
     target_speed: float,
     spawn_probability: float | None,
+    behavior_lane_probs: list[float] | tuple[float, ...] | None,
     duration: float,
     warmup_time: float | None,
 ) -> tuple[RolloutOutput, ...]:
@@ -171,6 +183,8 @@ def run_condition(
     }
     if spawn_probability is not None:
         overrides["spawn_probability"] = float(spawn_probability)
+    if behavior_lane_probs is not None:
+        overrides["behavior_lane_probs"] = [float(x) for x in behavior_lane_probs]
     if warmup_time is not None:
         overrides["warmup_time"] = float(warmup_time)
     cfg = get_env_config_for_scenario("multi_lane_stop_to_int", overrides)
@@ -237,7 +251,17 @@ def run_condition(
 
 
 def _run_task(
-    task: tuple[float, int, int, int, float, float | None, float, float | None],
+    task: tuple[
+        float,
+        int,
+        int,
+        int,
+        float,
+        float | None,
+        list[float] | tuple[float, ...] | None,
+        float,
+        float | None,
+    ],
 ) -> tuple[RolloutOutput, ...]:
     return run_condition(*task)
 
@@ -430,8 +454,7 @@ def write_mean_trajectories(
                 )
 
 
-def main() -> None:
-    cfg = dict(TEST_CONFIG)
+def run_experiment(cfg: dict) -> None:
     episodes = int(cfg["episodes"])
     if episodes <= 0:
         raise ValueError("TEST_CONFIG['episodes'] must be > 0")
@@ -455,6 +478,7 @@ def main() -> None:
             episodes,
             float(cfg["target_speed"]),
             cfg["spawn_probability"],
+            cfg["behavior_lane_probs"],
             float(cfg["duration"]),
             cfg["warmup_time"],
         )
@@ -490,6 +514,9 @@ def main() -> None:
         f"running {total_conditions} conditions x {episodes} episodes "
         f"({total_episodes} episodes total) with {workers} worker process(es)"
     )
+    print(f"spawn_probability={cfg['spawn_probability']}")
+    print(f"behavior_lane_probs={cfg['behavior_lane_probs']}")
+    print(f"out_dir={out_dir.resolve()}")
     with trajectory_raw_path.open("w", newline="", encoding="utf-8") as trajectory_file:
         trajectory_writer = csv.DictWriter(trajectory_file, fieldnames=trajectory_fields)
         trajectory_writer.writeheader()
@@ -564,6 +591,24 @@ def main() -> None:
     print(f"mean pivot md: {summary_md.resolve()}")
     print(f"raw trajectories: {trajectory_raw_path.resolve()}")
     print(f"mean trajectories: {trajectory_mean_path.resolve()}")
+
+
+def main() -> None:
+    base_cfg = dict(TEST_CONFIG)
+    profiles = list(base_cfg.get("profiles") or [])
+    if not profiles:
+        run_experiment(base_cfg)
+        return
+
+    out_root = Path(base_cfg["out_root"])
+    for profile in profiles:
+        cfg = dict(base_cfg)
+        cfg.pop("profiles", None)
+        name = str(profile["name"])
+        cfg["behavior_lane_probs"] = profile.get("behavior_lane_probs")
+        cfg["out_dir"] = out_root / name
+        print(f"\n=== profile: {name} ===")
+        run_experiment(cfg)
 
 
 if __name__ == "__main__":

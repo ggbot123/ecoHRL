@@ -7,7 +7,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Type
 
 from rl.algos.sac.sac import SAC
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig
-from rl.algos.HRL.hiro import HIROConfig, LowSafetyFilterConfig
+from rl.algos.HRL.hiro import HIROConfig, HighGoalSafetyConfig, LowSafetyFilterConfig
 from util.config_utils import deep_update
 
 
@@ -109,6 +109,32 @@ def _fill_missing_dataclass_defaults(
 
 def _hiro_config_from_mapping(saved: Mapping[str, Any]) -> HIROConfig:
     saved_compat = deepcopy(dict(saved))
+    legacy_high_goal_safety_fields = {
+        "use_high_goal_safety_layer": "enabled",
+        "high_goal_safe_eps": "eps",
+        "high_goal_safe_use_custom_kinematics": "use_custom_kinematics",
+        "high_goal_safe_max_accel": "max_accel",
+        "high_goal_safe_max_decel": "max_decel",
+        "high_goal_safe_front_dmin": "front_dmin",
+        "high_goal_safe_lane_change_rear_dmin": "lane_change_rear_dmin",
+        "high_goal_safe_min_goal_x_span": "min_goal_x_span",
+        "high_goal_safe_enable_goal_vx_bounds": "enable_goal_vx_bounds",
+        "high_goal_dynamic_feasible_lane_intervals": "dynamic_feasible_lane_intervals",
+    }
+    legacy_high_goal_safety = {}
+    for old_name, new_name in legacy_high_goal_safety_fields.items():
+        if old_name in saved_compat:
+            legacy_high_goal_safety[new_name] = saved_compat.pop(old_name)
+    if legacy_high_goal_safety:
+        high_goal_safety = saved_compat.get("high_goal_safety")
+        if high_goal_safety is None:
+            high_goal_safety = {}
+        if not isinstance(high_goal_safety, Mapping):
+            raise ValueError("HIRO config 'high_goal_safety' must be an object")
+        merged_high_goal_safety = deepcopy(dict(high_goal_safety))
+        merged_high_goal_safety.update(legacy_high_goal_safety)
+        saved_compat["high_goal_safety"] = merged_high_goal_safety
+
     deprecated_fields = {
         name: saved_compat.pop(name)
         for name in ("low_sac_impl",)
@@ -129,6 +155,7 @@ def _hiro_config_from_mapping(saved: Mapping[str, Any]) -> HIROConfig:
     )
     goal_sampler = kwargs.get("goal_sampler")
     low_safety_filter = kwargs.get("low_safety_filter")
+    high_goal_safety = kwargs.get("high_goal_safety")
     if not isinstance(goal_sampler, Mapping):
         raise ValueError("HIRO config 'goal_sampler' must be an object")
     kwargs["goal_sampler"] = GoalSamplerConfig(
@@ -151,6 +178,19 @@ def _hiro_config_from_mapping(saved: Mapping[str, Any]) -> HIROConfig:
         )
     else:
         raise ValueError("HIRO config 'low_safety_filter' must be an object or null")
+
+    if high_goal_safety is None:
+        kwargs["high_goal_safety"] = HighGoalSafetyConfig()
+    elif isinstance(high_goal_safety, Mapping):
+        kwargs["high_goal_safety"] = HighGoalSafetyConfig(
+            **_fill_missing_dataclass_defaults(
+                high_goal_safety,
+                HighGoalSafetyConfig,
+                "high_goal_safety config",
+            )
+        )
+    else:
+        raise ValueError("HIRO config 'high_goal_safety' must be an object or null")
     return HIROConfig(**kwargs)
 
 

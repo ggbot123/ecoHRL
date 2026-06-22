@@ -13,7 +13,7 @@ from util.hiro_utils import load_hiro_high_model, unique_path
 
 from rl.utils import utils
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
-from configs.conf import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
+from configs.builders import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 
 
 def main(

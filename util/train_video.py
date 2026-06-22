@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import os
 
 import gymnasium as gym
@@ -33,102 +32,6 @@ class FixedObserverRender(gym.Wrapper):
     def render(self):
         self._install_observer()
         return self.env.render()
-
-
-class CollisionAwareRecordVideo(RecordVideo):
-    """Record scheduled videos and always keep episodes that contain collisions.
-
-    Gymnasium's RecordVideo decides whether to record at episode start, before we
-    know whether the episode will crash. To avoid missing collision episodes, this
-    wrapper records every episode when collision capture is enabled, then deletes
-    unscheduled non-collision videos after the episode finishes.
-    """
-
-    def __init__(
-        self,
-        env: gym.Env,
-        video_folder: str,
-        episode_trigger,
-        name_prefix: str,
-        keep_collision_episodes: bool,
-        disable_logger: bool = True,
-    ):
-        self._regular_episode_trigger = episode_trigger
-        self._keep_collision_episodes = bool(keep_collision_episodes)
-        self._episode_had_collision = False
-        self._active_regular_recording = False
-        self._active_video_name = None
-        self.recorded_frames = []
-        super().__init__(
-            env,
-            video_folder=video_folder,
-            episode_trigger=self._recording_episode_trigger,
-            name_prefix=name_prefix,
-            disable_logger=disable_logger,
-        )
-
-    def _recording_episode_trigger(self, episode_id: int) -> bool:
-        regular = bool(self._regular_episode_trigger(int(episode_id)))
-        self._active_regular_recording = regular
-        return regular or self._keep_collision_episodes
-
-    @staticmethod
-    def _info_has_collision(info: dict) -> bool:
-        if not isinstance(info, dict):
-            return False
-        if bool(info.get("crashed", False)):
-            return True
-        rewards = info.get("rewards", None)
-        if isinstance(rewards, dict):
-            try:
-                return float(rewards.get("collision_reward", 0.0)) > 0.0
-            except (TypeError, ValueError):
-                return False
-        return False
-
-    def _raw_env_has_collision(self) -> bool:
-        vehicle = getattr(self.unwrapped, "vehicle", None)
-        return bool(getattr(vehicle, "crashed", False))
-
-    def reset(self, *, seed: int | None = None, options: dict | None = None):
-        obs, info = super().reset(seed=seed, options=options)
-        self._episode_had_collision = False
-        return obs, info
-
-    def step(self, action):
-        obs, rew, terminated, truncated, info = super().step(action)
-        if self._info_has_collision(info) or self._raw_env_has_collision():
-            self._episode_had_collision = True
-        return obs, rew, terminated, truncated, info
-
-    def start_recording(self, video_name: str):
-        self._active_video_name = str(video_name)
-        return super().start_recording(video_name)
-
-    def stop_recording(self):
-        keep_video = bool(self._active_regular_recording or self._episode_had_collision)
-        assert self.recording, "stop_recording was called, but no recording was started"
-
-        if keep_video and len(self.recorded_frames) > 0:
-            from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
-
-            clip = ImageSequenceClip(self.recorded_frames, fps=self.frames_per_sec)
-            moviepy_logger = None if self.disable_logger else "bar"
-            path = os.path.join(self.video_folder, f"{self._video_name}.mp4")
-            try:
-                clip.write_videofile(path, logger=moviepy_logger)
-            finally:
-                close = getattr(clip, "close", None)
-                if callable(close):
-                    close()
-                del clip
-
-        self.recorded_frames = []
-        self.recording = False
-        self._video_name = None
-        self._active_video_name = None
-        if self.gc_trigger and self.gc_trigger(self.episode_id):
-            gc.collect()
 
 
 def global_view_video_config() -> dict:
@@ -166,25 +69,21 @@ def wrap_training_video_env(
     video_folder: str | None,
     video_name_prefix: str,
     video_episode_freq: int,
-    record_video_global_view: bool,
     record_video_scheduled: bool,
-    record_video_collision_episodes: bool,
 ) -> gym.Env:
     if not video_folder:
         raise ValueError("video_folder must be provided when record_video=True")
 
-    if record_video_global_view:
-        raw_env = env.unwrapped
-        center_x = float(getattr(raw_env, "config", {}).get("road_length", 0.0)) / 2.0
-        env = FixedObserverRender(env, position=[center_x, 5.0])
+    raw_env = env.unwrapped
+    center_x = float(getattr(raw_env, "config", {}).get("road_length", 0.0)) / 2.0
+    env = FixedObserverRender(env, position=[center_x, 5.0])
 
     os.makedirs(video_folder, exist_ok=True)
-    env = CollisionAwareRecordVideo(
+    env = RecordVideo(
         env,
         video_folder=video_folder,
         episode_trigger=make_episode_trigger(video_episode_freq, record_video_scheduled),
         name_prefix=video_name_prefix,
-        keep_collision_episodes=bool(record_video_collision_episodes),
         disable_logger=True,
     )
     try:

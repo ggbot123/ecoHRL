@@ -1,3 +1,7 @@
+import pickle
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 
 from custom_env.envs.common.abstract import AbstractEnv
@@ -5,11 +9,12 @@ from custom_env.road.road import Road, RoadNetwork
 from custom_env.road.lane import LineType, StraightLane
 from custom_env.envs.common.action import Action
 from custom_env import utils
+from custom_env.vehicle.behavior import AggressiveIDMVehicle
 from custom_env.vehicle.objects import Obstacle, Landmark
 
-from configs.conf import get_env_config
+from configs.builders import get_env_config
 from scenarios.goal_lane_logic import sample_goal_lane_id
-from scenarios.reward_logic import wrong_lane_terminal_triggered
+from scenarios.reward_logic import goal_lane_dense_progress, wrong_lane_terminal_triggered
 from util.config_utils import sync_punctual_time_with_phase_offset
 from util.safety_utils import compute_ego_clear_distance_for_front_vehicle
 
@@ -29,16 +34,16 @@ class GoalMarker(Landmark):
 class BusStop(Obstacle):
     affects_traffic = False
     """
-    静态矩形公交站台，沿道路方向放置。
-    length: 沿道路方向长度
-    width:  垂直道路方向宽度（从路缘向右侧延伸）
+    Static rectangular bus stop placed along the road.
+    length: longitudinal size.
+    width: lateral size.
     """
-    LENGTH = 20.0  # m，沿 x 方向
-    WIDTH = 3.0    # m，可以自己调宽一点，比如 3~4m
+    LENGTH = 20.0
+    WIDTH = 3.0
 
     def __init__(self, road, position, heading=0, speed=0):
         super().__init__(road, position, heading, speed)
-        self.collidable = False  # 设为 False，使其成为纯视觉物体，避免意外碰撞
+        self.collidable = False
 
 
 class VirtualStopVehicle(Obstacle):
@@ -85,7 +90,7 @@ class IntersectionSignalController:
     def __init__(self, config: dict, lanes_count: int):
         self.lanes_count = int(lanes_count)
         self.yellow = self.YELLOW_DURATION
-        self.cycle_offset = float(config.get("signal_cycle_offset", 0.0))
+        self.cycle_offset = 0.0
 
         self.direction_lane_groups = self._parse_direction_lane_groups(config, lanes_count)
 
@@ -211,15 +216,40 @@ class IntersectionSignalController:
 
 class MultiLaneStopToIntEnv(AbstractEnv):
     """
-    多车道直路 + 顺序交通流 + 预热 + 更安全的生成逻辑
-    - 道路：节点 "0" -> "1" 的四车道直路，长度 road_length
+    多车道直�?+ 顺序交通流 + 预热 + 更安全的生成逻辑
+    - 道路：节�?"0" -> "1" 的四车道直路，长�?road_length
     - 环境车：从左端（x=0）按概率生成，跑到右端后删除
-    - warmup：先只跑环境车 warmup_time 秒，再在公交站插入 ego
+    - warmup：先只跑环境�?warmup_time 秒，再在公交站插�?ego
     """
     metadata = {
         "render_modes": ["human", "rgb_array"],
-        "render_fps": 10,  # 例如 10fps，对应你的 policy_frequency=10Hz
+        "render_fps": 10,  # 例如 10fps，对应你�?policy_frequency=10Hz
     }
+    SIGNAL_GREEN_LAUNCH_ATTRS = (
+        "target_speed",
+        "TIME_WANTED",
+        "DISTANCE_WANTED",
+        "COMFORT_ACC_MAX",
+        "COMFORT_ACC_MIN",
+        "DELTA",
+        "imperfection",
+    )
+    BACKGROUND_SNAPSHOT_VEHICLE_ATTRS = (
+        "target_speed",
+        "TIME_WANTED",
+        "DISTANCE_WANTED",
+        "COMFORT_ACC_MAX",
+        "COMFORT_ACC_MIN",
+        "DELTA",
+        "POLITENESS",
+        "LANE_CHANGE_MIN_ACC_GAIN",
+        "LANE_CHANGE_MAX_BRAKING_IMPOSED",
+        "ACC_MAX",
+        "imperfection",
+    )
+    BACKGROUND_SNAPSHOT_MATCH_TOLERANCE = 1e-3
+    BACKGROUND_SNAPSHOT_OFFSET_KEY_SCALE = 1000
+
     def __init__(self, config: dict = None, render_mode: str | None = None):
         super().__init__(config=config, render_mode=render_mode)
         if self.config['PERCEPTION_DISTANCE'] is not None:
@@ -236,6 +266,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._inter_episode_remaining = 0.0
         self._queue_takeover_active = False
         self._queue_takeover_enter_count = 0
+        self._background_only_sim_time = 0.0
 
     # ----------------- 配置 ----------------- #
     @classmethod
@@ -245,19 +276,27 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         cfg.setdefault("movement_lanes", None)
         cfg.setdefault("movement_behavior_probs", None)
         cfg.setdefault("background_vehicle_respect_movement_lanes", True)
-        cfg.setdefault("enable_signal_virtual_stops", True)
-        cfg.setdefault("single_road_network", True)
+        cfg.setdefault("enable_signal_green_launch_behavior", True)
+        cfg.setdefault("signal_green_launch_approach_distance", None)
+        cfg.setdefault("signal_green_launch_end_margin", 5.0)
+        cfg.setdefault("signal_green_launch_target_speed", None)
+        cfg.setdefault("enable_signal_cycle_spawn_probability", False)
+        cfg.setdefault("signal_cycle_spawn_probability", None)
         cfg.setdefault("inter_episode_as_steps", False)
         cfg.setdefault("inter_episode_step_seconds", 0.0)
         cfg.setdefault("inter_episode_zero_obs", True)
+        cfg.setdefault("background_snapshot_reset", False)
+        cfg.setdefault("background_snapshot_path", None)
+        cfg.setdefault("background_snapshot_paths", None)
         return cfg
 
     # ----------------- 建路 ----------------- #
     def _create_road(self):
+        self.config["single_road_network"] = True
         # 路网由三段组成：
         # 1) 进路段（0->1）：有车道线，长度由 goal x 决定
-        # 2) 路口段（1->2）：长度 intersection_length，仅保留道路上下边沿线
-        # 3) 路口后段（2->3）：长度 road_length - goal_x - intersection_length
+        # 2) 路口段（1->2）：长度 intersection_length，仅保留道路上下边沿�?
+        # 3) 路口后段�?->3）：长度 road_length - goal_x - intersection_length
         lanes = int(self.config["lanes_count"])
         lane_w = float(StraightLane.DEFAULT_WIDTH)
         speed_limit = float(self.config["speed_limit"])
@@ -363,11 +402,11 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._create_bus_stop()
         self._update_goal_highlight_regions()
 
-    # ----------------- reset：预热 + 插入 ego ----------------- #
+    # ----------------- reset：预�?+ 插入 ego ----------------- #
     def _reset(self):
         """
-        - 第一次 reset：建路 + 全局 warmup 交通流 + 插入 ego；
-        - 后续 reset：保留现有路网和交通流，只移除旧 ego、清理一下车流，再插入新的 ego。
+        - 第一�?reset：建�?+ 全局 warmup 交通流 + 插入 ego�?
+        - 后续 reset：保留现有路网和交通流，只移除�?ego、清理一下车流，再插入新�?ego�?
         """
         first_reset = not getattr(self, "_did_global_warmup", False)
         has_previous_episode = int(getattr(self, "_episodes_started", 0)) > 0
@@ -375,6 +414,10 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._episode_goal_lane_id = self._sample_goal_lane_id()
         self._inter_episode_active = False
         self._inter_episode_remaining = 0.0
+
+        if bool(self.config.get("background_snapshot_reset", False)):
+            self._reset_from_background_snapshot()
+            return
 
         # 每次都重置交通流，用于测试，以保证各个episode之间独立
         if self.config["warmup_each_episode"] is True:
@@ -384,18 +427,18 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             self._warmup(render=self.config.get("warmup_render", False))
         else:
             if first_reset:
-                # ------- 第一次：建立路网 + 清空所有车辆 + 预热交通流 -------
+                # ------- 第一次：建立路网 + 清空所有车�?+ 预热交通流 -------
                 self._create_road()
                 self.road.vehicles = []
                 self.controlled_vehicles = []
 
-                # 只跑环境车 warmup_time 秒
+                # 只跑环境�?warmup_time �?
                 self._warmup(render=self.config.get("warmup_render", False))
 
                 # 打标记：后续 reset 不再重建 & warmup
                 self._did_global_warmup = True
             else:
-                # 把上一回合的 ego 从 road.vehicles 里移除
+                # 把上一回合�?ego �?road.vehicles 里移�?
                 if getattr(self, "vehicle", None) is not None:
                     try:
                         self.road.vehicles.remove(self.vehicle)
@@ -455,6 +498,56 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             phase_offset = 0.0
         return float(phase_offset)
 
+    def _current_signal_cycle_spawn_probability(self) -> float:
+        base = float(self.config.get("spawn_probability", 0.0))
+        if not bool(self.config.get("enable_signal_cycle_spawn_probability", False)):
+            return base
+
+        controller = getattr(self, "_signal_controller", None)
+        profile = self.config.get("signal_cycle_spawn_probability", None)
+        if controller is None or not isinstance(profile, (list, tuple)):
+            return base
+
+        cycle = float(sum(total for _, total in controller.signal_plan))
+        if cycle <= 1e-9:
+            return base
+
+        tau = (float(self._signal_time_global) + float(controller.cycle_offset)) % cycle
+        for item in profile:
+            if isinstance(item, dict):
+                start_raw = item.get("start", item.get("from", item.get("begin", None)))
+                end_raw = item.get("end", item.get("to", item.get("until", None)))
+                prob_raw = item.get(
+                    "spawn_probability",
+                    item.get("probability", item.get("prob", None)),
+                )
+            elif isinstance(item, (list, tuple)) and len(item) >= 3:
+                start_raw, end_raw, prob_raw = item[:3]
+            else:
+                continue
+
+            try:
+                start = float(start_raw) % cycle
+                end = float(end_raw) % cycle
+                prob = float(prob_raw)
+            except (TypeError, ValueError):
+                continue
+
+            if not np.isfinite(prob):
+                continue
+
+            if abs(end - start) <= 1e-9:
+                in_window = True
+            elif start < end:
+                in_window = start <= tau < end
+            else:
+                in_window = tau >= start or tau < end
+
+            if in_window:
+                return float(np.clip(prob, 0.0, 1.0))
+
+        return base
+
     def _sync_episode_punctual_time(self) -> None:
         actual_offset = self._current_signal_phase_offset()
         self.config["actual_episode_start_phase_offset"] = float(actual_offset)
@@ -482,6 +575,579 @@ class MultiLaneStopToIntEnv(AbstractEnv):
                 self._current_signal_phase_offset(),
             )
         )
+
+    def _snapshot_cycle_seconds_from_config(self) -> float:
+        raw_plan = self.config.get("signal_plan", [])
+        cycle = 0.0
+        if isinstance(raw_plan, list):
+            for item in raw_plan:
+                if not isinstance(item, dict):
+                    continue
+                for value in item.values():
+                    try:
+                        cycle += float(value)
+                    except (TypeError, ValueError):
+                        continue
+        return max(float(cycle), 0.0)
+
+    @staticmethod
+    def _snapshot_scalar(value: Any) -> Any:
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    @staticmethod
+    def _snapshot_lane_index(value: Any) -> tuple[str, str, int | None] | None:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) < 3:
+            return None
+        lane_id = None if value[2] is None else int(value[2])
+        return (str(value[0]), str(value[1]), lane_id)
+
+    def _snapshot_route(self, value: Any) -> list[tuple[str, str, int | None]] | None:
+        if value is None:
+            return None
+        route: list[tuple[str, str, int | None]] = []
+        for lane_index in value:
+            parsed = self._snapshot_lane_index(lane_index)
+            if parsed is not None:
+                route.append(parsed)
+        return route
+
+    def _snapshot_config_signature(self) -> dict[str, Any]:
+        keys = [
+            "lanes_count",
+            "road_length",
+            "speed_limit",
+            "start_longitudinal",
+            "goal_longitudinal",
+            "intersection_length",
+            "flow_speed_range",
+            "speed_distribution",
+            "spawn_min_gap",
+            "spawn_min_t_headway",
+            "spawn_check_adjacent_cutins",
+            "spawn_adjacent_cutin_front_gap",
+            "spawn_adjacent_cutin_back_gap",
+            "movement_lanes",
+            "movement_behavior_probs",
+            "signal_plan",
+            "behavior_vehicle_types",
+            "behavior_lane_probs",
+            "background_vehicle_respect_movement_lanes",
+            "enable_signal_green_launch_behavior",
+            "signal_green_launch_approach_distance",
+            "signal_green_launch_end_margin",
+            "signal_green_launch_target_speed",
+            "enable_signal_cycle_spawn_probability",
+            "signal_cycle_spawn_probability",
+        ]
+        if not bool(self.config.get("enable_signal_cycle_spawn_probability", False)):
+            keys.append("spawn_probability")
+        return {key: self.config.get(key, None) for key in keys}
+
+    def _vehicle_to_background_snapshot(self, vehicle) -> dict[str, Any]:
+        original = getattr(vehicle, "_signal_green_launch_original", None)
+        attrs: dict[str, Any] = {}
+        for attr in self.BACKGROUND_SNAPSHOT_VEHICLE_ATTRS:
+            if isinstance(original, dict) and attr in original:
+                value = original[attr]
+            elif hasattr(vehicle, attr):
+                value = getattr(vehicle, attr)
+            else:
+                continue
+            attrs[attr] = self._snapshot_scalar(value)
+
+        action = dict(getattr(vehicle, "action", {}) or {})
+        action = {
+            str(k): float(v)
+            for k, v in action.items()
+            if isinstance(v, (int, float, np.floating))
+        }
+        cls = vehicle.__class__
+        return {
+            "class_path": f"{cls.__module__}.{cls.__qualname__}",
+            "position": np.asarray(vehicle.position, dtype=float).copy(),
+            "heading": float(getattr(vehicle, "heading", 0.0)),
+            "speed": float(getattr(vehicle, "speed", 0.0)),
+            "lane_index": self._snapshot_lane_index(getattr(vehicle, "lane_index", None)),
+            "target_lane_index": self._snapshot_lane_index(getattr(vehicle, "target_lane_index", None)),
+            "target_speed": float(getattr(vehicle, "target_speed", getattr(vehicle, "speed", 0.0))),
+            "route": self._snapshot_route(getattr(vehicle, "route", None)),
+            "enable_lane_change": bool(getattr(vehicle, "enable_lane_change", True)),
+            "timer": float(getattr(vehicle, "timer", 0.0)),
+            "movement_direction": getattr(vehicle, "movement_direction", None),
+            "vid": int(getattr(vehicle, "vid", -1)),
+            "action": action,
+            "crashed": bool(getattr(vehicle, "crashed", False)),
+            "attrs": attrs,
+        }
+
+    def export_background_snapshot(self) -> dict[str, Any]:
+        """Return a restorable snapshot of background traffic at the current signal phase."""
+        if not hasattr(self, "road") or self.road is None:
+            raise RuntimeError("Cannot export a background snapshot before the road exists")
+
+        self._clear_background()
+        controlled = tuple(getattr(self, "controlled_vehicles", []) or ())
+        vehicles = [
+            self._vehicle_to_background_snapshot(vehicle)
+            for vehicle in list(getattr(self.road, "vehicles", []) or [])
+            if not any(vehicle is controlled_vehicle for controlled_vehicle in controlled)
+        ]
+        return {
+            "version": 1,
+            "phase_offset": float(self._current_signal_phase_offset()),
+            "signal_time_global": float(self._signal_time_global),
+            "vid": int(self.config.get("vid", 0)),
+            "background_count": int(len(vehicles)),
+            "config_signature": self._snapshot_config_signature(),
+            "vehicles": vehicles,
+        }
+
+    def _background_snapshot_offset_key(self, offset: float) -> str:
+        return str(int(round(float(offset) * self.BACKGROUND_SNAPSHOT_OFFSET_KEY_SCALE)))
+
+    def _build_background_snapshot_index(
+        self,
+        snapshots: list[dict[str, Any]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        index: dict[str, list[dict[str, Any]]] = {}
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict) or "phase_offset" not in snapshot:
+                continue
+            key = self._background_snapshot_offset_key(float(snapshot["phase_offset"]))
+            index.setdefault(key, []).append(snapshot)
+        return index
+
+    def _validate_background_snapshot_config_signature(self, saved: Any) -> None:
+        if not isinstance(saved, dict):
+            raise ValueError("Background snapshot pool is missing config_signature")
+
+        current = self._snapshot_config_signature()
+        ignored_keys: set[str] = set()
+        try:
+            if len(self._background_snapshot_paths()) > 1:
+                ignored_keys.add("behavior_lane_probs")
+        except ValueError:
+            pass
+        mismatches: list[str] = []
+        for key, current_value in current.items():
+            if key in ignored_keys:
+                continue
+            if saved.get(key, None) != current_value:
+                mismatches.append(key)
+        if mismatches:
+            detail = ", ".join(mismatches[:12])
+            if len(mismatches) > 12:
+                detail += f", ... (+{len(mismatches) - 12} more)"
+            raise ValueError(
+                "Background snapshot pool config does not match current env config: "
+                + detail
+            )
+
+    def _background_snapshot_paths(self) -> list[Path]:
+        path_raw = self.config.get("background_snapshot_paths", None)
+        if path_raw is None:
+            path_raw = self.config.get("background_snapshot_path", None)
+        if not path_raw:
+            raise ValueError(
+                "background_snapshot_reset=True requires background_snapshot_path "
+                "or background_snapshot_paths"
+            )
+        if isinstance(path_raw, (list, tuple)):
+            paths = [Path(p) for p in path_raw if p]
+        else:
+            paths = [Path(path_raw)]
+        if not paths:
+            raise ValueError("background_snapshot_paths must contain at least one path")
+        return paths
+
+    def _load_background_snapshot_pool(self, path_raw: Any = None) -> dict[str, list[dict[str, Any]]]:
+        """Load a legacy single-file pool and keep its full in-memory index."""
+        if path_raw is None:
+            path_raw = self.config.get("background_snapshot_path", None)
+        if not path_raw:
+            raise ValueError("background_snapshot_reset=True requires background_snapshot_path")
+        path = str(Path(path_raw))
+        cached_path = getattr(self, "_background_snapshot_cache_path", None)
+        cached_index = getattr(self, "_background_snapshot_index", None)
+        if cached_path == path and isinstance(cached_index, dict):
+            return cached_index
+
+        with Path(path).open("rb") as f:
+            data = pickle.load(f)
+        if isinstance(data, dict):
+            self._validate_background_snapshot_config_signature(data.get("config_signature", None))
+        snapshot_index = None
+        if isinstance(data, dict) and isinstance(data.get("snapshots_by_offset", None), dict):
+            snapshot_index = {
+                str(key): list(value)
+                for key, value in data["snapshots_by_offset"].items()
+                if isinstance(value, list)
+            }
+        if isinstance(data, dict) and "snapshots" in data:
+            snapshots = data["snapshots"]
+        else:
+            snapshots = data
+        if not isinstance(snapshots, list) or not snapshots:
+            raise ValueError(f"No background snapshots found in {path}")
+        if not snapshot_index:
+            snapshot_index = self._build_background_snapshot_index(snapshots)
+        if not snapshot_index:
+            raise ValueError(f"No indexed background snapshots found in {path}")
+
+        self._background_snapshot_cache_path = path
+        self._background_snapshot_pool = snapshots
+        self._background_snapshot_index = snapshot_index
+        return snapshot_index
+
+    def _load_background_snapshot_shard_meta(self, path: Path) -> dict[str, Any]:
+        path = Path(path)
+        path_key = str(path)
+        cached_path = getattr(self, "_background_snapshot_meta_cache_path", None)
+        cached_meta = getattr(self, "_background_snapshot_meta", None)
+        if cached_path == path_key and isinstance(cached_meta, dict):
+            return cached_meta
+
+        meta_path = path / "meta.pkl"
+        with meta_path.open("rb") as f:
+            meta = pickle.load(f)
+        if not isinstance(meta, dict) or meta.get("format") not in {
+            "offset_shards",
+            "offset_chunk_shards",
+        }:
+            raise ValueError(f"Invalid sharded background snapshot pool metadata in {meta_path}")
+        if int(meta.get("offset_key_scale", self.BACKGROUND_SNAPSHOT_OFFSET_KEY_SCALE)) != int(
+            self.BACKGROUND_SNAPSHOT_OFFSET_KEY_SCALE
+        ):
+            raise ValueError(
+                "Background snapshot pool offset_key_scale does not match current env"
+            )
+        self._validate_background_snapshot_config_signature(meta.get("config_signature", None))
+
+        self._background_snapshot_meta_cache_path = path_key
+        self._background_snapshot_meta = meta
+        return meta
+
+    def _load_background_snapshot_shard(self, path: Path, offset_key: str) -> list[dict[str, Any]]:
+        path = Path(path)
+        path_key = str(path)
+        cached_path = getattr(self, "_background_snapshot_shard_cache_path", None)
+        cached_key = getattr(self, "_background_snapshot_shard_cache_key", None)
+        cached_snapshots = getattr(self, "_background_snapshot_shard_snapshots", None)
+        if cached_path == path_key and cached_key == offset_key and isinstance(cached_snapshots, list):
+            return cached_snapshots
+
+        meta = self._load_background_snapshot_shard_meta(path)
+        shards = meta.get("shards", {})
+        if not isinstance(shards, dict) or offset_key not in shards:
+            raise ValueError(f"No background snapshot shard for offset key {offset_key} in {path}")
+        shard_info = shards[offset_key]
+        if not isinstance(shard_info, dict) or not shard_info.get("file"):
+            raise ValueError(f"Invalid background snapshot shard metadata for offset key {offset_key}")
+
+        shard_path = path / str(shard_info["file"])
+        with shard_path.open("rb") as f:
+            shard = pickle.load(f)
+        if not isinstance(shard, dict):
+            raise ValueError(f"Invalid background snapshot shard payload in {shard_path}")
+        self._validate_background_snapshot_config_signature(shard.get("config_signature", None))
+        snapshots = shard.get("snapshots", None)
+        if not isinstance(snapshots, list) or not snapshots:
+            raise ValueError(f"No background snapshots found in shard {shard_path}")
+
+        self._background_snapshot_shard_cache_path = path_key
+        self._background_snapshot_shard_cache_key = offset_key
+        self._background_snapshot_shard_snapshots = snapshots
+        return snapshots
+
+    def _load_background_snapshot_chunk(
+        self,
+        path: Path,
+        offset_key: str,
+        chunk_info: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        path = Path(path)
+        path_key = str(path)
+        chunk_file = str(chunk_info.get("file", ""))
+        if not chunk_file:
+            raise ValueError(f"Invalid background snapshot chunk metadata for offset key {offset_key}")
+
+        cached_path = getattr(self, "_background_snapshot_chunk_cache_path", None)
+        cached_key = getattr(self, "_background_snapshot_chunk_cache_key", None)
+        cached_file = getattr(self, "_background_snapshot_chunk_cache_file", None)
+        cached_snapshots = getattr(self, "_background_snapshot_chunk_snapshots", None)
+        if (
+            cached_path == path_key
+            and cached_key == offset_key
+            and cached_file == chunk_file
+            and isinstance(cached_snapshots, list)
+        ):
+            return cached_snapshots
+
+        chunk_path = path / chunk_file
+        with chunk_path.open("rb") as f:
+            chunk = pickle.load(f)
+        if not isinstance(chunk, dict):
+            raise ValueError(f"Invalid background snapshot chunk payload in {chunk_path}")
+        self._validate_background_snapshot_config_signature(chunk.get("config_signature", None))
+        snapshots = chunk.get("snapshots", None)
+        if not isinstance(snapshots, list) or not snapshots:
+            raise ValueError(f"No background snapshots found in chunk {chunk_path}")
+
+        self._background_snapshot_chunk_cache_path = path_key
+        self._background_snapshot_chunk_cache_key = offset_key
+        self._background_snapshot_chunk_cache_file = chunk_file
+        self._background_snapshot_chunk_snapshots = snapshots
+        return snapshots
+
+    def _sample_background_snapshot_from_chunked_shard(
+        self,
+        path: Path,
+        offset_key: str,
+        shard_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        chunks = shard_info.get("chunks", None)
+        if not isinstance(chunks, list) or not chunks:
+            raise ValueError(f"No background snapshot chunks for offset key {offset_key}")
+
+        total = int(shard_info.get("count", 0))
+        if total <= 0:
+            total = sum(int(chunk.get("count", 0)) for chunk in chunks if isinstance(chunk, dict))
+        if total <= 0:
+            raise ValueError(f"Empty background snapshot chunk shard for offset key {offset_key}")
+
+        selected = int(self.np_random.integers(total))
+        remaining = selected
+        for chunk_info in chunks:
+            if not isinstance(chunk_info, dict):
+                continue
+            count = int(chunk_info.get("count", 0))
+            if count <= 0:
+                continue
+            if remaining >= count:
+                remaining -= count
+                continue
+            snapshots = self._load_background_snapshot_chunk(path, offset_key, chunk_info)
+            if remaining >= len(snapshots):
+                # Metadata drift should not happen, but keep the failure explicit.
+                raise ValueError(
+                    f"Background snapshot chunk count mismatch for offset key {offset_key}"
+                )
+            return snapshots[remaining]
+
+        raise ValueError(f"Failed to sample background snapshot for offset key {offset_key}")
+
+    def _load_background_snapshot_candidates_from_path(
+        self,
+        path: Path,
+        target: float,
+        cycle: float,
+        tolerance: float,
+    ) -> list[dict[str, Any]]:
+        target_key = int(round(float(target) * self.BACKGROUND_SNAPSHOT_OFFSET_KEY_SCALE))
+
+        if path.is_dir():
+            exact_key = str(target_key)
+            meta = self._load_background_snapshot_shard_meta(path)
+            shards = meta.get("shards", {})
+            if isinstance(shards, dict) and exact_key in shards:
+                shard_info = shards[exact_key]
+                if isinstance(shard_info, dict) and shard_info.get("format") == "chunks":
+                    return [
+                        self._sample_background_snapshot_from_chunked_shard(
+                            path, exact_key, shard_info
+                        )
+                    ]
+                return self._load_background_snapshot_shard(path, exact_key)
+            # Compatibility guard for pools created with tiny floating-point drift.
+            candidates: list[dict[str, Any]] = []
+            for key in (str(target_key - 1), str(target_key + 1)):
+                if not isinstance(shards, dict) or key not in shards:
+                    continue
+                shard_info = shards[key]
+                if isinstance(shard_info, dict) and shard_info.get("format") == "chunks":
+                    snapshot = self._sample_background_snapshot_from_chunked_shard(
+                        path, key, shard_info
+                    )
+                    if self._snapshot_phase_diff(
+                        float(snapshot["phase_offset"]), target, cycle
+                    ) <= tolerance:
+                        candidates.append(snapshot)
+                    continue
+                shard = self._load_background_snapshot_shard(path, key)
+                candidates.extend(
+                    snapshot
+                    for snapshot in shard
+                    if self._snapshot_phase_diff(
+                        float(snapshot["phase_offset"]), target, cycle
+                    )
+                    <= tolerance
+                )
+            return candidates
+
+        snapshot_index = self._load_background_snapshot_pool(path)
+        candidates = snapshot_index.get(str(target_key), [])
+        if not candidates:
+            neighbor_keys = (str(target_key - 1), str(target_key + 1))
+            candidates = [
+                snapshot
+                for key in neighbor_keys
+                for snapshot in snapshot_index.get(key, [])
+                if self._snapshot_phase_diff(float(snapshot["phase_offset"]), target, cycle) <= tolerance
+            ]
+        return candidates
+
+    def _load_background_snapshot_candidates(
+        self,
+        target: float,
+        cycle: float,
+        tolerance: float,
+    ) -> list[dict[str, Any]]:
+        paths = self._background_snapshot_paths()
+        if len(paths) == 1:
+            return self._load_background_snapshot_candidates_from_path(
+                paths[0], target, cycle, tolerance
+            )
+
+        first = int(self.np_random.integers(len(paths)))
+        order = [first] + [idx for idx in range(len(paths)) if idx != first]
+        for idx in order:
+            candidates = self._load_background_snapshot_candidates_from_path(
+                paths[idx], target, cycle, tolerance
+            )
+            if candidates:
+                return candidates
+        return []
+
+    def _snapshot_phase_diff(self, phase_a: float, phase_b: float, cycle: float) -> float:
+        if cycle <= 1e-9:
+            return abs(float(phase_a) - float(phase_b))
+        raw = abs((float(phase_a) - float(phase_b)) % cycle)
+        return min(raw, cycle - raw)
+
+    def _sample_background_snapshot(self) -> dict[str, Any]:
+        cycle = self._snapshot_cycle_seconds_from_config()
+        target = float(self.config.get("episode_start_phase_offset", 0.0))
+        if cycle > 1e-9:
+            target %= cycle
+        tolerance = float(self.BACKGROUND_SNAPSHOT_MATCH_TOLERANCE)
+
+        candidates = self._load_background_snapshot_candidates(target, cycle, tolerance)
+        if not candidates:
+            raise ValueError(
+                "No background snapshot matches "
+                f"episode_start_phase_offset={target:.6f} within {tolerance:.6f}s"
+            )
+
+        idx = int(self.np_random.integers(len(candidates)))
+        return candidates[idx]
+
+    def _vehicle_from_background_snapshot(self, data: dict[str, Any]):
+        class_path = str(data["class_path"])
+        vehicle_cls = utils.class_from_path(class_path)
+        position = np.asarray(data.get("position", [0.0, 0.0]), dtype=float).copy()
+        heading = float(data.get("heading", 0.0))
+        speed = float(data.get("speed", 0.0))
+        lane_index = self._snapshot_lane_index(data.get("lane_index", None))
+        target_lane_index = self._snapshot_lane_index(data.get("target_lane_index", lane_index))
+        route = self._snapshot_route(data.get("route", None))
+        target_speed = float(data.get("target_speed", speed))
+        enable_lane_change = bool(data.get("enable_lane_change", True))
+        timer = float(data.get("timer", 0.0))
+
+        try:
+            vehicle = vehicle_cls(
+                self.road,
+                position,
+                heading,
+                speed,
+                target_lane_index=target_lane_index,
+                target_speed=target_speed,
+                route=route,
+                enable_lane_change=enable_lane_change,
+                timer=timer,
+            )
+        except TypeError:
+            try:
+                vehicle = vehicle_cls(
+                    self.road,
+                    position,
+                    heading,
+                    speed,
+                    target_lane_index=target_lane_index,
+                    target_speed=target_speed,
+                    route=route,
+                )
+            except TypeError:
+                vehicle = vehicle_cls(self.road, position, heading, speed)
+
+        if lane_index is None:
+            lane_index = self.road.network.get_closest_lane_index(position, heading)
+        vehicle.lane_index = lane_index
+        vehicle.lane = self.road.network.get_lane(lane_index)
+        if target_lane_index is not None:
+            vehicle.target_lane_index = target_lane_index
+        if route is not None:
+            vehicle.route = list(route)
+        if hasattr(vehicle, "enable_lane_change"):
+            vehicle.enable_lane_change = enable_lane_change
+        if hasattr(vehicle, "timer"):
+            vehicle.timer = timer
+        vehicle.target_speed = target_speed
+        action = {"steering": 0.0, "acceleration": 0.0}
+        action.update(dict(data.get("action", {}) or {}))
+        vehicle.action = action
+        vehicle.crashed = bool(data.get("crashed", False))
+        vehicle.impact = None
+        if data.get("movement_direction", None) is not None:
+            vehicle.movement_direction = str(data["movement_direction"])
+        if int(data.get("vid", -1)) >= 0:
+            vehicle.vid = int(data["vid"])
+        for attr, value in dict(data.get("attrs", {}) or {}).items():
+            setattr(vehicle, str(attr), self._snapshot_scalar(value))
+        return vehicle
+
+    def _reset_from_background_snapshot(self) -> bool:
+        snapshot = self._sample_background_snapshot()
+        if not isinstance(snapshot, dict):
+            raise ValueError("Background snapshot entries must be dictionaries")
+
+        snapshot_signature = snapshot.get("config_signature", None)
+        if isinstance(snapshot_signature, dict) and "behavior_lane_probs" in snapshot_signature:
+            self.config["behavior_lane_probs"] = snapshot_signature["behavior_lane_probs"]
+
+        self._create_road()
+        self.road.vehicles = []
+        self.controlled_vehicles = []
+        self._clear_virtual_stops()
+
+        cycle = self._snapshot_cycle_seconds_from_config()
+        if "signal_time_global" in snapshot:
+            self._signal_time_global = float(snapshot["signal_time_global"])
+        else:
+            phase = float(snapshot.get("phase_offset", self.config.get("episode_start_phase_offset", 0.0)))
+            cycle_offset = float(getattr(self._signal_controller, "cycle_offset", 0.0))
+            self._signal_time_global = (phase - cycle_offset) % cycle if cycle > 1e-9 else phase
+
+        max_vid = int(snapshot.get("vid", self.config.get("vid", 0)))
+        for vehicle_data in list(snapshot.get("vehicles", []) or []):
+            vehicle = self._vehicle_from_background_snapshot(vehicle_data)
+            self.road.vehicles.append(vehicle)
+            max_vid = max(max_vid, int(getattr(vehicle, "vid", -1)))
+        self.config["vid"] = max(int(self.config.get("vid", 0)), max_vid)
+
+        self.time = 0.0
+        self.steps = 0
+        self._signal_episode_base = float(self._signal_time_global)
+        self._sync_episode_punctual_time()
+        self._create_ego()
+        self._episodes_started += 1
+        self._did_global_warmup = True
+        self._update_signal_virtual_stops(query_time=0.0)
+        return True
 
     def _inter_episode_step_seconds(self) -> float:
         configured = float(self.config.get("inter_episode_step_seconds", 0.0))
@@ -521,7 +1187,6 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self.vehicle = dummy
 
         self._last_speed = 0.0
-        self._last_acc = 0.0
         self._last_longitudinal = 0.0
         self._last_lane_id = int(lane_id)
         self._has_arrived = False
@@ -722,6 +1387,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             return
 
         self._simulate_background_for(delta)
+        self._background_only_sim_time += delta
 
     def _simulate_background_for(self, seconds: float) -> None:
         """Simulate road/background traffic for given wall-clock seconds without ego control."""
@@ -731,12 +1397,12 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         sim_freq = float(self.config["simulation_frequency"])
         base_dt = 1.0 / sim_freq
-        base_spawn_p = float(self.config.get("spawn_probability", 0.0))
 
         while remain > 1e-9:
             dt = min(base_dt, remain)
             self._update_signal_virtual_stops(query_time=None)
             self._clear_background()
+            base_spawn_p = self._current_signal_cycle_spawn_probability()
             spawn_p = base_spawn_p * (dt / base_dt)
             self._spawn_background(spawn_probability=spawn_p)
             self.road.act()
@@ -748,7 +1414,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._update_signal_virtual_stops(query_time=None)
 
     def _warmup(self, render: bool = False):
-        """只跑环境车 warmup_time 秒，可以选择是否渲染出来看。"""
+        """Run background-only warmup before inserting ego."""
         warmup_time = float(self.config["warmup_time"])
         sim_freq = float(self.config["simulation_frequency"])
         sim_dt = 1.0 / sim_freq
@@ -773,47 +1439,52 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             t = k / sim_freq  # 当前 warmup 时间 [s]
             times.append(t)
             avg_speeds.append(avg_speed)
-            
+
             self.road.act()
             self.road.step(sim_dt)
             self._signal_time_global += sim_dt
-            # 调试模式：在 reset 期间也渲染 warmup 的画面
+            # 调试模式：在 reset 期间也渲�?warmup 的画�?
             if render and self.render_mode is not None:
                 self.render()
 
-        # 再做一次清理，避免 warmup 结束时残留 crash 车辆
+        # 再做一次清理，避免 warmup 结束时残�?crash 车辆
         self._clear_virtual_stops()
         self._clear_background()
 
+        self._background_only_sim_time += float(steps) * sim_dt
         self._warmup_times = np.asarray(times, dtype=float)
         self._warmup_avg_speeds = np.asarray(avg_speeds, dtype=float)
 
-    # ----------------- RL step：在 AbstractEnv 的基础上维护车流 ----------------- #
+    # ----------------- RL step：在 AbstractEnv 的基础上维护车�?----------------- #
     def step(self, action):
         if bool(getattr(self, "_inter_episode_active", False)):
             return self._step_inter_episode_dummy(action)
 
-        # 在当前决策步生效的信号相位（供 _simulate 内 IDM 使用）
+        # 在当前决策步生效的信号相位（�?_simulate �?IDM 使用�?
         dt = 1.0 / float(self.config["policy_frequency"])
         self._update_signal_virtual_stops(query_time=self.time + dt)
 
-        # 让 AbstractEnv 完成 ego 控制 + 仿真
+        # �?AbstractEnv 完成 ego 控制 + 仿真
         obs, reward, terminated, truncated, info = super().step(action)
 
         # Sync persistent signal clock to the current episode local time after step().
         self._signal_time_global = float(self._signal_episode_base + self.time)
 
-        # 维持渲染与下一步前的一致信号状态
+        # 维持渲染与下一步前的一致信号状�?
         self._update_signal_virtual_stops(query_time=self.time)
         self._update_queue_takeover_state()
 
-        # 把“加权后的分项奖励”塞进 info，方便 callback 从 infos 里读
+        # 把“加权后的分项奖励”塞�?info，方�?callback �?infos 里读
         weighted = getattr(self, "_last_weighted_rewards", None)
         if isinstance(info, dict) and weighted is not None:
             info["reward_components"] = dict(weighted)
 
         next_obs_is_dummy = False
-        if bool(terminated or truncated) and bool(self.config.get("inter_episode_as_steps", False)):
+        use_inter_episode_steps = (
+            bool(self.config.get("inter_episode_as_steps", False))
+            and not bool(self.config.get("background_snapshot_reset", False))
+        )
+        if bool(terminated or truncated) and use_inter_episode_steps:
             pending = self._compute_episode_start_offset_delta(strict_next=True)
             next_obs_is_dummy = bool(pending > 1e-9)
             if isinstance(info, dict):
@@ -833,7 +1504,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         # 在每个决策步之后，更新一次车流：清除驶离 & crashed，按概率增车
         self._clear_background()
-        self._spawn_background(self.config["spawn_probability"] * (sim_freq / pol_freq))    # TODO: 完善增车策略，现在是按policy_freq集总生成，不是按simu_freq生成
+        self._spawn_background(self._current_signal_cycle_spawn_probability() * (sim_freq / pol_freq))    # TODO: 完善增车策略，现在是按policy_freq集总生成，不是按simu_freq生成
 
         return obs, reward, terminated, truncated, info
 
@@ -856,6 +1527,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             "signal_time_global": float(getattr(self, "_signal_time_global", np.nan)),
             "signal_episode_base": float(getattr(self, "_signal_episode_base", np.nan)),
             "actual_episode_start_phase_offset": self.get_actual_episode_start_phase_offset(),
+            "current_spawn_probability": self._current_signal_cycle_spawn_probability(),
             "punctual_time_target": self.get_punctual_time_target(),
             "punctual_time_window_start": float(punctual_window[0]),
             "punctual_time_window_end": float(punctual_window[1]),
@@ -964,6 +1636,95 @@ class MultiLaneStopToIntEnv(AbstractEnv):
                 pass
         self._virtual_stops = {}
 
+    def _restore_signal_green_launch_behavior(self, vehicle) -> None:
+        original = getattr(vehicle, "_signal_green_launch_original", None)
+        if isinstance(original, dict):
+            for attr, value in original.items():
+                setattr(vehicle, attr, value)
+        if hasattr(vehicle, "_signal_green_launch_original"):
+            delattr(vehicle, "_signal_green_launch_original")
+
+    def _vehicle_signal_direction(self, vehicle) -> str | None:
+        direction = getattr(vehicle, "movement_direction", None)
+        if direction in {"left", "straight"}:
+            return str(direction)
+
+        controller = getattr(self, "_signal_controller", None)
+        if controller is None:
+            return None
+        lane_index = getattr(vehicle, "lane_index", None)
+        if lane_index is None or len(lane_index) < 3:
+            return None
+        return controller.lane_direction(int(lane_index[2]))
+
+    def _signal_green_launch_target_speed(self) -> float:
+        configured = self.config.get("signal_green_launch_target_speed", None)
+        if configured is not None:
+            return max(float(configured), 0.1)
+
+        target_speed = float(AggressiveIDMVehicle.DESIRED_SPEED_MAX)
+        speed_limit = float(self.config.get("speed_limit", target_speed))
+        if np.isfinite(speed_limit) and speed_limit > 0.0:
+            target_speed = min(target_speed, speed_limit)
+        return max(target_speed, 0.1)
+
+    def _green_launch_candidate(self, vehicle, phase: dict[str, dict[str, float | str]]) -> bool:
+        direction = self._vehicle_signal_direction(vehicle)
+        if direction is None:
+            return False
+        state = str(phase.get(direction, {}).get("state", "red"))
+        if state != "green":
+            return False
+
+        try:
+            x = float(np.asarray(vehicle.position, dtype=float)[0])
+        except (TypeError, ValueError, IndexError):
+            return False
+
+        stop_x = float(self._goal_longitudinal())
+        approach_raw = self.config.get("signal_green_launch_approach_distance", None)
+        approach = stop_x if approach_raw is None else max(float(approach_raw), 0.0)
+        intersection = max(float(self.config.get("intersection_length", 0.0)), 0.0)
+        end_margin = max(float(self.config.get("signal_green_launch_end_margin", 5.0)), 0.0)
+        return (stop_x - approach) <= x <= (stop_x + intersection + end_margin)
+
+    def _apply_signal_green_launch_behavior(self, vehicle) -> None:
+        if not isinstance(getattr(vehicle, "_signal_green_launch_original", None), dict):
+            original = {
+                attr: getattr(vehicle, attr)
+                for attr in self.SIGNAL_GREEN_LAUNCH_ATTRS
+                if hasattr(vehicle, attr)
+            }
+            vehicle._signal_green_launch_original = original
+
+        vehicle.target_speed = max(
+            float(getattr(vehicle, "target_speed", 0.0)),
+            self._signal_green_launch_target_speed(),
+        )
+        vehicle.TIME_WANTED = float(AggressiveIDMVehicle.TIME_WANTED_MEAN)
+        vehicle.DISTANCE_WANTED = float(AggressiveIDMVehicle.DISTANCE_WANTED_MEAN)
+        vehicle.COMFORT_ACC_MAX = float(AggressiveIDMVehicle.COMFORT_ACC_MAX_MEAN)
+        vehicle.COMFORT_ACC_MIN = float(AggressiveIDMVehicle.COMFORT_ACC_MIN_MEAN)
+        vehicle.DELTA = 0.5 * (
+            float(AggressiveIDMVehicle.DELTA_LOW)
+            + float(AggressiveIDMVehicle.DELTA_UPP)
+        )
+        vehicle.imperfection = float(AggressiveIDMVehicle.IMPERFECTION_MEAN)
+
+    def _update_signal_green_launch_behavior(self, phase: dict[str, dict[str, float | str]]) -> None:
+        if not hasattr(self, "road") or self.road is None:
+            return
+
+        controlled = tuple(getattr(self, "controlled_vehicles", []) or ())
+        enabled = bool(self.config.get("enable_signal_green_launch_behavior", True))
+        for vehicle in list(getattr(self.road, "vehicles", []) or []):
+            if any(vehicle is controlled_vehicle for controlled_vehicle in controlled):
+                continue
+            if enabled and self._green_launch_candidate(vehicle, phase):
+                self._apply_signal_green_launch_behavior(vehicle)
+            else:
+                self._restore_signal_green_launch_behavior(vehicle)
+
     def _update_signal_virtual_stops(self, query_time: float | None = None) -> None:
         if not hasattr(self, "road") or self.road is None or self._signal_controller is None:
             return
@@ -976,15 +1737,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         groups = self._signal_controller.direction_lane_groups
 
         self._update_signal_render_items(phase)
-
-        if not bool(self.config.get("enable_signal_virtual_stops", True)):
-            for _, v in list(self._virtual_stops.items()):
-                try:
-                    self.road.objects.remove(v)
-                except ValueError:
-                    pass
-            self._virtual_stops = {}
-            return
+        self._update_signal_green_launch_behavior(phase)
 
         ego = getattr(self, "vehicle", None)
         ego_lane_id = None
@@ -1046,7 +1799,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         if state == "red":
             return 0.0, max(remaining + yellow, 0.0)
         return 0.0, max(remaining, 0.0)
-    
+
     # ----------------- RL task 定义 ----------------- #
     def _reward(self, action: Action) -> float:
         raw = self._rewards(action)
@@ -1061,15 +1814,11 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         # Auxiliary metric for HIRO high-level reward shaping:
         # keep env reward unchanged, but expose acc-only comfort contribution in info.
-        comfort_w = float(self.config.get("comfort_reward", 0.0))
-        comfort_acc_only = float(raw.get("comfort_reward_acc_only", raw.get("comfort_reward", 0.0)))
-        weighted["comfort_reward_acc_only_for_high"] = comfort_w * comfort_acc_only * on_road
-
         # 特殊记录 on_road_reward
         weighted["on_road_reward"] = on_road
         self._last_raw_rewards = raw
         self._last_weighted_rewards = weighted
-        
+
         return total
 
     def _rewards(self, action: Action) -> dict[str, float]:
@@ -1083,13 +1832,13 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         route_length = max(target_long - self._start_longitudinal(), 1e-6)
         progress = np.clip(delta_s / route_length, 0.0, 1.0)
 
-        # ---------- 2) 舒适性奖励（加速度 / 加速度+jerk） ----------
+        # ---------- 2) 舒适性奖励（加速度 / 加速度+jerk�?----------
         dt = 1.0 / float(self.config["policy_frequency"])
         cur_speed = self.vehicle.speed
         last_speed = getattr(self, "_last_speed", cur_speed)
         acc = (cur_speed - last_speed) / dt
 
-        # 参考车速辅助奖励：超时后参考车速退化为限速
+        # 参考车速辅助奖励：超时后参考车速退化为限�?
         remaining_distance = max(target_long - longi, 0.0)
         remaining_expected_time = float(self.config.get("punctual_time_target", self.config.get("duration", 0.0))) - float(self.time)
         speed_limit = float(self.config.get("speed_limit", 0.0))
@@ -1097,36 +1846,28 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             ref_speed = speed_limit
         else:
             ref_speed = remaining_distance / max(remaining_expected_time, 1e-6)
-        ref_speed = route_length / float(self.config.get("punctual_time_target", self.config.get("duration", 0.0)))
-        # speed_ref_aux = -abs(float(cur_speed) - float(ref_speed)) * dt
-        speed_ref_aux = 0
+        # ref_speed = route_length / float(self.config.get("punctual_time_target", self.config.get("duration", 0.0)))
+        speed_ref_aux = -abs(float(cur_speed) - float(ref_speed)) * dt
+        # speed_ref_aux = 0
 
 
         a_max = float(self.config["comfort_max_accel"])
         acc_term = (abs(acc) / max(a_max, 1e-6)) ** 2
 
-        use_jerk = bool(self.config.get("comfort_use_jerk", False))
-        comfort_acc_only = -(acc_term) * dt
-        if use_jerk:
-            last_acc = float(getattr(self, "_last_acc", acc))
-            jerk = (acc - last_acc) / dt
-            j_max = float(self.config.get("comfort_max_jerk", 5.0))
-            jerk_term = (abs(jerk) / max(j_max, 1e-6)) ** 2
-
-            w_acc = float(self.config.get("comfort_acc_weight", 1.0))
-            w_jerk = float(self.config.get("comfort_jerk_weight", 1.0))
-            w_sum = max(w_acc + w_jerk, 1e-6)
-            comfort = -((w_acc * acc_term + w_jerk * jerk_term) / w_sum) * dt
-        else:
-            comfort = -(acc_term) * dt
+        comfort = -(acc_term) * dt
         # comfort = - (min(abs(acc) / a_max, 1.0) ** 2) * dt
 
         # ---------- 3) 换道惩罚 ----------
         curr_lane_id = self.vehicle.lane_index[2]
         last_lane_id = getattr(self, "_last_lane_id", curr_lane_id)
         lane_changed = 1.0 if curr_lane_id != last_lane_id else 0.0
+        goal_lane_dense = goal_lane_dense_progress(
+            previous_lane_id=last_lane_id,
+            current_lane_id=curr_lane_id,
+            goal_lane_id=self._goal_lane_id(),
+        )
 
-        # ---------- 4) 准时性奖励（只在首次到达目标时给） ----------
+        # ---------- 4) 准时性奖励（只在首次到达目标时给�?----------
         punctual = 0.0
         if not getattr(self, "_has_arrived", False) and self._goal_reached():
             self._has_arrived = True
@@ -1135,7 +1876,6 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         wrong_lane_terminal = float(self._wrong_lane_terminal_triggered())
 
         self._last_speed = cur_speed
-        self._last_acc = acc
         self._last_lane_id = curr_lane_id
         self._last_longitudinal = longi
         return {
@@ -1143,21 +1883,20 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             "progress_reward": progress,
             "speed_ref_aux_reward": float(speed_ref_aux),
             "comfort_reward": comfort,
-            "comfort_reward_acc_only": comfort_acc_only,
             "lane_change_reward": lane_changed,
+            "goal_lane_dense_reward": goal_lane_dense,
             "punctual_reward": punctual,
             "wrong_lane_terminal_penalty": wrong_lane_terminal,
             "on_road_reward": float(self.vehicle.on_road),
         }
-    
+
 
     def _is_terminated(self) -> bool:
         """The episode is over if the ego vehicle crashed, reached the goal, or went off-road."""
         return (
             self.vehicle.crashed
             or self._goal_longitudinal_reached()
-            or self.config["offroad_terminal"]
-            and not self.vehicle.on_road
+            or not self.vehicle.on_road
         )
 
     def _is_truncated(self) -> bool:
@@ -1169,8 +1908,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         episode_ending = (
             self.vehicle.crashed
             or self._is_truncated()
-            or self.config["offroad_terminal"]
-            and not self.vehicle.on_road
+            or not self.vehicle.on_road
         )
         return wrong_lane_terminal_triggered(
             longitudinal_reached=longitudinal_reached,
@@ -1185,11 +1923,11 @@ class MultiLaneStopToIntEnv(AbstractEnv):
     def _spawn_background(self, spawn_probability=None):
         cfg = self.config
         if spawn_probability is None:
-            spawn_probability = float(cfg["spawn_probability"])
+            spawn_probability = self._current_signal_cycle_spawn_probability()
         if self.np_random.uniform() > spawn_probability:
             return
         lanes = int(cfg["lanes_count"])
-        
+
         behavior_types = cfg.get(
             "behavior_vehicle_types",
             [cfg["other_vehicles_type"]],
@@ -1197,11 +1935,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         n_types = len(behavior_types)
         lane_probs_all = cfg.get("behavior_lane_probs", None)   # 各车道独立的行为分布（可选）
         movement_probs_all = cfg.get("movement_behavior_probs", None)  # 按通行方向配置行为分布（可选）
-        global_probs = np.array(
-            cfg.get("behavior_probs", [1.0] * n_types),
-            dtype=float,
-        )
-        global_probs = global_probs / global_probs.sum()
+        uniform_probs = np.full(n_types, 1.0 / max(n_types, 1), dtype=float)
 
         def _normalize_probs(raw_probs) -> np.ndarray | None:
             try:
@@ -1216,7 +1950,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             return arr / s
 
         def _get_lane_behavior_probs(lane_id: int, direction: str) -> np.ndarray:
-            """返回当前 lane_id 的 behavior 概率向量"""
+            """Return behavior probabilities for a lane."""
             if lane_probs_all is not None:
                 try:
                     lane_row = _normalize_probs(lane_probs_all[lane_id])
@@ -1230,15 +1964,15 @@ class MultiLaneStopToIntEnv(AbstractEnv):
                 if movement_row is not None:
                     return movement_row
 
-            # 回退：使用全局分布
-            return global_probs
+            # Fallback to uniform distribution.
+            return uniform_probs
 
         def _lane_direction(lane_id: int) -> str:
             if self._signal_controller is None:
                 return "left" if lane_id == 0 else "straight"
             return self._signal_controller.lane_direction(lane_id)
 
-        # 尝试若干次（不同车道+速度），找一个符合安全间距的插入点，成功生成一辆就退出循环
+        # Try several lane/speed samples and insert the first safe vehicle.
         for _ in range(2 * lanes):
             lane_id = int(self.np_random.integers(lanes))
             direction = _lane_direction(lane_id)
@@ -1274,24 +2008,20 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             cfg["vid"] += 1
             v.vid = cfg["vid"]
             v.movement_direction = direction
-            if hasattr(v, "randomize_behavior"):    # 随机化车辆参数
+            if hasattr(v, "randomize_behavior"):    # 随机化车辆参�?
                 v.randomize_behavior()
 
             # 可选：锁定环境车在其所属通行方向车道，避免跨方向变道
             if bool(cfg.get("background_vehicle_respect_movement_lanes", True)) and hasattr(v, "enable_lane_change"):
                 v.enable_lane_change = False
-                
+
             self.road.vehicles.append(v)
             break
 
     def _can_spawn_on_lane(self, lane, lane_index, new_speed: float) -> bool:
-        """
-        判断在给定 lane 上、以 new_speed 从 x=0 插入是否安全：
-        - 入口附近必须没有太近的车（空间间距）
-        - 最近前车与入口距离 >= min_gap + new_speed * min_t_headway（时间车头时距约束）
-        """
+        """Return whether inserting a vehicle at x=0 on the lane is safe."""
         cfg = self.config
-        min_gap = float(cfg.get("spawn_min_gap", 10.0))          # 纯空间
+        min_gap = float(cfg.get("spawn_min_gap", 10.0))          # 纯空�?
         min_t_headway = float(cfg.get("spawn_min_t_headway", 1.5))  # 车头时距
         check_cutins = bool(cfg.get("spawn_check_adjacent_cutins", False))
         cutin_front_gap = float(cfg.get("spawn_adjacent_cutin_front_gap", 15.0))
@@ -1324,7 +2054,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             if li[0] != lane_index[0] or li[1] != lane_index[1] or li[2] != lane_index[2]:
                 continue
             longi, _ = lane.local_coordinates(v.position)
-            if longi < 0.0: # 理论上不会有 <0 的车，这里略过
+            if longi < 0.0: # 理论上不会有 <0 的车，这里略�?
                 continue
             if longi < min_gap: # 入口附近有车，直接视为不安全
                 return False
@@ -1334,7 +2064,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         if front_dist is None:  # 该车道入口前方暂时没人，可以安全插入
             return True
 
-        # 安全距离 = 最小空间间距 + v * t_headway
+        # 安全距离 = 最小空间间�?+ v * t_headway
         safe_dist = min_gap + new_speed * min_t_headway
         return front_dist >= safe_dist
 
@@ -1345,11 +2075,11 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         remaining = []
         for v in self.road.vehicles:
-            # ego 一定保留
+            # ego 一定保�?
             if v in self.controlled_vehicles:
                 remaining.append(v)
                 continue
-            # 已经 crash 的环境车直接移除，避免堆成“连环车祸山”
+            # 已经 crash 的环境车直接移除，避免堆成“连环车祸山�?
             if getattr(v, "crashed", False):
                 continue
             # 判断是否驶离场景
@@ -1381,9 +2111,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         lane = self.road.network.get_lane(lane_index)
         ego_speed = self._sample_ego_speed()
 
-        # 清理入口前方车辆：
+        # 清理入口前方车辆�?
         # - ego_clear_radius 为数值时，使用固定半径（兼容旧配置）
-        # - ego_clear_radius="auto" 时，按 safety-layer 约束与前车速度动态计算
+        # - ego_clear_radius="auto" 时，�?safety-layer 约束与前车速度动态计�?
         clear_radius_cfg = cfg.get("ego_clear_radius", "auto")
         use_fixed_radius = isinstance(clear_radius_cfg, (int, float, np.floating))
         cleaned = []
@@ -1407,7 +2137,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             cleaned.append(v)
         self.road.vehicles = cleaned
 
-        # 初始化 ego
+        # 初始�?ego
         longi0 = 0
         position = lane.position(longi0, 0.0)
         heading = lane.heading_at(longi0)
@@ -1417,9 +2147,8 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self.controlled_vehicles = [ego]
         self.road.vehicles.append(ego)
 
-        # 初始化奖励相关的历史量
+        # 初始化奖励相关的历史�?
         self._last_speed = ego_speed
-        self._last_acc = 0.0
         self._last_longitudinal = longi0
         self._has_arrived = False
         self._arrival_time = None
@@ -1427,18 +2156,18 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._queue_takeover_enter_count = 0
 
     def _goal_reached(self) -> bool:
-        """在目标车道且 x >= goal_longitudinal（默认路口前）"""
+        """Return whether ego is on the goal lane and past the goal position."""
         if self.vehicle.lane_index[2] != self._goal_lane_id():
             return False
         return self._goal_longitudinal_reached()
-    
+
     def _goal_longitudinal_reached(self) -> bool:
-        """x >= goal_longitudinal（不要求在目标车道）"""
+        """Return whether ego has reached the configured longitudinal goal."""
         longi = float(self.vehicle.position[0])
         return longi >= self._goal_longitudinal()
-    
+
     def _punctual_factor(self, t: float) -> float:
-        """根据到达时间 t 计算 [0,1] 上的准时性系数"""
+        """Compute punctuality factor in [0, 1]."""
         t_min, t_max = self.config.get("punctual_time_window", [20.0, 30.0])
         t_target = float(self.config.get("punctual_time_target", 25.0))
 
@@ -1452,7 +2181,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         d = abs(t - t_target) / half_width   # in [0,1]
         d = min(d, 1.0)
         return 1.0 - 0.5 * d
-    
+
     def _create_bus_stop(self):
         lane_id = self._initial_lane_id()
         lanes = int(self.config["lanes_count"])
@@ -1462,7 +2191,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         center_long = 0.0
         bus_width = BusStop.WIDTH
         lane_half_width = getattr(lane, "width", 4.0) / 2.0
-        margin = 0.5  # 车道右缘和站台中线之间留一点间隙
+        margin = 0.5  # 车道右缘和站台中线之间留一点间�?
 
         # Always place the stop on the outer side of the selected initial lane.
         side_sign = 1.0 if (2 * lane_id) >= (lanes - 1) else -1.0
@@ -1472,7 +2201,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         position = lane.position(center_long, lateral_center)
         heading = lane.heading_at(center_long)
 
-        # 创建 BusStop 对象并加入 road.objects，交给 viewer 渲染
+        # 创建 BusStop 对象并加�?road.objects，交�?viewer 渲染
         bus_stop = BusStop(self.road, position, heading)
         if not hasattr(self.road, "objects"):
             self.road.objects = []
@@ -1623,20 +2352,20 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         """
         if not hasattr(self, "road") or self.road is None:
             return
-            
+
         # Remove existing goal marker
         if hasattr(self, "_goal_marker") and self._goal_marker in self.road.objects:
             self.road.objects.remove(self._goal_marker)
-            
+
         # Create new marker
         # goal_phys is absolute [x, y, vx, vy]
         position = np.array([goal_phys[0], goal_phys[1]])
-        
+
         # We can use heading 0 for point goal, or calculate if needed
         heading = 0
-        
+
         self._goal_marker = GoalMarker(self.road, position, heading)
-        
+
         if not hasattr(self.road, "objects"):
             self.road.objects = []
         self.road.objects.append(self._goal_marker)

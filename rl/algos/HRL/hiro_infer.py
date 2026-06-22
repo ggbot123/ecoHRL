@@ -4,7 +4,7 @@ from rl.algos.sac.sac import SAC
 from rl.utils import utils
 from rl.algos.HRL.rule_based import RuleBasedAgentWrapper, RuleBasedController
 from rl.algos.HRL.high_goal_safe_bounds import HighGoalSafeBoundsCalculator
-from configs.conf import get_hiro_config
+from configs.builders import get_hiro_config
 
 
 class _SingleEnvAdapter:

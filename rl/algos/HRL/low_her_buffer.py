@@ -51,7 +51,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         device: str | th.device = "auto",
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
-        handle_timeout_termination: bool = True,
+        handle_timeout_termination: bool = False,
         *,
         feat_dim: int,
         kin_flat_dim: int,
@@ -81,7 +81,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             device=device,
             n_envs=n_envs,
             optimize_memory_usage=optimize_memory_usage,
-            handle_timeout_termination=handle_timeout_termination,
+            handle_timeout_termination=False,
         )
 
         self.feat_dim = int(feat_dim)

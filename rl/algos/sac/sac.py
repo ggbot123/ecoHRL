@@ -363,6 +363,7 @@ class SAC(OffPolicyAlgorithm):
                 "comp_speed_ref_aux_reward",
                 "comp_comfort_reward_for_high",
                 "comp_lane_change_reward",
+                "comp_goal_lane_dense_reward",
                 "comp_punctual_reward",
                 "comp_wrong_lane_terminal_penalty",
                 "acc_min",
@@ -443,6 +444,7 @@ class SAC(OffPolicyAlgorithm):
             "speed_ref_aux_reward",
             "comfort_reward_for_high",
             "lane_change_reward",
+            "goal_lane_dense_reward",
             "punctual_reward",
             "wrong_lane_terminal_penalty",
         ]

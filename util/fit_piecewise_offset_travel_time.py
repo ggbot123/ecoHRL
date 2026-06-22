@@ -8,10 +8,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DATA_DIR = Path("debug") / "offset_target_time_table_with_traffic"
-RAW_INPUT_CSV = DATA_DIR / "offset_target_time_raw.csv"
-OUTPUT_PNG = DATA_DIR / "offset_travel_time_piecewise_fit.png"
-OUTPUT_CSV = DATA_DIR / "offset_travel_time_piecewise_fit.csv"
+DATA_ROOT = Path("debug") / "offset_target_time_table_spawn006"
+DATA_DIRS = [
+    DATA_ROOT / "lane_probs_060_030_010",
+    DATA_ROOT / "lane_probs_040_030_030",
+]
 
 LEFT_END = 3.0
 LOW_PLATEAU_END = 25.0
@@ -74,21 +75,35 @@ def piecewise_value(offsets: np.ndarray, slope: float) -> np.ndarray:
 
 def write_fit_csv(path: Path, offsets: np.ndarray, fitted: np.ndarray) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["offset", "fitted_travel_time"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "offset",
+                "fitted_window_center",
+                "fitted_window_start",
+                "fitted_window_end",
+            ],
+        )
         writer.writeheader()
         for offset, travel_time in zip(offsets, fitted):
             writer.writerow(
                 {
                     "offset": f"{offset:.6f}",
-                    "fitted_travel_time": f"{travel_time:.6f}",
+                    "fitted_window_center": f"{travel_time:.6f}",
+                    "fitted_window_start": f"{travel_time - 5.0:.6f}",
+                    "fitted_window_end": f"{travel_time + 5.0:.6f}",
                 }
             )
 
 
-def main() -> None:
-    offsets, means, stds = load_all_lanes_mean(RAW_INPUT_CSV)
+def fit_data_dir(data_dir: Path) -> None:
+    raw_input_csv = data_dir / "offset_target_time_raw.csv"
+    output_png = data_dir / "offset_travel_time_piecewise_fit.png"
+    output_csv = data_dir / "offset_travel_time_piecewise_fit.csv"
+
+    offsets, means, stds = load_all_lanes_mean(raw_input_csv)
     if offsets.size == 0:
-        raise RuntimeError(f"No travel-time rows found in {RAW_INPUT_CSV}")
+        raise RuntimeError(f"No travel-time rows found in {raw_input_csv}")
 
     slope = fit_shared_slope(offsets, means)
     fitted_at_samples = piecewise_value(offsets, slope)
@@ -136,11 +151,12 @@ def main() -> None:
     ax.grid(True, color="#D0D0D0", linewidth=0.7, alpha=0.7)
     ax.legend(loc="upper right")
 
-    OUTPUT_PNG.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(OUTPUT_PNG, dpi=200)
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_png, dpi=200)
     plt.close(fig)
-    write_fit_csv(OUTPUT_CSV, offsets, fitted_at_samples)
+    write_fit_csv(output_csv, offsets, fitted_at_samples)
 
+    print(f"\n=== {data_dir} ===")
     print(f"shared slope: {slope:.8f}")
     print(f"outer-segment RMSE: {rmse_outer:.6f} s")
     print("piecewise function:")
@@ -148,8 +164,13 @@ def main() -> None:
     print("  3 <= offset < 25  : y = 35")
     print("  25 <= offset < 30 : y = 75")
     print(f"  offset >= 30 : y = {HIGH_LEVEL:.1f} + ({slope:.8f}) * (offset - 30)")
-    print(OUTPUT_PNG.resolve())
-    print(OUTPUT_CSV.resolve())
+    print(output_png.resolve())
+    print(output_csv.resolve())
+
+
+def main() -> None:
+    for data_dir in DATA_DIRS:
+        fit_data_dir(data_dir)
 
 
 if __name__ == "__main__":

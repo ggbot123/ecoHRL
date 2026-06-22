@@ -46,7 +46,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
         device: str | th.device = "auto",
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
-        handle_timeout_termination: bool = True,
+        handle_timeout_termination: bool = False,
         *,
         max_seq_len: int,
         kin_flat_dim: int,
@@ -69,7 +69,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
             device=device,
             n_envs=n_envs,
             optimize_memory_usage=optimize_memory_usage,
-            handle_timeout_termination=handle_timeout_termination,
+            handle_timeout_termination=False,
         )
 
         # This implementation is only used with a 1-env dummy vec env for the high-level policy.
@@ -107,6 +107,7 @@ class HiROHighReplayBuffer(ReplayBuffer):
             "speed_ref_aux_reward",
             "comfort_reward_for_high",
             "lane_change_reward",
+            "goal_lane_dense_reward",
             "punctual_reward",
             "wrong_lane_terminal_penalty",
         ]

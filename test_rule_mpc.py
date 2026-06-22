@@ -15,7 +15,7 @@ except Exception:
     def tqdm(iterable, *args, **kwargs):
         return iterable
 
-from configs.conf import get_env_config_for_scenario, get_scenario_spec
+from configs.builders import get_env_config_for_scenario, get_scenario_spec
 from custom_env.vehicle.behavior import IDMVehicle
 from rl.algos.HRL.rule_based import RuleBasedController
 from util.hiro_utils import unique_path

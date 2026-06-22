@@ -13,25 +13,6 @@ def deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> Dict[str, Any]:
     return dst
 
 
-def sync_observation_with_comfort_switch(cfg: Dict[str, Any]) -> None:
-    """Keep observation features consistent with comfort_use_jerk."""
-    use_jerk = bool(cfg.get("comfort_use_jerk", False))
-    obs_cfg = cfg.setdefault("observation", {})
-    features = list(obs_cfg.get("features", []))
-    features_range = dict(obs_cfg.get("features_range", {}))
-
-    if use_jerk:
-        if "acceleration" not in features:
-            features.append("acceleration")
-        features_range.setdefault("acceleration", [-5.0, 5.0])
-    else:
-        features = [f for f in features if f != "acceleration"]
-        features_range.pop("acceleration", None)
-
-    obs_cfg["features"] = features
-    obs_cfg["features_range"] = features_range
-
-
 def sync_lane_slot_observation_switch(cfg: Dict[str, Any]) -> None:
     """Optionally switch to fixed lane-slot kinematics without touching legacy mode."""
     if not bool(cfg.get("use_lane_slot_observation", False)):
@@ -129,7 +110,6 @@ def build_env_config(
     cfg = deepcopy(base_config)
     if overrides:
         deep_update(cfg, overrides)
-    sync_observation_with_comfort_switch(cfg)
     sync_lane_slot_observation_switch(cfg)
     sync_goal_lane_observation_switch(cfg)
     sync_punctual_time_with_phase_offset(cfg)

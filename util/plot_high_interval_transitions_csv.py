@@ -12,7 +12,7 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import numpy as np
 
-from configs.conf import get_env_config
+from configs.builders import get_env_config
 from rl.utils.utils import goal_action_to_abs
 
 

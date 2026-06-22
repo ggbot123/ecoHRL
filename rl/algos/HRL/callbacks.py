@@ -90,6 +90,7 @@ class HIROLoggingCallback(BaseCallback):
             "speed_ref_aux_reward",
             "comfort_reward_for_high",
             "lane_change_reward",
+            "goal_lane_dense_reward",
             "punctual_reward",
             "wrong_lane_terminal_penalty",
         ]
@@ -123,6 +124,7 @@ class HIROLoggingCallback(BaseCallback):
             "progress_reward",
             "comfort_reward",
             "lane_change_reward",
+            "goal_lane_dense_reward",
             "punctual_reward",
             "wrong_lane_terminal_penalty",
         ]
@@ -155,6 +157,7 @@ class HIROLoggingCallback(BaseCallback):
                     "high_comp_speed_ref_aux_reward",
                     "high_comp_comfort_reward_for_high",
                     "high_comp_lane_change_reward",
+                    "high_comp_goal_lane_dense_reward",
                     "high_comp_punctual_reward",
                     "high_comp_wrong_lane_terminal_penalty",
                     "low_seq_collision_reward",
@@ -162,6 +165,7 @@ class HIROLoggingCallback(BaseCallback):
                     "low_seq_speed_ref_aux_reward",
                     "low_seq_comfort_reward_for_high",
                     "low_seq_lane_change_reward",
+                    "low_seq_goal_lane_dense_reward",
                     "low_seq_punctual_reward",
                     "low_seq_wrong_lane_terminal_penalty",
                     "low_seq_ego_acceleration",
@@ -596,20 +600,16 @@ class HIROLoggingCallback(BaseCallback):
         return int(env_i) == 0 and bool(active)
 
     def _effective_high_components(self, rc: dict[str, Any]) -> dict[str, float]:
-        # Use the same rule as HIRO high_ret accumulation in hiro.py:
-        # when high_use_acc_only_comfort=True, replace mixed comfort with acc-only comfort contribution.
         comp = {
             "collision_reward": float(rc.get("collision_reward", 0.0)),
             "progress_reward": float(rc.get("progress_reward", 0.0)),
             "speed_ref_aux_reward": float(rc.get("speed_ref_aux_reward", 0.0)),
             "lane_change_reward": float(rc.get("lane_change_reward", 0.0)),
+            "goal_lane_dense_reward": float(rc.get("goal_lane_dense_reward", 0.0)),
             "punctual_reward": float(rc.get("punctual_reward", 0.0)),
             "wrong_lane_terminal_penalty": float(rc.get("wrong_lane_terminal_penalty", 0.0)),
         }
-        if bool(getattr(self.model, "high_use_acc_only_comfort", False)):
-            comp["comfort_reward_for_high"] = float(rc.get("comfort_reward_acc_only_for_high", rc.get("comfort_reward", 0.0)))
-        else:
-            comp["comfort_reward_for_high"] = float(rc.get("comfort_reward", 0.0))
+        comp["comfort_reward_for_high"] = float(rc.get("comfort_reward", 0.0))
         return comp
 
     def _to_physical_acc(self, a1: float) -> float:
@@ -1199,6 +1199,7 @@ class HIROLoggingCallback(BaseCallback):
                             comp_sums["speed_ref_aux_reward"],
                             comp_sums["comfort_reward_for_high"],
                             comp_sums["lane_change_reward"],
+                            comp_sums["goal_lane_dense_reward"],
                             comp_sums["punctual_reward"],
                             comp_sums["wrong_lane_terminal_penalty"],
                             self._json_arr(comp_seq.get("collision_reward", [])),
@@ -1206,6 +1207,7 @@ class HIROLoggingCallback(BaseCallback):
                             self._json_arr(comp_seq.get("speed_ref_aux_reward", [])),
                             self._json_arr(comp_seq.get("comfort_reward_for_high", [])),
                             self._json_arr(comp_seq.get("lane_change_reward", [])),
+                            self._json_arr(comp_seq.get("goal_lane_dense_reward", [])),
                             self._json_arr(comp_seq.get("punctual_reward", [])),
                             self._json_arr(comp_seq.get("wrong_lane_terminal_penalty", [])),
                             self._json_arr(self._hi_acc_seq_by_env.get(env_i, [])),

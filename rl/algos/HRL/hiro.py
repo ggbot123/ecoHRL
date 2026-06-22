@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, List, Optional, Callable
 
 import gymnasium as gym
@@ -221,7 +221,11 @@ def compute_low_level_external_reward(
     """Remove task-level rewards that should only train the high level."""
     replay_mask_f = np.asarray(replay_mask, dtype=np.float32)
     low_reward = np.asarray(reward_env, dtype=np.float32) * replay_mask_f
-    excluded_names = ["punctual_reward", "wrong_lane_terminal_penalty"]
+    excluded_names = [
+        "goal_lane_dense_reward",
+        "punctual_reward",
+        "wrong_lane_terminal_penalty",
+    ]
     if exclude_progress:
         excluded_names.append("progress_reward")
     for name in excluded_names:
@@ -298,6 +302,20 @@ class LowSafetyFilterConfig:
 
 
 @dataclass
+class HighGoalSafetyConfig:
+    enabled: bool = False
+    eps: float = 1e-6
+    use_custom_kinematics: bool = True
+    max_accel: Optional[float] = 2.0
+    max_decel: Optional[float] = 3.0
+    front_dmin: float = 15.0
+    lane_change_rear_dmin: float = 10.0
+    min_goal_x_span: float = 0.0
+    enable_goal_vx_bounds: bool = False
+    dynamic_feasible_lane_intervals: bool = True
+
+
+@dataclass
 class HIROConfig:
     high_interval: int         # 高层每 high_interval 个 env.step 决策一次
     batch_size: int
@@ -326,17 +344,48 @@ class HIROConfig:
     low_safety_filter: Optional[LowSafetyFilterConfig] = None
     low_safety_violation_penalty: float = 0.0
     fixed_goal_vx: Optional[float] = None
-    use_high_goal_safety_layer: bool = False
-    high_goal_safe_eps: float = 1e-6
-    high_goal_safe_use_custom_kinematics: bool = False
-    high_goal_safe_max_accel: Optional[float] = None
-    high_goal_safe_max_decel: Optional[float] = None
-    high_goal_safe_front_dmin: float = 0.0
-    high_goal_safe_lane_change_rear_dmin: float = 0.0
-    high_goal_safe_min_goal_x_span: float = 0.0
+    high_goal_safety: HighGoalSafetyConfig = field(default_factory=HighGoalSafetyConfig)
     high_obs_use_signal_features: bool = True
-    high_goal_safe_enable_goal_vx_bounds: bool = True
-    high_goal_dynamic_feasible_lane_intervals: bool = False
+
+    @property
+    def use_high_goal_safety_layer(self) -> bool:
+        return bool(self.high_goal_safety.enabled)
+
+    @property
+    def high_goal_safe_eps(self) -> float:
+        return float(self.high_goal_safety.eps)
+
+    @property
+    def high_goal_safe_use_custom_kinematics(self) -> bool:
+        return bool(self.high_goal_safety.use_custom_kinematics)
+
+    @property
+    def high_goal_safe_max_accel(self) -> Optional[float]:
+        return self.high_goal_safety.max_accel
+
+    @property
+    def high_goal_safe_max_decel(self) -> Optional[float]:
+        return self.high_goal_safety.max_decel
+
+    @property
+    def high_goal_safe_front_dmin(self) -> float:
+        return float(self.high_goal_safety.front_dmin)
+
+    @property
+    def high_goal_safe_lane_change_rear_dmin(self) -> float:
+        return float(self.high_goal_safety.lane_change_rear_dmin)
+
+    @property
+    def high_goal_safe_min_goal_x_span(self) -> float:
+        return float(self.high_goal_safety.min_goal_x_span)
+
+    @property
+    def high_goal_safe_enable_goal_vx_bounds(self) -> bool:
+        return bool(self.high_goal_safety.enable_goal_vx_bounds)
+
+    @property
+    def high_goal_dynamic_feasible_lane_intervals(self) -> bool:
+        return bool(self.high_goal_safety.dynamic_feasible_lane_intervals)
 
 
 class HIROSAC:
@@ -374,7 +423,6 @@ class HIROSAC:
 
         # ---- 从env中获取的必要变量 --- #
         env_cfg = env.get_attr("config", indices=0)[0]
-        self.high_use_acc_only_comfort = bool(env_cfg.get("high_use_acc_only_comfort", True))
         self.queue_takeover_enabled = bool(env_cfg.get("enable_queue_takeover", False))
         self.high_gamma = float(high_sac_kwargs.get("gamma", 0.99))
         self.punctual_time_target = float(env_cfg.get("punctual_time_target", env_cfg.get("duration", 0.0)))
@@ -481,7 +529,9 @@ class HIROSAC:
             if low_inference_only:
                 low_sac_kwargs["buffer_size"] = int(min(int(low_sac_kwargs.get("buffer_size", 1000000)), 1024))
                 low_sac_kwargs.pop("replay_buffer_class", None)
-                low_sac_kwargs.pop("replay_buffer_kwargs", None)
+                rb_kwargs_low = dict(low_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
+                rb_kwargs_low["handle_timeout_termination"] = False
+                low_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs_low
                 print("[HIRO] Low SAC inference-only mode in high_only: keep n_envs, use small replay buffer")
 
             use_low_her = bool(self.low_use_her)
@@ -889,6 +939,7 @@ class HIROSAC:
             "speed_ref_aux_reward",
             "comfort_reward_for_high",
             "lane_change_reward",
+            "goal_lane_dense_reward",
             "punctual_reward",
             "wrong_lane_terminal_penalty",
         ]
@@ -1140,21 +1191,8 @@ class HIROSAC:
             except Exception:
                 physical_acc = np.zeros(n_envs, dtype=np.float32)
 
-            # High-level reward policy switch:
-            # True  -> replace mixed comfort (acc+jerk) with acc-only comfort contribution
-            # False -> keep env extrinsic reward unchanged
             replay_mask_f = replay_mask.astype(np.float32)
-            if self.high_use_acc_only_comfort:
-                comfort_mixed = np.asarray([rc.get("comfort_reward", 0.0) for rc in r_components], dtype=np.float32) * replay_mask_f
-                comfort_acc_only = np.asarray(
-                    [rc.get("comfort_reward_acc_only_for_high", rc.get("comfort_reward", 0.0)) for rc in r_components],
-                    dtype=np.float32,
-                ) * replay_mask_f
-                high_step_reward = (
-                    reward_env * replay_mask_f - comfort_mixed + comfort_acc_only
-                )
-            else:
-                high_step_reward = reward_env * replay_mask_f
+            high_step_reward = reward_env * replay_mask_f
             high_ret = discounted_option_reward_update(
                 high_ret,
                 high_step_reward,
@@ -1175,13 +1213,9 @@ class HIROSAC:
                     high_comp_sums["collision_reward"][i] += discount_i * float(rc.get("collision_reward", 0.0))
                     high_comp_sums["progress_reward"][i] += discount_i * float(rc.get("progress_reward", 0.0))
                     high_comp_sums["speed_ref_aux_reward"][i] += discount_i * float(rc.get("speed_ref_aux_reward", 0.0))
-                    if self.high_use_acc_only_comfort:
-                        high_comp_sums["comfort_reward_for_high"][i] += discount_i * float(
-                            rc.get("comfort_reward_acc_only_for_high", rc.get("comfort_reward", 0.0))
-                        )
-                    else:
-                        high_comp_sums["comfort_reward_for_high"][i] += discount_i * float(rc.get("comfort_reward", 0.0))
+                    high_comp_sums["comfort_reward_for_high"][i] += discount_i * float(rc.get("comfort_reward", 0.0))
                     high_comp_sums["lane_change_reward"][i] += discount_i * float(rc.get("lane_change_reward", 0.0))
+                    high_comp_sums["goal_lane_dense_reward"][i] += discount_i * float(rc.get("goal_lane_dense_reward", 0.0))
                     high_comp_sums["punctual_reward"][i] += discount_i * float(rc.get("punctual_reward", 0.0))
                     high_comp_sums["wrong_lane_terminal_penalty"][i] += discount_i * float(rc.get("wrong_lane_terminal_penalty", 0.0))
                 idx_replay = np.flatnonzero(replay_mask)
@@ -1244,7 +1278,7 @@ class HIROSAC:
                 if not low_replay_mask[i]:
                     continue
                 for name, val in rc.items():
-                    if name in {"punctual_reward", "wrong_lane_terminal_penalty"}:
+                    if name in {"goal_lane_dense_reward", "punctual_reward", "wrong_lane_terminal_penalty"}:
                         continue
                     low_comp_sums.setdefault(name, np.zeros(n_envs, dtype=np.float32))[i] += float(val)
             if low_transition_end.any():

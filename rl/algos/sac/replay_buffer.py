@@ -17,7 +17,7 @@ class SkipReplayBuffer(ReplayBuffer):
         device: str | th.device = "auto",
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
-        handle_timeout_termination: bool = True,
+        handle_timeout_termination: bool = False,
     ) -> None:
         self.source_n_envs = int(n_envs)
         # Store valid transitions one by one so skipped vector-env slots do not
@@ -29,7 +29,7 @@ class SkipReplayBuffer(ReplayBuffer):
             device=device,
             n_envs=1,
             optimize_memory_usage=optimize_memory_usage,
-            handle_timeout_termination=handle_timeout_termination,
+            handle_timeout_termination=False,
         )
 
     def add(
