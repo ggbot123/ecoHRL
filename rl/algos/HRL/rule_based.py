@@ -1229,11 +1229,12 @@ class RuleBasedAgentWrapper:
 
     def _apply_follow_mode_cap(self, action: np.ndarray) -> np.ndarray:
         safe = np.asarray(action, dtype=np.float32).reshape(-1).copy()
-        if safe.size < 2:
+        acc_idx = 1 if self.controller.action_type == "ParamLaneAccelAction" else 0
+        if safe.size <= acc_idx:
             return safe
-        acc_phys = self.controller._acc_norm_to_phys(float(safe[1]))
+        acc_phys = self.controller._acc_norm_to_phys(float(safe[acc_idx]))
         acc_phys = min(acc_phys, self.follow_max_acc)
-        safe[1] = self.controller._acc_phys_to_norm(acc_phys)
+        safe[acc_idx] = self.controller._acc_phys_to_norm(acc_phys)
         return safe.astype(np.float32)
 
     def act(self, low_obs: np.ndarray, goal_phys: np.ndarray) -> np.ndarray:
@@ -1243,10 +1244,12 @@ class RuleBasedAgentWrapper:
         # low_obs = [t_norm, local_kin_flat, goal_rel]
         kin_slice = low_obs[:, : 1 + self.n_veh_local * self.feat_dim]
         _, kin, _ = rl_utils.split_time_kinematics(kin_slice, self.n_veh_local, self.feat_dim)
+        use_follow_state = int(low_obs.shape[0]) == int(self.n_envs)
 
         actions: List[np.ndarray] = []
         for i in range(int(low_obs.shape[0])):
             t_norm = float(low_obs[i, 0])
+            self._reset_follow_active_at_interval_start(i, t_norm, use_follow_state)
             rem_time = float(self.high_interval) * (1.0 - t_norm) * float(self.dt)
 
             ego_feat = kin[i, 0]
@@ -1271,8 +1274,11 @@ class RuleBasedAgentWrapper:
             others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
             extra_start = int(1 + self.n_veh_local * self.feat_dim)
             extra = low_obs[i, extra_start : extra_start + self.obs_extra_dim]
+            front_gap, front_ttc = self._front_follow_metrics(others_rel_arr, float(ego_abs[2]), extra)
             others_rel_arr = self._augment_others_with_front_extra(others_rel_arr, float(ego_abs[2]), extra)
             a = self.controller.compute_action(ego_abs, others_rel_arr, goal_phys[i], self.dt, remaining_time=rem_time)
+            if self._update_follow_active(i, front_gap, front_ttc, use_state=use_follow_state):
+                a = self._apply_follow_mode_cap(a)
             actions.append(a)
 
         return np.asarray(actions, dtype=np.float32)
@@ -1284,12 +1290,10 @@ class RuleBasedAgentWrapper:
 
         kin_slice = low_obs[:, : 1 + self.n_veh_local * self.feat_dim]
         _, kin, _ = rl_utils.split_time_kinematics(kin_slice, self.n_veh_local, self.feat_dim)
-        use_follow_state = int(low_obs.shape[0]) == int(self.n_envs)
 
         safe_actions: List[np.ndarray] = []
         for i in range(int(low_obs.shape[0])):
             t_norm = float(low_obs[i, 0])
-            self._reset_follow_active_at_interval_start(i, t_norm, use_follow_state)
             rem_time = float(self.high_interval) * (1.0 - t_norm) * float(self.dt)
 
             ego_feat = kin[i, 0]
@@ -1312,7 +1316,6 @@ class RuleBasedAgentWrapper:
             others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
             extra_start = int(1 + self.n_veh_local * self.feat_dim)
             extra = low_obs[i, extra_start : extra_start + self.obs_extra_dim]
-            front_gap, front_ttc = self._front_follow_metrics(others_rel_arr, float(ego_vel[0]), extra)
             others_rel_arr = self._augment_others_with_front_extra(others_rel_arr, float(ego_vel[0]), extra)
             g0 = int(1 + self.n_veh_local * self.feat_dim + self.obs_extra_dim)
             g1 = int(g0 + self.goal_dim)
@@ -1326,8 +1329,6 @@ class RuleBasedAgentWrapper:
                 dt=self.dt,
                 remaining_time=rem_time,
             )
-            if self._update_follow_active(i, front_gap, front_ttc, use_state=use_follow_state):
-                safe_a = self._apply_follow_mode_cap(safe_a)
             safe_actions.append(safe_a)
 
         return np.asarray(safe_actions, dtype=np.float32)

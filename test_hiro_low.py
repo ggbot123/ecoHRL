@@ -1,5 +1,7 @@
 import os
 import csv
+import contextlib
+import io
 import json
 import importlib
 from datetime import datetime
@@ -9,11 +11,15 @@ import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 from stable_baselines3.common.buffers import ReplayBuffer
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 from configs.builders import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 from rl.algos.sac.sac import SAC
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
-from rl.algos.HRL.goal_samplers import UniformGoalSampler
+from rl.algos.HRL.goal_samplers import get_goal_sampler
 from rl.utils import utils as hiro_utils
 from util.mpc import MPCController
 from util.plot_result import (
@@ -25,6 +31,7 @@ from util.plot_result import (
 )
 from util.hiro_low_test_utils import (
     setup_env_with_state,
+    make_vehicle,
     build_high_action_space,
     default_metric_fn,
     abs_dx_metric_fn,
@@ -32,19 +39,136 @@ from util.hiro_low_test_utils import (
     load_test_cases_from_csv,
     evaluate_q_sa_surface,
 )
+from util.hiro_low_offline_eval import load_low_eval_cases
 from util.hiro_low_batch_utils import run_batch_random_neighbors_acc_eval
+from util.config_utils import deep_update
+from util.hiro_utils import (
+    apply_hiro_config_overrides,
+    env_config_from_run_config,
+    hiro_config_from_run_config,
+    load_hiro_run_config,
+)
+from custom_env.vehicle.kinematics import Vehicle
 
 
 class _DummyHigh:
-    """占位高层模型，避免低层测试时强制依赖高层模型�?""
+    """Placeholder high-level policy for low-level-only tests."""
 
     def predict(self, obs: np.ndarray, deterministic: bool = True):
-        # HIRO high action 维度通常�?3：[dx, y_code, vx]
+        # HIRO high action is usually 3D: [dx, y_code, vx].
         return np.zeros((1, 3), dtype=np.float32), None
 
 
 _abs_dx_metric_fn = abs_dx_metric_fn
 _abs_dy_metric_fn = abs_dy_metric_fn
+
+
+def _model_dir_from_low_model_path(low_model_path: str) -> str:
+    normalized = os.path.normpath(str(low_model_path))
+    if os.path.isdir(normalized):
+        return normalized
+    parent = os.path.dirname(normalized)
+    return parent or "."
+
+
+def _lane_id_from_y(y: float, lane_width: float, lanes_count: int) -> int:
+    lane_width = max(float(lane_width), 1e-6)
+    lanes_count = max(int(lanes_count), 1)
+    return int(np.clip(int(round(float(y) / lane_width)), 0, lanes_count - 1))
+
+
+def _safe_case_id(raw: Any, fallback: str) -> str:
+    text = str(raw).strip() if raw is not None else ""
+    if not text:
+        text = str(fallback)
+    for ch in ["/", "\\", " ", ":", "*", "?", "\"", "<", ">", "|"]:
+        text = text.replace(ch, "_")
+    return text
+
+
+def _to_vec4(value: Any, field_name: str) -> List[float]:
+    if value is None:
+        raise ValueError(f"{field_name} is missing")
+    arr = list(value)
+    if len(arr) < 4:
+        raise ValueError(f"{field_name} must have at least 4 values")
+    return [float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])]
+
+
+def _goal_phys_with_masked_vx(goal_phys: Sequence[float]) -> np.ndarray:
+    arr = np.asarray(goal_phys, dtype=np.float32).reshape(-1).copy()
+    if arr.shape[0] < 4:
+        raise ValueError("goal_phys must contain at least [x, y, vx, vy]")
+    arr[2] = 0.0
+    return arr
+
+
+def _normalize_low_eval_json_case(case: Dict[str, Any], index: int) -> Dict[str, Any]:
+    case_id = case.get("case_id", f"case_{index:03d}")
+    normalized = dict(case)
+    normalized["case_id"] = str(case_id)
+    normalized["ego_state"] = _to_vec4(case.get("ego_state"), "ego_state")
+    normalized["goal_phys"] = _to_vec4(case.get("goal_phys"), "goal_phys")
+    neighbors_state = case.get("neighbors_state", []) or []
+    normalized["neighbors_state"] = [_to_vec4(v, f"neighbors_state[{i}]") for i, v in enumerate(neighbors_state)]
+    normalized["neighbors_snapshot"] = list(case.get("neighbors_snapshot", []) or [])
+    normalized["scenario_label"] = str(case.get("scenario_label", "") or "")
+    return normalized
+
+
+def load_test_cases_from_json(json_path: str, max_cases: Optional[int] = None) -> List[Dict[str, Any]]:
+    raw_cases = load_low_eval_cases(json_path)
+    cases = [
+        _normalize_low_eval_json_case(case, i)
+        for i, case in enumerate(raw_cases, start=1)
+    ]
+    if max_cases is not None and int(max_cases) > 0:
+        cases = cases[: int(max_cases)]
+    if not cases:
+        raise ValueError(f"No usable cases in JSON: {json_path}")
+    return cases
+
+
+def setup_env_with_low_case(
+    env,
+    ego_state: Sequence[float],
+    neighbors_state: Sequence[Sequence[float]],
+    neighbors_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
+):
+    """Restore one low-level test case, preserving behavior vehicles when snapshots are available."""
+    if not neighbors_snapshot:
+        return setup_env_with_state(env, ego_state, neighbors_state)
+
+    base_env = env.unwrapped
+    road = base_env.road
+    road.vehicles = []
+    base_env.controlled_vehicles = []
+
+    ego_cls = base_env.action_type.vehicle_class
+    ego = make_vehicle(road, ego_state, ego_cls)
+
+    neighbors: List[Vehicle] = []
+    for i, raw in enumerate(list(neighbors_snapshot)):
+        try:
+            if hasattr(base_env, "_vehicle_from_background_snapshot"):
+                neighbors.append(base_env._vehicle_from_background_snapshot(dict(raw)))
+            else:
+                state = neighbors_state[i] if i < len(neighbors_state) else raw.get("state", None)
+                neighbors.append(make_vehicle(road, _to_vec4(state, f"neighbors_snapshot[{i}]"), Vehicle))
+        except Exception:
+            if i < len(neighbors_state):
+                neighbors.append(make_vehicle(road, neighbors_state[i], Vehicle))
+
+    base_env.controlled_vehicles = [ego]
+    base_env.vehicle = ego
+    road.vehicles = [ego] + neighbors
+
+    for v in road.vehicles:
+        if hasattr(v, "history"):
+            v.history.clear()
+            v.history.appendleft(Vehicle.create_from(v))
+
+    return base_env, ego, neighbors
 
 
 def run_mpc_theoretical_optimal(
@@ -59,11 +183,12 @@ def run_mpc_theoretical_optimal(
     mpc_global_maxiter: int = 250,
     mpc_plot_alternative_optima: bool = False,
     mpc_max_alternative_optima: int = 3,
+    hiro_cfg: Optional[Any] = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
     base_env, _, _ = setup_env_with_state(env, ego_state, neighbors_state)
-    hiro_cfg = get_hiro_config()
+    hiro_cfg = hiro_cfg or get_hiro_config()
     mpc = MPCController(
         base_env,
         horizon=int(max(1, horizon)),
@@ -186,7 +311,7 @@ def run_mpc_theoretical_optimal(
     fig.savefig(speed_fig, dpi=150)
     plt.close(fig)
 
-    # 2) 加速度曲线（物�?+ 归一化）
+    # 2) Acceleration curve: physical and normalized values.
     acc_fig = os.path.join(out_dir, "mpc_acc_curve.png")
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(t, acc_phys[:n_steps], linewidth=1.6, label="acc_phys (m/s^2)")
@@ -204,7 +329,7 @@ def run_mpc_theoretical_optimal(
     fig.savefig(acc_fig, dpi=150)
     plt.close(fig)
 
-    # 3) 换道曲线（lane_scalar + lane_id�?
+    # 3) Lane-change curve: lane_scalar and lane_id.
     lane_fig = os.path.join(out_dir, "mpc_lane_change_curve.png")
     fig, ax1 = plt.subplots(figsize=(8, 3))
     ax1.plot(t, lane_scalar, color="tab:blue", linewidth=1.6, label="lane_scalar")
@@ -254,7 +379,7 @@ def run_mpc_theoretical_optimal(
     fig.savefig(lane_fig, dpi=150)
     plt.close(fig)
 
-    print("MPC low-level 理论最优解结果�?)
+    print("MPC low-level theoretical optimum:")
     print(f"  success         : {summary['success']}")
     print(f"  message         : {summary['message']}")
     print(f"  horizon         : {summary['horizon']}")
@@ -329,7 +454,33 @@ def run_uniform_goal_trials(
     metric_fn = metric_fn or default_metric_fn
 
     high_act_space = build_high_action_space(env, runner.hi)
-    sampler = UniformGoalSampler(high_act_space)
+
+    def _extract_ego_speed(high_obs_batch: np.ndarray) -> np.ndarray:
+        arr = np.asarray(high_obs_batch, dtype=np.float32)
+        _, kin, _ = hiro_utils.split_time_kinematics(arr, runner.n_veh, runner.feat_dim)
+        ego_sub = hiro_utils.extract_ego_substate(kin, runner.ego_feature_idx)
+        if ego_sub.shape[1] >= 4:
+            vx = ego_sub[:, 2]
+            vy = ego_sub[:, 3]
+            return np.sqrt(np.maximum(vx * vx + vy * vy, 0.0)).astype(np.float32)
+        return np.zeros((arr.shape[0],), dtype=np.float32)
+
+    enable_vx_bounds = bool(getattr(runner.cfg, "high_goal_safe_enable_goal_vx_bounds", True))
+    fixed_goal_vx = getattr(runner.cfg, "fixed_goal_vx", None)
+    if fixed_goal_vx is not None and np.isclose(float(fixed_goal_vx), 0.0):
+        enable_vx_bounds = False
+    sampler_cfg = getattr(runner.cfg, "goal_sampler", "uniform")
+    sampler = get_goal_sampler(
+        sampler_cfg,
+        high_act_space,
+        bounds_fn=runner.high_goal_safe_bounds.compute_np if runner.high_goal_safe_bounds is not None else None,
+        speed_fn=_extract_ego_speed,
+        enable_vx_bounds=enable_vx_bounds,
+        dynamic_feasible_lane_intervals=bool(
+            getattr(runner.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
+        ),
+    )
+    print(f"goal sampler for trials: {getattr(sampler_cfg, 'type', sampler_cfg)}")
 
     goals_phys: List[np.ndarray] = []
     metrics: List[float] = []
@@ -345,8 +496,10 @@ def run_uniform_goal_trials(
         runner.need_high = False
         runner.c = 0
 
-        goal_action = sampler(np.asarray(obs0, dtype=np.float32)[None, :])
+        high_obs0 = runner._build_high_obs(np.asarray(obs0, dtype=np.float32), env)
+        goal_action = sampler(np.asarray(high_obs0, dtype=np.float32).reshape(1, -1))
         goal_phys = hiro_utils.goal_action_to_abs(ego_sub[None, :], goal_action, runner.lane_center_ys).reshape(-1)
+        goal_phys = _goal_phys_with_masked_vx(goal_phys)
         runner.goal_phys = goal_phys.copy()
 
         if hasattr(env.unwrapped, "set_hiro_goal"):
@@ -375,19 +528,19 @@ def run_uniform_goal_trials(
     summary_path = os.path.join(out_dir, "goal_trials_summary.png")
     save_goal_metric_summary(env, goals_phys, metrics, summary_path, metric_name=metric_name)
 
-    # 打印 goal_phys �?y 分布�?/4/8�?
+    # Print the distribution of goal_phys y over lane centers 0/4/8.
     y_counts = {0.0: 0, 4.0: 0, 8.0: 0}
     for g in goals_phys:
         if g is None or len(g) < 2:
             continue
         y = float(g[1])
-        # 允许微小数值误差，按最近值归�?
+        # Allow small numeric noise and assign to the nearest lane center.
         closest = min(y_counts.keys(), key=lambda v: abs(y - v))
         if abs(y - closest) <= 1e-3:
             y_counts[closest] += 1
 
     total = sum(y_counts.values())
-    print("goal_phys y 分布统计 (0/4/8):")
+    print("goal_phys y distribution (0/4/8):")
     print(f"  y=0  : {y_counts[0.0]}")
     print(f"  y=4  : {y_counts[4.0]}")
     print(f"  y=8  : {y_counts[8.0]}")
@@ -402,11 +555,12 @@ def run_mpc_action_sequence_evaluation(
     action_sequence: Sequence[Sequence[float]],
     out_dir: str,
     steps_to_goal: int,
+    hiro_cfg: Optional[Any] = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
     base_env, _, _ = setup_env_with_state(env, ego_state, neighbors_state)
-    hiro_cfg = get_hiro_config()
+    hiro_cfg = hiro_cfg or get_hiro_config()
     mpc = MPCController(
         base_env,
         horizon=max(1, len(action_sequence)),
@@ -480,7 +634,7 @@ def run_mpc_action_sequence_evaluation(
             writer.writeheader()
             writer.writerows(trajectory_rows)
 
-    print("MPC 动作序列评估结果�?)
+    print("MPC action sequence evaluation:")
     print(f"  success         : {summary['success']}")
     print(f"  message         : {summary['message']}")
     print(f"  horizon         : {summary['horizon']}")
@@ -500,7 +654,11 @@ def main(
     neighbors_state: Sequence[Sequence[float]],
     goal_phys: Sequence[float],
     batch_cases_csv: Optional[str] = None,
+    batch_cases_json: Optional[str] = None,
+    batch_max_cases: int = 0,
+    neighbors_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
     env_overrides: Optional[Dict[str, Any]] = None,
+    hiro_overrides: Optional[Dict[str, Any]] = None,
     out_dir: str = "./debug/low_level_rollout",
     use_low_safety_layer: Optional[bool] = None,
     seed: int = 0,
@@ -531,66 +689,146 @@ def main(
     q_sa_points_per_axis: int = 51,
     random_neighbors_batch_size: int = 0,
     random_neighbors_seed: int = 0,
-    scenario_name: str = "multi_lane",
+    scenario_name: Optional[str] = None,
     _is_subrun: bool = False,
-):
+) -> Optional[Dict[str, Any]]:
     run_out_dir = out_dir
+    is_batch_run = bool(batch_cases_csv or batch_cases_json)
     if not bool(_is_subrun):
         run_tag = datetime.now().strftime("run_%Y%m%d-%H%M%S")
         run_out_dir = os.path.join(out_dir, run_tag)
         os.makedirs(run_out_dir, exist_ok=True)
-        print(f"[RUN] output dir: {run_out_dir}")
+        if not is_batch_run:
+            print(f"[RUN] output dir: {run_out_dir}")
 
-    if batch_cases_csv:
-        cases = load_test_cases_from_csv(batch_cases_csv)
-        base_out_dir = os.path.join(run_out_dir, "batch_cases")
+    if batch_cases_csv or batch_cases_json:
+        if batch_cases_json:
+            cases = load_test_cases_from_json(batch_cases_json, max_cases=batch_max_cases if int(batch_max_cases) > 0 else None)
+            source_path = batch_cases_json
+            batch_name = "batch_cases_json"
+        else:
+            cases = load_test_cases_from_csv(str(batch_cases_csv))
+            if int(batch_max_cases) > 0:
+                cases = cases[: int(batch_max_cases)]
+            source_path = str(batch_cases_csv)
+            batch_name = "batch_cases_csv"
+        base_out_dir = os.path.join(run_out_dir, batch_name)
         os.makedirs(base_out_dir, exist_ok=True)
 
-        print(f"Loaded {len(cases)} cases from CSV: {batch_cases_csv}")
-        for i, case in enumerate(cases, start=1):
-            case_id = str(case.get("case_id", "")).strip() or f"case_{i:03d}"
-            safe_case_id = case_id.replace("/", "_").replace("\\", "_").replace(" ", "_")
-            case_out_dir = os.path.join(base_out_dir, safe_case_id)
-            print(f"[{i}/{len(cases)}] Running case: {case_id}")
-
-            main(
-                low_model_path=low_model_path,
-                steps=steps,
-                ego_state=case["ego_state"],
-                neighbors_state=case["neighbors_state"],
-                goal_phys=case["goal_phys"],
-                batch_cases_csv=None,
-                env_overrides=env_overrides,
-                out_dir=case_out_dir,
-                use_low_safety_layer=use_low_safety_layer,
-                seed=seed,
-                save_initial=save_initial,
-                uniform_trials=uniform_trials,
-                uniform_steps=uniform_steps,
-                uniform_metric_name=uniform_metric_name,
-                uniform_metric_fn=uniform_metric_fn,
-                run_mpc_optimal=run_mpc_optimal,
-                mpc_horizon=mpc_horizon,
-                mpc_steps_to_goal=mpc_steps_to_goal,
-                mpc_mode=mpc_mode,
-                mpc_global_maxiter=mpc_global_maxiter,
-                mpc_plot_alternative_optima=mpc_plot_alternative_optima,
-                mpc_max_alternative_optima=mpc_max_alternative_optima,
-                mpc_eval_actions_cont=mpc_eval_actions_cont,
-                lane_change_min_front_gap=lane_change_min_front_gap,
-                lane_change_min_rear_gap=lane_change_min_rear_gap,
-                lane_change_min_front_ttc=lane_change_min_front_ttc,
-                lane_change_min_rear_ttc=lane_change_min_rear_ttc,
-                record_q_sa_curve=record_q_sa_curve,
-                q_sa_a0_min=q_sa_a0_min,
-                q_sa_a0_max=q_sa_a0_max,
-                q_sa_a1_min=q_sa_a1_min,
-                q_sa_a1_max=q_sa_a1_max,
-                q_sa_points_per_axis=q_sa_points_per_axis,
-                scenario_name=scenario_name,
-                _is_subrun=True,
+        summary_rows: List[Dict[str, Any]] = []
+        case_iter = enumerate(cases, start=1)
+        if tqdm is not None:
+            case_iter = tqdm(
+                case_iter,
+                total=len(cases),
+                desc="low eval cases",
+                unit="case",
             )
-        return
+        for i, case in case_iter:
+            case_id = str(case.get("case_id", "")).strip() or f"case_{i:03d}"
+            scenario_label = str(case.get("scenario_label", "") or "").strip()
+            dir_label = f"{case_id}_{scenario_label}" if scenario_label else case_id
+            safe_case_id = _safe_case_id(dir_label, f"case_{i:03d}")
+            case_out_dir = os.path.join(base_out_dir, safe_case_id)
+            if tqdm is not None and hasattr(case_iter, "set_postfix_str"):
+                case_iter.set_postfix_str(dir_label)
+
+            error_text = ""
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = main(
+                        low_model_path=low_model_path,
+                        steps=steps,
+                        ego_state=case["ego_state"],
+                        neighbors_state=case["neighbors_state"],
+                        goal_phys=case["goal_phys"],
+                        batch_cases_csv=None,
+                        batch_cases_json=None,
+                        batch_max_cases=0,
+                        neighbors_snapshot=case.get("neighbors_snapshot", None),
+                        env_overrides=env_overrides,
+                        hiro_overrides=hiro_overrides,
+                        out_dir=case_out_dir,
+                        use_low_safety_layer=use_low_safety_layer,
+                        seed=seed,
+                        save_initial=save_initial,
+                        uniform_trials=uniform_trials,
+                        uniform_steps=uniform_steps,
+                        uniform_metric_name=uniform_metric_name,
+                        uniform_metric_fn=uniform_metric_fn,
+                        run_mpc_optimal=run_mpc_optimal,
+                        mpc_horizon=mpc_horizon,
+                        mpc_steps_to_goal=mpc_steps_to_goal,
+                        mpc_mode=mpc_mode,
+                        mpc_global_maxiter=mpc_global_maxiter,
+                        mpc_plot_alternative_optima=mpc_plot_alternative_optima,
+                        mpc_max_alternative_optima=mpc_max_alternative_optima,
+                        mpc_eval_actions_cont=mpc_eval_actions_cont,
+                        lane_change_min_front_gap=lane_change_min_front_gap,
+                        lane_change_min_rear_gap=lane_change_min_rear_gap,
+                        lane_change_min_front_ttc=lane_change_min_front_ttc,
+                        lane_change_min_rear_ttc=lane_change_min_rear_ttc,
+                        record_q_sa_curve=record_q_sa_curve,
+                        q_sa_a0_min=q_sa_a0_min,
+                        q_sa_a0_max=q_sa_a0_max,
+                        q_sa_a1_min=q_sa_a1_min,
+                        q_sa_a1_max=q_sa_a1_max,
+                        q_sa_points_per_axis=q_sa_points_per_axis,
+                        random_neighbors_batch_size=0,
+                        random_neighbors_seed=random_neighbors_seed,
+                        scenario_name=scenario_name,
+                        _is_subrun=True,
+                    )
+            except Exception as e:
+                result = None
+                error_text = f"{type(e).__name__}: {e}"
+                os.makedirs(case_out_dir, exist_ok=True)
+                with open(os.path.join(case_out_dir, "case_error.txt"), "w", encoding="utf-8") as f:
+                    f.write(error_text + "\n")
+            case_meta_path = os.path.join(case_out_dir, "case_metadata.json")
+            with open(case_meta_path, "w", encoding="utf-8") as f:
+                json.dump(case, f, ensure_ascii=False, indent=2)
+            row: Dict[str, Any] = {
+                "case_index": int(i),
+                "case_id": case_id,
+                "scenario_label": scenario_label,
+                "case_dir": case_out_dir,
+                "failed": int(bool(error_text)),
+                "error": error_text,
+            }
+            for key in [
+                "ego_lane_id",
+                "target_lane_id",
+                "trend",
+                "traffic_adjusted",
+                "traffic_feasible",
+                "traffic_vehicle_count",
+            ]:
+                if key in case:
+                    row[key] = case[key]
+            if isinstance(result, dict):
+                row.update(result)
+            summary_rows.append(row)
+
+        summary_json = os.path.join(base_out_dir, "batch_summary.json")
+        with open(summary_json, "w", encoding="utf-8") as f:
+            json.dump(summary_rows, f, ensure_ascii=False, indent=2)
+
+        summary_csv = os.path.join(base_out_dir, "batch_summary.csv")
+        if summary_rows:
+            fieldnames: List[str] = []
+            for row in summary_rows:
+                for key, value in row.items():
+                    if isinstance(value, (str, int, float, bool)) or value is None:
+                        if key not in fieldnames:
+                            fieldnames.append(key)
+            with open(summary_csv, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in summary_rows:
+                    writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+        return {"batch_cases": len(cases), "summary_csv": summary_csv, "summary_json": summary_json}
 
     if int(random_neighbors_batch_size) > 0:
         run_batch_random_neighbors_acc_eval(
@@ -605,48 +843,105 @@ def main(
             env_overrides=env_overrides,
             use_low_safety_layer=use_low_safety_layer,
         )
-        return
+        return None
 
     # 环境配置：禁用背景车流，保持仅有指定车辆
     test_overrides: Dict[str, Any] = {
         "spawn_probability": 0.0,
         "warmup_time": 0.0,
         "warmup_each_episode": True,
+        "inter_episode_as_steps": False,
+        "background_snapshot_reset": False,
+        "background_snapshot_path": None,
+        "background_snapshot_paths": None,
         "show_trajectories": True,
         "screen_width": 1800,
         "screen_height": 300,
         "scaling": 3,
         "centering_position": [0.5, 0.5],
-        "show_trajectories": True,
-        "initial_lane_id": 1,
         "lane_change_min_front_gap": float(lane_change_min_front_gap),
         "lane_change_min_rear_gap": float(lane_change_min_rear_gap),
         "lane_change_min_front_ttc": float(lane_change_min_front_ttc),
         "lane_change_min_rear_ttc": float(lane_change_min_rear_ttc),
     }
     if env_overrides:
-        test_overrides.update(env_overrides)
+        deep_update(test_overrides, env_overrides)
 
-    scenario_spec = get_scenario_spec(scenario_name)
+    model_dir = _model_dir_from_low_model_path(low_model_path)
+    saved_env_config: Optional[Dict[str, Any]] = None
+    saved_scenario_name: Optional[str] = None
+    run_config_path: Optional[str] = None
+    try:
+        run_config, run_config_path = load_hiro_run_config(model_dir)
+        hiro_cfg = hiro_config_from_run_config(run_config)
+        saved_env_config = env_config_from_run_config(run_config)
+        run_metadata = run_config.get("run_metadata", {})
+        if isinstance(run_metadata, dict) and run_metadata.get("scenario_name"):
+            saved_scenario_name = str(run_metadata["scenario_name"])
+    except FileNotFoundError:
+        hiro_cfg = get_hiro_config()
+    if hiro_overrides:
+        hiro_cfg = apply_hiro_config_overrides(hiro_cfg, hiro_overrides)
+        print(f"[LOW TEST] hiro_overrides={json.dumps(hiro_overrides, ensure_ascii=True)}")
+    if str(getattr(hiro_cfg, "low_level_type", "sac")).lower() != "sac":
+        print(
+            "[LOW TEST] forcing hiro_cfg.low_level_type='sac' "
+            "because a SAC low_model_path is being tested"
+        )
+        hiro_cfg.low_level_type = "sac"
+
+    effective_scenario_name = scenario_name or saved_scenario_name or "multi_lane"
+    scenario_spec = get_scenario_spec(effective_scenario_name)
     importlib.import_module(str(scenario_spec["module"]))
     env_id = str(scenario_spec["env_id"])
-    print(f"[LOW TEST] scenario={scenario_name}, env_id={env_id}")
+    print(f"[LOW TEST] scenario={effective_scenario_name}, env_id={env_id}")
+    if run_config_path:
+        print(f"[LOW TEST] config_source={run_config_path}")
 
-    env_config = get_env_config_for_scenario(scenario_name, test_overrides)
-    n_local = int(env_config.get("observation", {}).get("vehicles_count_local", 1))
-    if len(neighbors_state) > max(0, n_local - 1):
-        raise ValueError(
-            f"neighbors_state 数量 ({len(neighbors_state)}) 超过 vehicles_count_local-1 ({max(0, n_local - 1)})�?
+    if saved_env_config is not None and effective_scenario_name == saved_scenario_name:
+        env_config = get_env_config_for_scenario(effective_scenario_name)
+        deep_update(env_config, saved_env_config)
+        env_config.pop("_env_seed", None)
+        env_config.pop("actual_episode_start_phase_offset", None)
+        deep_update(env_config, test_overrides)
+    else:
+        env_config = get_env_config_for_scenario(effective_scenario_name, test_overrides)
+    lane_width_cfg = float(env_config.get("lane_width", 4.0))
+    lanes_count_cfg = int(env_config.get("lanes_count", 3))
+    explicit_env_overrides = env_overrides or {}
+    if "initial_lane_id" not in explicit_env_overrides:
+        env_config["initial_lane_id"] = _lane_id_from_y(
+            float(np.asarray(ego_state, dtype=np.float32).reshape(-1)[1]),
+            lane_width_cfg,
+            lanes_count_cfg,
         )
-    if len(goal_phys) < 4:
-        raise ValueError("goal_phys 需要至少包�?[x, y, vx, vy] 四个元素�?)
+    if "goal_lane_id" not in explicit_env_overrides:
+        env_config["goal_lane_id"] = _lane_id_from_y(
+            float(np.asarray(goal_phys, dtype=np.float32).reshape(-1)[1]),
+            lane_width_cfg,
+            lanes_count_cfg,
+        )
+    print(
+        "[LOW TEST] local_config "
+        f"snapshot_reset={bool(env_config.get('background_snapshot_reset', False))}, "
+        f"spawn_probability={env_config.get('spawn_probability')}, "
+        f"warmup_time={env_config.get('warmup_time')}, "
+        f"initial_lane_id={env_config.get('initial_lane_id')}, "
+        f"goal_lane_id={env_config.get('goal_lane_id')}"
+    )
+    n_local = int(env_config.get("observation", {}).get("vehicles_count_local", 1))
+    if not neighbors_snapshot and len(neighbors_state) > max(0, n_local - 1):
+        raise ValueError(
+            f"neighbors_state count ({len(neighbors_state)}) exceeds "
+            f"vehicles_count_local - 1 ({max(0, n_local - 1)})"
+        )
+    goal_phys_arr = _goal_phys_with_masked_vx(goal_phys)
     env = gym.make(env_id, render_mode=None, config=env_config)
 
     obs0, _ = env.reset(seed=seed)
-    base_env, ego, neighbors = setup_env_with_state(env, ego_state, neighbors_state)
+    base_env, ego, neighbors = setup_env_with_low_case(env, ego_state, neighbors_state, neighbors_snapshot)
     obs0 = base_env.observation_type.observe()
 
-    hiro_cfg = get_hiro_config()
     low_model = SAC.load(
         low_model_path,
         # Inference does not need HER replay buffer; this keeps loading compatible
@@ -662,13 +957,39 @@ def main(
         low_model,
         int(getattr(hiro_cfg, "high_interval", 25)),
         use_low_safety_layer=use_low_safety_layer,
+        config=hiro_cfg,
     )
-    runner.init_from_env(env, obs0, float(getattr(hiro_cfg, "intrinsic_coef", 1.0)))
 
-    goal_phys_arr = np.asarray(goal_phys, dtype=np.float32).reshape(-1)
+    def _align_runner_low_obs_dim() -> None:
+        low_shape = getattr(getattr(low_model, "observation_space", None), "shape", None)
+        trained_low_dim = int(np.prod(low_shape)) if low_shape else None
+        if trained_low_dim is None:
+            return
+
+        with_extra_dim = int(1 + runner.local_kin_flat_dim + runner.obs_extra_dim + runner.ego_dim)
+        without_extra_dim = int(1 + runner.local_kin_flat_dim + runner.ego_dim)
+        if trained_low_dim == with_extra_dim:
+            return
+        if trained_low_dim == without_extra_dim and int(runner.obs_extra_dim) > 0:
+            print(
+                "[LOW TEST] low_obs_dim aligned to legacy model: "
+                f"model={trained_low_dim}, env_with_extra={with_extra_dim}; "
+                "dropping observation extra features"
+            )
+            runner.obs_extra_dim = 0
+            return
+        raise ValueError(
+            "Low-level observation dimension mismatch: "
+            f"model expects {trained_low_dim}, test builds {with_extra_dim} "
+            f"(or {without_extra_dim} without extra features)."
+        )
+
+    runner.init_from_env(env, obs0, float(getattr(hiro_cfg, "intrinsic_coef", 1.0)))
+    _align_runner_low_obs_dim()
+
     runner.goal_phys = goal_phys_arr.copy()
 
-    # 初始�?ego_start，用于可视化范围�?
+    # Initialize ego_start for visualization limits.
     _, kin0, _ = runner._split(obs0)
     runner.ego_start = runner._ego_sub(kin0).copy()
     runner.need_high = False
@@ -688,12 +1009,16 @@ def main(
     q_sa_a1_mesh_ref: Optional[np.ndarray] = None
 
     def _build_low_obs_for_q(obs_raw: np.ndarray) -> np.ndarray:
-        """Build low_obs as [t_norm, local_kin_flat, goal_rel] (no signal dims)."""
+        """Build low_obs as [t_norm, local_kin_flat, extra, goal_rel]."""
         _, kin_local, kin_flat_local = runner._split(obs_raw)
         ego_sub_local = runner._ego_sub(kin_local)
         t_norm_local = np.array([runner.c / float(runner.hi)], dtype=np.float32)
         goal_rel_local = (runner.goal_phys - ego_sub_local).astype(np.float32)
         local_kin_flat_local = np.asarray(kin_flat_local[0, :runner.local_kin_flat_dim], dtype=np.float32).copy()
+        obs_arr_local = np.asarray(obs_raw, dtype=np.float32).reshape(-1)
+        extra_local = obs_arr_local[
+            1 + runner.kin_flat_dim : 1 + runner.kin_flat_dim + runner.obs_extra_dim
+        ].astype(np.float32)
 
         if bool(getattr(runner.cfg, "mask_ego_position_in_low_obs", False)):
             if int(runner.feat_dim) > 0 and local_kin_flat_local.shape[0] >= int(runner.feat_dim):
@@ -702,7 +1027,7 @@ def main(
                 local_kin_flat_local[idx_x_local] = 0.0
                 local_kin_flat_local[idx_y_local] = 0.0
 
-        return np.concatenate([t_norm_local, local_kin_flat_local, goal_rel_local]).astype(np.float32)
+        return np.concatenate([t_norm_local, local_kin_flat_local, extra_local, goal_rel_local]).astype(np.float32)
 
     def _record_q_sa_for_step(step_idx: int, low_obs_state: np.ndarray, action_ref: np.ndarray, chosen_action: Optional[np.ndarray] = None):
         nonlocal q_sa_a0_mesh_ref, q_sa_a1_mesh_ref
@@ -784,6 +1109,7 @@ def main(
             mpc_global_maxiter=mpc_global_maxiter,
             mpc_plot_alternative_optima=mpc_plot_alternative_optima,
             mpc_max_alternative_optima=mpc_max_alternative_optima,
+            hiro_cfg=hiro_cfg,
         )
     else:
         mpc_curve_data = None
@@ -799,14 +1125,16 @@ def main(
             action_sequence=mpc_eval_actions_cont,
             out_dir=mpc_dir,
             steps_to_goal=mpc_goal_steps,
+            hiro_cfg=hiro_cfg,
         )
 
     if bool(run_mpc_optimal) or (mpc_eval_actions_cont is not None):
 
-        # 重新设置一次环境状态，确保后续 RL rollout 从同一起点开�?
-        base_env, ego, neighbors = setup_env_with_state(env, ego_state, neighbors_state)
+        # Reset the env state once so the RL rollout starts from the same state.
+        base_env, ego, neighbors = setup_env_with_low_case(env, ego_state, neighbors_state, neighbors_snapshot)
         obs0 = base_env.observation_type.observe()
-        runner.init_from_env(env, obs0, float(getattr(get_hiro_config(), "intrinsic_coef", 1.0)))
+        runner.init_from_env(env, obs0, float(getattr(hiro_cfg, "intrinsic_coef", 1.0)))
+        _align_runner_low_obs_dim()
         runner.goal_phys = goal_phys_arr.copy()
         _, kin0, _ = runner._split(obs0)
         runner.ego_start = runner._ego_sub(kin0).copy()
@@ -867,6 +1195,11 @@ def main(
     init_speed = float(ego_init[2]) if ego_init.shape[0] > 2 else 0.0
     rl_speed_curve.append(init_speed)
     rl_safety_speed_curve.append(init_speed)
+    total_env_reward = 0.0
+    any_done = False
+    any_terminated = False
+    any_truncated = False
+    any_queue_takeover_terminal = False
 
     for step in range(1, int(steps) + 1):
         runner.goal_phys = goal_phys_arr.copy()
@@ -923,6 +1256,14 @@ def main(
         safety_speed_upper_curve.append(vx_now + acc_phys_safety_upper * float(runner.dt))
 
         obs_next, reward, terminated, truncated, info = env.step(action)
+        total_env_reward += float(reward)
+        any_done = bool(any_done or terminated or truncated)
+        any_terminated = bool(any_terminated or terminated)
+        any_truncated = bool(any_truncated or truncated)
+        if isinstance(info, dict):
+            any_queue_takeover_terminal = bool(
+                any_queue_takeover_terminal or bool(info.get("queue_takeover_terminal", False))
+            )
 
         _, kin_next, _ = runner._split(obs_next)
         ego_next = runner._ego_sub(kin_next)
@@ -973,7 +1314,7 @@ def main(
 
         obs = obs_next
 
-    # 保存三组对比曲线：RL 输出 / Safety Layer 上界 / MPC 最�?
+    # Save comparison curves: RL output, safety-layer upper bound, and MPC.
     mpc_speed_curve = np.asarray([], dtype=np.float32)
     mpc_acc_curve = np.asarray([], dtype=np.float32)
     mpc_lane_curve = np.asarray([], dtype=np.float32)
@@ -1138,24 +1479,81 @@ def main(
             )
             print(f"Saved Q(s,a0,a1) surfaces to: {q_sa_dir}")
 
+    _, kin_final, _ = runner._split(obs)
+    ego_final = runner._ego_sub(kin_final)
+    goal_err = goal_phys_arr[: ego_final.shape[0]] - ego_final
+    abs_dx = float(abs(goal_err[0])) if goal_err.shape[0] > 0 else 0.0
+    abs_dy = float(abs(goal_err[1])) if goal_err.shape[0] > 1 else 0.0
+    abs_dv = float(abs(goal_err[2])) if goal_err.shape[0] > 2 else 0.0
+    goal_error_l2 = float(np.linalg.norm(goal_err))
+    collision = bool(getattr(env.unwrapped.vehicle, "crashed", False))
+    success = bool(
+        abs_dx <= 5.0
+        and abs_dy <= 1.2
+        and abs_dv <= 2.5
+        and not collision
+        and not any_queue_takeover_terminal
+    )
+    final_metrics: Dict[str, Any] = {
+        "goal_error_l2": goal_error_l2,
+        "abs_dx": abs_dx,
+        "abs_dy": abs_dy,
+        "abs_dv": abs_dv,
+        "success": int(success),
+        "collision": int(collision),
+        "done": int(any_done),
+        "terminated": int(any_terminated),
+        "truncated": int(any_truncated),
+        "queue_takeover_terminal": int(any_queue_takeover_terminal),
+        "steps": int(steps),
+        "env_return": float(total_env_reward),
+        "low_reward_sum_collision": float(reward_sums.get("collision_reward", 0.0)),
+        "low_reward_sum_progress": float(reward_sums.get("progress_reward", 0.0)),
+        "low_reward_sum_comfort": float(reward_sums.get("comfort_reward", 0.0)),
+        "low_reward_sum_lane_change": float(reward_sums.get("lane_change_reward", 0.0)),
+        "low_reward_sum_intrinsic": float(reward_sums.get("intrinsic_reward", 0.0)),
+        "final_x": float(ego_final[0]) if ego_final.shape[0] > 0 else 0.0,
+        "final_y": float(ego_final[1]) if ego_final.shape[0] > 1 else 0.0,
+        "final_vx": float(ego_final[2]) if ego_final.shape[0] > 2 else 0.0,
+        "goal_x": float(goal_phys_arr[0]) if goal_phys_arr.shape[0] > 0 else 0.0,
+        "goal_y": float(goal_phys_arr[1]) if goal_phys_arr.shape[0] > 1 else 0.0,
+        "goal_vx": float(goal_phys_arr[2]) if goal_phys_arr.shape[0] > 2 else 0.0,
+    }
+    metrics_path = os.path.join(run_out_dir, "low_test_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(final_metrics, f, ensure_ascii=False, indent=2)
+    print(
+        "[LOW TEST] final metrics: "
+        f"success={success}, goal_l2={goal_error_l2:.3f}, "
+        f"abs_dx={abs_dx:.3f}, abs_dy={abs_dy:.3f}, abs_dv={abs_dv:.3f}, "
+        f"collision={collision}, queue_terminal={any_queue_takeover_terminal}"
+    )
+    print(f"Saved low test metrics: {metrics_path}")
+
     env.close()
     print(f"Saved {steps + (1 if save_initial else 0)} frames to: {run_out_dir}")
+    return final_metrics
 
 
 if __name__ == "__main__":
-    # 用法示例�?
-    # 1) 指定低层模型路径
-    # 2) 指定 ego + 观测车辆初始状态（x, y, vx, vy�?
-    # 3) 指定 goal_phys（x, y, vx, vy�?
-    # 4) 若需要批量测试，可传 batch_cases_csv（列支持�?
-    #    - ego_state / neighbors_state / goal_phys 三列，值为列表字符串；�?
-    #    - ego_x,ego_y,ego_vx,ego_vy + goal_x,goal_y,goal_vx,goal_vy + neighbors_state(可�?
-    #    - 可�?case_id 列作为输出目录名�?
+    # Usage:
+    # 1) Set the low-level model path.
+    # 2) Set ego and neighbor initial states as [x, y, vx, vy].
+    # 3) Set goal_phys as [x, y, vx, vy].
+    # 4) For batch tests, pass batch_cases_csv with supported columns:
+    #    - ego_state / neighbors_state / goal_phys as list strings, or
+    #    - ego_x,ego_y,ego_vx,ego_vy + goal_x,goal_y,goal_vx,goal_vy
+    #      plus optional neighbors_state and case_id.
+    #    Or pass batch_cases_json="debug/hiro_low_eval_cases_snapshot012.json"
+    #    to replay the offline low-eval case set with behavior-model neighbors.
 
     main(
-        low_model_path="./models/hiro_260416_lowonly_reUni_amax3_dmin15_10_newEnv/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260620_lowonly_uniform_randomStart_snapshot02_queue_lc05_fixedHER/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260622_lowonly_uniform_randomStart_snapshot02_queueNew_lc05_fixedHER/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260619_lowonly_uniform_randomStart_lateGreen_snapshot02_fixedHER/hiro_low_final.zip",
         # low_model_path="./models/hiro_260321_lowonly_reachableUniform_newSLv2_vio03_HER_reDim_amax3_dmin0/hiro_low_final.zip",
-        # low_model_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
+        low_model_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260415_lowonly_reUni_fixedHERv2_amax3_dmin15_10/hiro_low_final.zip",
         steps=25,
         # ego_state=[0.0, 4.0, 10.0, 0.0],
         # neighbors_state=[
@@ -1164,7 +1562,7 @@ if __name__ == "__main__":
         #     [30.0, 0.0, 10.0, 0.0],
         #     [5.0, 8.0, 15.0, 0.0],
         # ],
-        # goal_phys=[20, 4, 10, 0],
+        # goal_phys=[20, 4, 0, 0],
         ego_state=[0.0, 8.0, 10.0, 0.0],
         neighbors_state=[
             [30.0, 4.0, 10.0, 0.0],
@@ -1172,9 +1570,15 @@ if __name__ == "__main__":
             [30.0, 0.0, 10.0, 0.0],
             [25.0, 8.0, 15.0, 0.0],
         ],
-        goal_phys=[25, 8, 0, 0],
+        goal_phys=[20, 8, 0, 0],
         # batch_cases_csv="low_test_cases.csv",
         # batch_cases_csv="low_test_cases_debug.csv",
+        batch_cases_json="debug/hiro_low_eval_cases_snapshot012.json",
+        # batch_max_cases=10,
+        hiro_overrides={
+            # "goal_sampler": {"type": "reachable_uniform"},
+            # "goal_sampler": {"type": "uniform"},
+        },
         use_low_safety_layer=True,
         out_dir="./models/debug/low_level_rollout",
         uniform_trials=0,

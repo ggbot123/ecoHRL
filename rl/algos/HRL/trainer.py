@@ -14,6 +14,7 @@ from rl.algos.HRL.buffer import HiROHighReplayBuffer
 from rl.algos.HRL.callbacks import HIROLoggingCallback, HIROCheckpointCallback, HIROLowEpisodeTrajectoryCallback
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig, get_goal_sampler
 from rl.utils import utils
+from util.hiro_low_offline_eval import HIROLowOfflineEvalCallback
 from stable_baselines3.common.callbacks import CallbackList
 
 
@@ -122,6 +123,7 @@ def train_hiro(
     low_her_debug_sample_prob: float = 0.0,
     low_debug_summary_interval_steps: int = 10000,
     low_debug_env_step_interval_steps: int = 1000,
+    low_offline_eval_config: Dict[str, Any] | None = None,
     run_metadata: Dict[str, Any] | None = None,
 ):
     """Train HiRO (SAC high + SAC low).
@@ -135,6 +137,19 @@ def train_hiro(
     train_mode = str(getattr(cfg, "train_mode", "joint")).lower()
     if train_mode not in {"joint", "low_only", "high_only"}:
         raise ValueError(f"Unknown train_mode: {train_mode}")
+    env_configs = env.get_attr("config")
+    terminate_on_queue_envs = [
+        int(i)
+        for i, env_cfg in enumerate(env_configs)
+        if isinstance(env_cfg, dict)
+        and bool(env_cfg.get("terminate_on_queue_takeover", False))
+    ]
+    if train_mode != "low_only" and terminate_on_queue_envs:
+        raise ValueError(
+            "terminate_on_queue_takeover=True is only allowed for "
+            f"HIRO train_mode='low_only'; got train_mode={train_mode!r}, "
+            f"enabled_envs={terminate_on_queue_envs}"
+        )
 
     # Resolve mode-dependent effective settings here; HIRO should not contain redundant guardrails.
     opc_enabled = train_mode == "joint" and bool(getattr(cfg, "use_off_policy_correction", True))
@@ -210,7 +225,10 @@ def train_hiro(
         effective_cfg=effective_cfg,
         high_sac_kwargs=high_sac_kwargs,
         low_sac_kwargs=low_sac_kwargs,
-        run_metadata=run_metadata,
+        run_metadata={
+            **dict(run_metadata or {}),
+            "low_offline_eval_config": _json_safe(dict(low_offline_eval_config or {})),
+        },
         checkpoint_save_freq=checkpoint_save_freq,
     )
 
@@ -265,8 +283,52 @@ def train_hiro(
         verbose=0,
     )
 
+    callback_items = [logging_cb, checkpoint_cb]
+    low_eval_cfg = dict(low_offline_eval_config or {})
+    if train_mode == "low_only" and bool(low_eval_cfg.get("enabled", False)):
+        run_meta = dict(run_metadata or {})
+        cases_path = str(low_eval_cfg.get("cases_path", "debug/hiro_low_eval_cases_snapshot012.json"))
+        callback_items.insert(
+            1,
+            HIROLowOfflineEvalCallback(
+                cases_path=cases_path,
+                env_id=str(low_eval_cfg.get("env_id", run_meta.get("env_id", ""))),
+                scenario_name=str(
+                    low_eval_cfg.get(
+                        "scenario_name",
+                        run_meta.get("scenario_name", "multi_lane_stop_to_int"),
+                    )
+                ),
+                scenario_module=str(
+                    low_eval_cfg.get(
+                        "scenario_module",
+                        run_meta.get("scenario_module", "scenarios.multi_lane_stop_to_int"),
+                    )
+                ),
+                env_overrides=dict(
+                    low_eval_cfg.get(
+                        "env_overrides",
+                        run_meta.get("environment_overrides", {}) or {},
+                    )
+                ),
+                eval_freq=int(low_eval_cfg.get("eval_freq", 200_000)),
+                sample_size=int(low_eval_cfg.get("sample_size", 90)),
+                seed=int(low_eval_cfg.get("seed", seed)),
+                build_if_missing=bool(low_eval_cfg.get("build_if_missing", True)),
+                build_config=dict(low_eval_cfg.get("build_config", {}) or {}),
+                deterministic=bool(low_eval_cfg.get("deterministic", True)),
+                verbose=int(low_eval_cfg.get("verbose", 1)),
+            ),
+        )
+        print(
+            "[HIRO Trainer] Enabled low offline eval: "
+            f"cases={cases_path}, "
+            f"freq={int(low_eval_cfg.get('eval_freq', 200_000))}, "
+            f"sample_size={int(low_eval_cfg.get('sample_size', 90))}"
+        )
+
     # callback = CallbackList([logging_cb, low_traj_cb, checkpoint_cb])
-    callback = CallbackList([logging_cb, checkpoint_cb])
+    callback = CallbackList(callback_items)
     
     if train_mode == "joint":
         model.learn(

@@ -42,6 +42,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
     _INFO_KEY_SKIP_REPLAY = "skip_replay"
     _INFO_KEY_EP_ID = "low_ep_id"
     _INFO_KEY_EP_STEP = "low_ep_step"
+    _INFO_KEY_INTRINSIC_TERMINAL = "low_intrinsic_terminal"
 
     def __init__(
         self,
@@ -150,6 +151,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         self._valid = np.zeros((self.buffer_size, self.n_envs), dtype=bool)
         self._ep_id = np.full((self.buffer_size, self.n_envs), -1, dtype=np.int64)
         self._ep_step = np.full((self.buffer_size, self.n_envs), -1, dtype=np.int64)
+        self._intrinsic_terminal = np.zeros((self.buffer_size, self.n_envs), dtype=bool)
         self._seg_index: dict[int, dict[tuple[int, int], int]] = defaultdict(dict)
         self._time_index: dict[tuple[int, int, int], tuple[int, int]] = {}
         self._her_debug_records: deque[dict[str, Any]] = deque(maxlen=self.her_debug_max_records)
@@ -235,6 +237,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                 self._ego_now[pos, env_i] = 0.0
                 self._ego_next[pos, env_i] = 0.0
                 self._r_ext[pos, env_i] = 0.0
+                self._intrinsic_terminal[pos, env_i] = False
                 continue
 
             self._seg_id[pos, env_i] = int(info.get(self._INFO_KEY_SEG_ID, -1))
@@ -261,6 +264,9 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                 self._ego_next[pos, env_i] = 0.0
 
             self._r_ext[pos, env_i] = float(info.get(self._INFO_KEY_R_EXT, reward[env_i]))
+            self._intrinsic_terminal[pos, env_i] = bool(
+                info.get(self._INFO_KEY_INTRINSIC_TERMINAL, bool(done[env_i]))
+            )
 
             new_seg = int(self._seg_id[pos, env_i])
             if new_seg >= 0:
@@ -474,6 +480,11 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
         ego_start_ref_all = self._ego_start[batch_inds, env_indices].astype(np.float32, copy=True)
         source_done_mask = dones.reshape(-1).astype(bool)
         relabeled_done_mask = np.array(source_done_mask, copy=True)
+        source_intrinsic_terminal_mask = (
+            self._intrinsic_terminal[batch_inds, env_indices].astype(bool, copy=False)
+            & source_done_mask
+        )
+        intrinsic_terminal_mask = np.array(source_intrinsic_terminal_mask, copy=True)
         relabel_debug_pending: list[dict[str, Any]] = []
 
         for i in np.flatnonzero(her_mask):
@@ -559,6 +570,7 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
             obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_now_all[i]).astype(np.float32)
             next_obs_relabeled[i, self.goal_start : self.goal_end] = (g_new_abs - ego_next_all[i]).astype(np.float32)
             relabeled_done_mask[i] = (int(steps_ahead) == 1)
+            intrinsic_terminal_mask[i] = bool(relabeled_done_mask[i])
             her_applied_mask[i] = True
             applied_steps.append(int(steps_ahead))
             if relabeled_t_norm is not None:
@@ -589,7 +601,9 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                         "source_ego_next_abs": self._to_list(self._ego_next[src_row, src_col]),
                         "source_reward_stored": float(self.rewards[src_row, src_col]),
                         "source_done": bool(source_done_mask[i]),
+                        "source_intrinsic_terminal": bool(source_intrinsic_terminal_mask[i]),
                         "relabeled_done": bool(relabeled_done_mask[i]),
+                        "relabeled_intrinsic_terminal": bool(intrinsic_terminal_mask[i]),
                         "goal_row": int(goal_row),
                         "goal_col": int(goal_col),
                         "goal_seg_id": int(self._seg_id[int(goal_row), int(goal_col)]),
@@ -634,11 +648,11 @@ class HiROLowHERReplayBuffer(ReplayBuffer):
                 self.intrinsic_coef,
                 self.intrinsic_weights,
                 gamma=float(self.low_gamma),
-                is_terminal=relabeled_done_mask,
+                is_terminal=intrinsic_terminal_mask,
             )
         else:
             r_goal = np.zeros(batch_size, dtype=np.float32)
-            terminal_mask = relabeled_done_mask
+            terminal_mask = intrinsic_terminal_mask
             if terminal_mask.any():
                 r_goal_term, _, _ = utils.intrinsic_reward_l2(
                     ego_rel_next[terminal_mask],

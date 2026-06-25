@@ -40,6 +40,8 @@ class HIROPolicyRunner:
         self.need_high, self.c = True, 0
         self.n_veh, self.feat_dim, self.feature_names, self.ego_feature_idx, self.ego_dim = 0, 0, [], [], 0
         self.n_veh_local, self.kin_flat_dim, self.local_kin_flat_dim, self.obs_extra_dim = 0, 0, 0, 0
+        self.high_obs_extra_dim = 0
+        self.high_obs_include_signal_features = True
         self.lane_center_ys = np.zeros(0, dtype=np.float32)
         self.goal_phys = np.zeros(0, dtype=np.float32)
         self.ego_start = np.zeros(0, dtype=np.float32)
@@ -71,6 +73,34 @@ class HIROPolicyRunner:
         self.kin_flat_dim = self.n_veh * self.feat_dim
         self.local_kin_flat_dim = self.n_veh_local * self.feat_dim
         self.obs_extra_dim = int(max(0, int(np.asarray(obs0, dtype=np.float32).reshape(-1).shape[0]) - (1 + self.kin_flat_dim)))
+        self.high_obs_extra_dim = int(self.obs_extra_dim)
+        self.high_obs_include_signal_features = True
+        model_obs_shape = getattr(getattr(self.high_model, "observation_space", None), "shape", None)
+        model_obs_dim = int(model_obs_shape[0]) if model_obs_shape else 0
+        if model_obs_dim > 0:
+            base_dim = int(1 + self.kin_flat_dim)
+            extra_plus_signal = int(model_obs_dim - base_dim)
+            prefer_signal = bool(getattr(self.cfg, "high_obs_use_signal_features", True))
+            layouts = [
+                (int(self.obs_extra_dim + 2), (int(self.obs_extra_dim), True)),
+                (int(self.obs_extra_dim), (int(self.obs_extra_dim), False)),
+                (2, (0, True)),
+                (0, (0, False)),
+            ]
+            if not prefer_signal:
+                layouts = [layouts[1], layouts[3], layouts[0], layouts[2]]
+            matched_layout = next(
+                (layout for dim, layout in layouts if dim == extra_plus_signal),
+                None,
+            )
+            if matched_layout is None:
+                raise ValueError(
+                    "High-level observation dimension mismatch: "
+                    f"model expects {model_obs_dim}, env base={base_dim}, "
+                    f"env extra={self.obs_extra_dim}. Supported layouts are "
+                    "base, base+signal, base+extra, or base+extra+signal."
+                )
+            self.high_obs_extra_dim, self.high_obs_include_signal_features = matched_layout
         self.ego_dim = int(len(self.ego_feature_idx))
         cfg = getattr(env.unwrapped, "config", getattr(env, "config", {}))
         self.punctual_time_target = float(cfg.get("punctual_time_target", cfg.get("duration", 0.0)))
@@ -311,15 +341,31 @@ class HIROPolicyRunner:
 
     def _build_high_obs(self, obs: np.ndarray, env=None) -> np.ndarray:
         arr = np.asarray(obs, dtype=np.float32).reshape(1, -1)
-        punctual_target = self._get_punctual_time_target(env)
-        t_remaining = (punctual_target - arr[:, :1]).astype(np.float32)
+        time_mode = str(getattr(self.cfg, "high_obs_time_mode", "remaining")).lower().strip()
+        if time_mode == "remaining":
+            punctual_target = self._get_punctual_time_target(env)
+            high_t = (punctual_target - arr[:, :1]).astype(np.float32)
+        elif time_mode == "elapsed":
+            high_t = arr[:, :1].astype(np.float32)
+        else:
+            raise ValueError("high_obs_time_mode must be 'remaining' or 'elapsed'")
+
         kin_flat = np.asarray(arr[:, 1 : 1 + self.kin_flat_dim], dtype=np.float32).copy()
         extra = np.asarray(arr[:, 1 + self.kin_flat_dim : 1 + self.kin_flat_dim + self.obs_extra_dim], dtype=np.float32)
-        ego_x = float(kin_flat[0, self.idx_x])
-        goal_x = self._get_goal_longitudinal(env)
-        kin_flat[0, self.idx_x] = float(goal_x - ego_x)
-        signal = self._get_signal_features(env).reshape(1, 2)
-        return np.concatenate([t_remaining, kin_flat, extra, signal], axis=1).astype(np.float32)
+        x_mode = str(getattr(self.cfg, "high_obs_x_mode", "remaining")).lower().strip()
+        if x_mode == "remaining":
+            ego_x = float(kin_flat[0, self.idx_x])
+            goal_x = self._get_goal_longitudinal(env)
+            kin_flat[0, self.idx_x] = float(goal_x - ego_x)
+        elif x_mode != "elapsed":
+            raise ValueError("high_obs_x_mode must be 'remaining' or 'elapsed'")
+
+        parts = [high_t, kin_flat]
+        if int(getattr(self, "high_obs_extra_dim", self.obs_extra_dim)) > 0:
+            parts.append(extra[:, : int(self.high_obs_extra_dim)])
+        if bool(getattr(self, "high_obs_include_signal_features", True)):
+            parts.append(self._get_signal_features(env).reshape(1, 2))
+        return np.concatenate(parts, axis=1).astype(np.float32)
 
     def act(self, env, obs: np.ndarray) -> np.ndarray:
         self._last_action_queue_takeover = False

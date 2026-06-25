@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Sequence
 
 
 def deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> Dict[str, Any]:
@@ -11,6 +11,31 @@ def deep_update(dst: Dict[str, Any], src: Mapping[str, Any]) -> Dict[str, Any]:
         else:
             dst[k] = v
     return dst
+
+
+def _drop_ignored_override_paths(
+    overrides: Mapping[str, Any],
+    ignored_paths: Sequence[str] | None,
+) -> Dict[str, Any]:
+    """Return overrides with scenario-specific unsupported keys removed."""
+    filtered = deepcopy(dict(overrides))
+    if not ignored_paths:
+        return filtered
+
+    for raw_path in ignored_paths:
+        parts = [part for part in str(raw_path).split(".") if part]
+        if not parts:
+            continue
+        cursor = filtered
+        for part in parts[:-1]:
+            next_cursor = cursor.get(part)
+            if not isinstance(next_cursor, dict):
+                cursor = None
+                break
+            cursor = next_cursor
+        if isinstance(cursor, dict):
+            cursor.pop(parts[-1], None)
+    return filtered
 
 
 def sync_lane_slot_observation_switch(cfg: Dict[str, Any]) -> None:
@@ -125,5 +150,9 @@ def build_env_config_for_scenario(
     spec = get_scenario_spec_from_specs(scenario_specs, scenario_name)
     merged_overrides: Dict[str, Any] = deepcopy(spec.get("env_overrides", {}))
     if overrides:
-        deep_update(merged_overrides, overrides)
+        filtered_overrides = _drop_ignored_override_paths(
+            overrides,
+            spec.get("ignored_env_override_keys", ()),
+        )
+        deep_update(merged_overrides, filtered_overrides)
     return build_env_config(base_config, merged_overrides)

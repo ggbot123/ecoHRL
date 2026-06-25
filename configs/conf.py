@@ -147,8 +147,7 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
     },
     "action": {
         "type": "ParamLaneAccelAction",
-        "acceleration_range": [-3.0, 2.0],
-        # "acceleration_range": [-5.0, 5.0],
+        "acceleration_range": [-5.0, 5.0],
         "lane_actions": ["KEEP", "LANE_LEFT", "LANE_RIGHT"],
     },
 
@@ -178,6 +177,7 @@ _MULTILANE_BASE_ENV_CONFIG: Dict[str, Any] = {
 
     # Optional environment-owned queue controller. Scenarios that enable it may take over after ego has joined a stopped signal queue.
     "enable_queue_takeover": False,
+    "terminate_on_queue_takeover": False,
     "queue_takeover_front_speed": 2.0,
     "queue_takeover_front_gap": 30.0,
     "queue_takeover_enter_steps": 3,
@@ -196,6 +196,39 @@ _SCENARIO_SPECS: Dict[str, Dict[str, Any]] = {
     "multi_lane": {
         "module": "scenarios.multi_lane",
         "env_id": "multi-lane-custom-v0",
+        "ignored_env_override_keys": [
+            "intersection_length",
+            "movement_lanes",
+            "movement_behavior_probs",
+            "background_vehicle_respect_movement_lanes",
+            "signal_plan",
+            "align_ego_spawn_to_signal_offset",
+            "episode_start_phase_offset",
+            "punctual_time_offset_profile",
+            "enable_signal_green_launch_behavior",
+            "signal_green_launch_approach_distance",
+            "signal_green_launch_end_margin",
+            "signal_green_launch_target_speed",
+            "enable_signal_cycle_spawn_probability",
+            "signal_cycle_spawn_probability",
+            "inter_episode_as_steps",
+            "inter_episode_step_seconds",
+            "inter_episode_zero_obs",
+            "background_snapshot_reset",
+            "background_snapshot_path",
+            "background_snapshot_paths",
+            "enable_queue_takeover",
+            "terminate_on_queue_takeover",
+            "queue_takeover_front_speed",
+            "queue_takeover_front_gap",
+            "queue_takeover_enter_steps",
+            "queue_takeover_release_x_margin",
+            "queue_takeover_desired_speed",
+            "queue_takeover_max_accel",
+            "queue_takeover_comfort_brake",
+            "queue_takeover_min_gap",
+            "queue_takeover_time_headway",
+        ],
         "env_overrides": {
             "spawn_probability": 0.07,
             "goal_longitudinal": 400.0,
@@ -358,7 +391,6 @@ _HIRO_CONFIG: Dict[str, Any] = {
     # "low_level_type": "sac",
 
     "low_use_her": True,
-    # "low_use_her": False,
     "low_her_ratio": 0.6,
     "low_her_strategy": "future",
     "low_her_future_mode": "episode_timeaware",
@@ -376,8 +408,8 @@ _HIRO_CONFIG: Dict[str, Any] = {
 # =========================
 
 TRAIN_CONFIG: Dict[str, Any] = {
-    # "algo": "hiro",
-    "algo": "sac",
+    "algo": "hiro",
+    # "algo": "sac",
     "log_root": "./logs/current",
     "save_root": "./models",
     # "total_timesteps": 5_000_000,
@@ -387,18 +419,15 @@ TRAIN_CONFIG: Dict[str, Any] = {
     "n_envs": 8,
     "render": False,
 
-    # "run_name": "sac_260621_withPrior_2to2",
-    # "run_name": "sac_260621_withPrior_2to0",
-    # "run_name": "sac_260621_withPrior_2to0_noGoalReshape",
-    "run_name": "sac_260621_withPrior_2to2_noGoalReshape",
-    # "run_name": "hiro_260620_highonly_lateGreen_2to0_noGoalReshape",
+    # "run_name": "sac_260623_withPrior_2to0_noGoalReshape",
+    # "run_name": "sac_260624_withPrior_2to0",
+    # "run_name": "sac_260624_base_2to0",
+    # "run_name": "hiro_260623_highonly_2to0_noGoalReshape",
+    # "run_name": "hiro_260622_highonly_pretrained_2to2",
     # "run_name": "hiro_260620_highonly_lateGreen_2to1_newReset_dyna_buf100k_randStart_slowLane1",
-    # "run_name": "hiro_260618_highonly_lateGreen_2to2_newReset_largeBuf",
-    # "run_name": "hiro_260619_highonly_lateGreen_2to2_newReset_acc2",
-    # "run_name": "hiro_260619_highonly_lateGreen_2to0_newReset",
-    # "run_name": "hiro_260616_highonly_lateGreen_2toR_newFlowProb",
-    # "run_name": "hiro_260611_lowonly_noSigFeat_lateGreen_noHER",
-    # "run_name": "hiro_260620_lowonly_uniform_randomStart_snapshot02_queue_lc05_fixedHER",
+    # "run_name": "hiro_260624_lowonly_uniform_oldEnv_lc05_fixedHER",
+    "run_name": "hiro_260624_lowonly_uniform_newEnv_lc05_fixedHER",
+    # "run_name": "hiro_260624_lowonly_uniform_oldEnv_lc05_legacyHER",
 
     # "scenario_name": "multi_lane",
     "scenario_name": "multi_lane_stop_to_int",
@@ -406,8 +435,9 @@ TRAIN_CONFIG: Dict[str, Any] = {
     # Train-time config overrides. Keep sections empty unless you want to override defaults.
     "config_overrides": {
         "environment": {
-            "rule_based_compute_action_mode": "goal_x_accel_follow",
             # "rule_based_compute_action_mode": "goal_x_accel",
+            # "rule_follow_reset_on_high_interval": False,
+            "rule_based_compute_action_mode": "goal_x_accel_follow",
             "observation": {
                 # "append_front_vehicle_features": False,
                 "append_front_vehicle_features": True,
@@ -415,9 +445,10 @@ TRAIN_CONFIG: Dict[str, Any] = {
             },
             # "initial_lane_probs": None,
             # "initial_lane_id": "random",
-            # "goal_lane_id": 0,
+            "initial_lane_id": 2,
+            "goal_lane_id": 0,
             # "goal_lane_id": 1,
-            "goal_lane_id": 2,
+            # "goal_lane_id": 2,
             # "goal_lane_id": "random",
             "goal_lane_probs": None,
             # "behavior_lane_probs": [
@@ -445,47 +476,47 @@ TRAIN_CONFIG: Dict[str, Any] = {
                 {"start": 27.0, "end": 84.0, "spawn_probability": 0.03},
                 {"start": 84.0, "end": 120.0, "spawn_probability": 0.07},
             ],
+            # "align_ego_spawn_to_signal_offset": False,
             "align_ego_spawn_to_signal_offset": True,
             "background_snapshot_reset": True,
-            "background_snapshot_path": None,
             "background_snapshot_paths": [
-                # "debug/background_snapshot_pool_slowlane0",
+                "debug/background_snapshot_pool_slowlane0",
                 "debug/background_snapshot_pool_slowlane2",
             ],
             "episode_start_phase_offset": 20.0,   # late green pass
-            # "enable_queue_takeover": True,
-            "enable_queue_takeover": False,
-            "goal_lane_dense_reward": 0,
-            # "goal_lane_dense_reward": 1.0,
-            "lane_change_reward": -1.0,
-            # "lane_change_reward": -0.5,
+            "enable_queue_takeover": True,
+            "terminate_on_queue_takeover": True,  # low_only queue training: terminal/reset instead of pending replay
+            # "enable_queue_takeover": False,
+            # "goal_lane_dense_reward": 0,
+            "goal_lane_dense_reward": 1.0,
+            # "lane_change_reward": -1.0,
+            "lane_change_reward": -0.5,
             "action": {
-                "acceleration_range": [-3.0, 2.0],
                 # "acceleration_range": [-5.0, 5.0],
+                "acceleration_range": [-3.0, 2.0],
             },
+            "enable_signal_green_launch_behavior": False,
+            # "enable_signal_green_launch_behavior": True,
         },
         # SAC-only environment overrides, used only when algo="sac".
         "sac_environment": {
-            "speed_ref_aux_reward": 0.1,
+            # "speed_ref_aux_reward": 0.1,
+            "speed_ref_aux_reward": 0,
         },
         "hiro": {
             # "train_mode": "high_only",
             # "low_level_type": "rule_based",
-
             "train_mode": "low_only",
             "low_level_type": "sac",
             "goal_sampler": {
                 "type": "uniform",
             },
             "low_use_her": True,
-            "fixed_goal_vx": 0.0,
-            "use_low_safety_layer": True,
-            "high_goal_safety": {
-                "dynamic_feasible_lane_intervals": True,  # 或 True
-            },
+            "low_her_ratio": 0.8,
+            # "low_her_future_mode": "segment_legacy",
+            "low_her_future_mode": "episode_timeaware",
         },
         "hiro_high_sac_kwargs": {
-            # "buffer_size": 1_000_000,
             "buffer_size": 100_000,
         },
     },
@@ -502,10 +533,23 @@ TRAIN_CONFIG: Dict[str, Any] = {
     "hiro_high_transition_csv_all": True,
     "hiro_high_transition_csv_envs": "env0",
     "hiro_high_q_replay_debug": True,
-    "hiro_low_transition_detail_csv": False,
+    "hiro_low_transition_detail_csv": True,
+    # "hiro_low_transition_detail_csv": False,
     "hiro_low_her_debug_csv_interval_steps": 5_000,
     "hiro_low_her_debug_sample_prob": 0.001,
     "hiro_low_debug_summary_interval_steps": 10_000,
+
+    # Low-only offline evaluator. The callback is only attached when
+    # HIRO train_mode="low_only"; high-only/joint runs ignore this switch.
+    "hiro_low_offline_eval_enabled": True,
+    "hiro_low_offline_eval_cases_path": "debug/hiro_low_eval_cases_snapshot012.json",
+    "hiro_low_offline_eval_freq": 200_000,
+    "hiro_low_offline_eval_sample_size": 90,
+    "hiro_low_offline_eval_build_if_missing": True,
+    "hiro_low_offline_eval_cases_per_bucket": 8,
+    "hiro_low_offline_eval_seed": MASTER_SEED,
+    "hiro_low_offline_eval_traffic_front_gap": 12.0,
+    "hiro_low_offline_eval_traffic_rear_gap": 8.0,
 
     # Train-time video recording.
     "record_video": False,

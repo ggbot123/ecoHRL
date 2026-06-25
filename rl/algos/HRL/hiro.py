@@ -424,6 +424,15 @@ class HIROSAC:
         # ---- 从env中获取的必要变量 --- #
         env_cfg = env.get_attr("config", indices=0)[0]
         self.queue_takeover_enabled = bool(env_cfg.get("enable_queue_takeover", False))
+        self.terminate_on_queue_takeover = bool(
+            env_cfg.get("terminate_on_queue_takeover", False)
+        )
+        self.train_mode = str(getattr(config, "train_mode", "joint")).lower()
+        if self.terminate_on_queue_takeover and self.train_mode != "low_only":
+            raise ValueError(
+                "terminate_on_queue_takeover=True is only allowed for "
+                f"HIRO train_mode='low_only'; got train_mode={self.train_mode!r}"
+            )
         self.high_gamma = float(high_sac_kwargs.get("gamma", 0.99))
         self.punctual_time_target = float(env_cfg.get("punctual_time_target", env_cfg.get("duration", 0.0)))
         self.goal_longitudinal = float(env_cfg.get("goal_longitudinal", env_cfg.get("road_length", 0.0)))
@@ -500,7 +509,6 @@ class HIROSAC:
         low_act_space = env.action_space
 
         # ----- Build low-level agent ----- #
-        self.train_mode = str(getattr(config, "train_mode", "joint")).lower()
         self.low_level_type = str(getattr(config, "low_level_type", "sac")).lower()
         self.low_use_her = bool(getattr(self.cfg, "low_use_her", False))
         self.use_off_policy_correction = bool(getattr(self.cfg, "use_off_policy_correction", False))
@@ -830,11 +838,24 @@ class HIROSAC:
             local_kin_flat[:, idx_y] = 0.0
         return np.concatenate([t_norm, np.asarray(local_kin_flat, dtype=np.float32), extra, goal_rel], axis=1)
 
-    def _compute_intrinsic(self, kin: np.ndarray, kin_next: np.ndarray, goal_phys: np.ndarray, ego_start: np.ndarray, is_last_step: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _compute_intrinsic(
+        self,
+        kin: np.ndarray,
+        kin_next: np.ndarray,
+        goal_phys: np.ndarray,
+        ego_start: np.ndarray,
+        intrinsic_terminal_mask: np.ndarray,
+        goal_err_mask: np.ndarray | None = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         n_envs = int(kin.shape[0])
         intrinsic = np.zeros(n_envs, dtype=np.float32)
         goal_err = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
         intrinsic_unweighted = np.zeros(n_envs, dtype=np.float32)
+        intrinsic_terminal_mask = np.asarray(intrinsic_terminal_mask, dtype=bool).reshape(-1)
+        if goal_err_mask is None:
+            goal_err_mask = intrinsic_terminal_mask
+        else:
+            goal_err_mask = np.asarray(goal_err_mask, dtype=bool).reshape(-1)
 
         intrinsic_type = str(getattr(self.cfg, "intrinsic_type", "l2")).lower()
         if intrinsic_type == "huber_shaping":
@@ -843,22 +864,25 @@ class HIROSAC:
             goal_rel_all = goal_phys - ego_start
 
             intrinsic_val, goal_err_val, intrinsic_unw, _terminal_bonus = utils.intrinsic_reward_shaping_huber(ego_rel_now, ego_rel_next, goal_rel_all,
-                self._intrinsic_norm_ranges, self.cfg.intrinsic_coef, self._intrinsic_weights, gamma=float(self.low_gamma), is_terminal=is_last_step)
+                self._intrinsic_norm_ranges, self.cfg.intrinsic_coef, self._intrinsic_weights, gamma=float(self.low_gamma), is_terminal=intrinsic_terminal_mask)
             intrinsic = intrinsic_val
 
-            if is_last_step.any():
-                idx_last = np.flatnonzero(is_last_step)
+            if goal_err_mask.any():
+                idx_last = np.flatnonzero(goal_err_mask)
                 goal_err[idx_last] = goal_err_val[idx_last]
                 intrinsic_unweighted[idx_last] = intrinsic_unw[idx_last]
         else:
-            if is_last_step.any():
-                idx_last = np.flatnonzero(is_last_step)
+            if goal_err_mask.any():
+                idx_last = np.flatnonzero(goal_err_mask)
                 ego_next_rel = utils.extract_ego_substate(kin_next[idx_last], self.ego_feature_idx) - ego_start[idx_last]
                 goal_rel = goal_phys[idx_last] - ego_start[idx_last]
 
-                intrinsic[idx_last], goal_err[idx_last], intrinsic_unweighted[idx_last] = utils.intrinsic_reward_l2(
+                l2_reward, goal_err[idx_last], intrinsic_unweighted[idx_last] = utils.intrinsic_reward_l2(
                     ego_next_rel, goal_rel, self._intrinsic_norm_ranges, self.cfg.intrinsic_coef, self._intrinsic_weights
                 )
+                terminal_mask_local = intrinsic_terminal_mask[idx_last]
+                if terminal_mask_local.any():
+                    intrinsic[idx_last[terminal_mask_local]] = l2_reward[terminal_mask_local]
 
         return intrinsic, goal_err, intrinsic_unweighted
 
@@ -898,6 +922,7 @@ class HIROSAC:
             self.queue_takeover_enabled
             and train_low
             and self.low_level_type == "sac"
+            and not self.terminate_on_queue_takeover
             and not self.low_use_her
         ):
             raise ValueError(
@@ -973,6 +998,7 @@ class HIROSAC:
             self.queue_takeover_enabled
             and train_low
             and self.low_level_type == "sac"
+            and not self.terminate_on_queue_takeover
         )
 
         def _commit_pending_low(env_indices: np.ndarray) -> int:
@@ -1149,6 +1175,10 @@ class HIROSAC:
                 [bool(info.get("queue_takeover_active", False)) for info in infos],
                 dtype=bool,
             )
+            queue_takeover_terminal_mask = np.asarray(
+                [bool(info.get("queue_takeover_terminal", False)) for info in infos],
+                dtype=bool,
+            )
             queue_enter_mask = replay_mask & (~queue_takeover_mask) & queue_takeover_next_mask
             queue_exit_mask = replay_mask & queue_takeover_mask & (~queue_takeover_next_mask)
             low_replay_mask = replay_mask & (~queue_takeover_mask)
@@ -1244,9 +1274,11 @@ class HIROSAC:
 
             # calculate intrinsic reward
             regular_interval_end = (c == hi - 1) & (~queue_takeover_next_mask)
+            queue_enter_terminal_mask = queue_enter_mask & done & queue_takeover_terminal_mask
             low_transition_end = (
                 regular_interval_end | done
-            ) & low_replay_mask & (~queue_enter_mask)
+            ) & low_replay_mask & ((~queue_enter_mask) | queue_enter_terminal_mask)
+            low_intrinsic_terminal_mask = low_transition_end & regular_interval_end
             high_interval_end = (
                 regular_interval_end | done | queue_exit_mask
             ) & replay_mask
@@ -1258,7 +1290,8 @@ class HIROSAC:
                 kin_next,
                 goal_phys,
                 ego_start,
-                low_transition_end,
+                low_intrinsic_terminal_mask,
+                goal_err_mask=low_transition_end,
             )
             intrinsic[~low_replay_mask] = 0.0
             if low_transition_end.any():
@@ -1309,6 +1342,7 @@ class HIROSAC:
                     low_infos[i]["low_ego_now"] = np.asarray(ego_now_sub[i], dtype=np.float32)
                     low_infos[i]["low_ego_next"] = np.asarray(ego_next_sub[i], dtype=np.float32)
                     low_infos[i]["low_r_ext"] = float(low_reward_ext[i])
+                    low_infos[i]["low_intrinsic_terminal"] = bool(low_intrinsic_terminal_mask[i])
 
             committed_low_count = 0
             if use_pending_low:

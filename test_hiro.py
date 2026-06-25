@@ -9,7 +9,7 @@ import json
 import random
 import torch as th
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -26,7 +26,7 @@ from util.hiro_utils import (
 )
 from rl.algos.HRL.hiro_infer import HIROPolicyRunner
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig, get_goal_sampler
-from configs.builders import get_env_config_for_scenario, get_scenario_spec
+from configs.builders import get_env_config_for_scenario, get_hiro_config, get_scenario_spec
 
 
 class OneBasedEvalRecordVideo(RecordVideo):
@@ -43,6 +43,39 @@ class OneBasedEvalRecordVideo(RecordVideo):
             else int(self.episode_id) + 1
         )
         return super().start_recording(f"hiro_ep_{episode_number:04d}")
+
+
+def _legacy_hiro_run_config(model_dir: str) -> Tuple[Dict[str, Any], str]:
+    """Build a minimal config for old HIRO checkpoints saved before run_config.json."""
+    hiro_cfg = asdict(get_hiro_config())
+    hiro_cfg.update(
+        {
+            "train_mode": "high_only",
+            "low_level_type": "rule_based",
+            "high_obs_use_signal_features": False,
+            "use_low_safety_layer": True,
+        }
+    )
+    env_cfg = get_env_config_for_scenario("multi_lane")
+    payload = {
+        "run_metadata": {
+            "scenario_name": "multi_lane",
+            "legacy_config_fallback": True,
+            "legacy_model_dir": os.path.abspath(model_dir),
+            "high_obs_time_mode": "elapsed",
+            "high_obs_x_mode": "elapsed",
+        },
+        "environment": {"env0_config": env_cfg},
+        "hiro": {"config": hiro_cfg},
+    }
+    return payload, f"<legacy fallback for {os.path.abspath(model_dir)}>"
+
+
+def _load_hiro_run_config_or_legacy(model_dir: str) -> Tuple[Dict[str, Any], str]:
+    try:
+        return load_hiro_run_config(model_dir)
+    except FileNotFoundError:
+        return _legacy_hiro_run_config(model_dir)
 
 
 def main(
@@ -96,6 +129,16 @@ def main(
 
     env_overrides = _override_section("environment")
     hiro_overrides = _override_section("hiro")
+    hiro_eval_modes: Dict[str, Any] = {}
+    for mode_key in ("high_obs_time_mode", "high_obs_x_mode"):
+        if mode_key in hiro_overrides:
+            mode_val = str(hiro_overrides.pop(mode_key)).lower().strip()
+            if mode_val not in {"remaining", "elapsed"}:
+                raise ValueError(
+                    f"config_overrides['hiro']['{mode_key}'] must be "
+                    "'remaining' or 'elapsed'"
+                )
+            hiro_eval_modes[mode_key] = mode_val
     evaluation_overrides = _override_section("evaluation")
     allowed_evaluation_overrides = {"high_policy_source"}
     unknown_evaluation_keys = set(evaluation_overrides) - allowed_evaluation_overrides
@@ -115,15 +158,27 @@ def main(
         )
 
     config_source_dir = config_model_dir or high_model_dir or model_dir
-    run_config, run_config_path = load_hiro_run_config(config_source_dir)
+    run_config, run_config_path = _load_hiro_run_config_or_legacy(config_source_dir)
     env_run_config, env_run_config_path = (
-        load_hiro_run_config(env_config_model_dir)
+        _load_hiro_run_config_or_legacy(env_config_model_dir)
         if env_config_model_dir
         else (run_config, run_config_path)
     )
     hiro_cfg = hiro_config_from_run_config(run_config)
     if hiro_overrides:
         hiro_cfg = apply_hiro_config_overrides(hiro_cfg, hiro_overrides)
+    run_metadata = run_config.get("run_metadata")
+    if isinstance(run_metadata, Mapping) and run_metadata.get("legacy_config_fallback"):
+        hiro_eval_modes.setdefault(
+            "high_obs_time_mode",
+            str(run_metadata.get("high_obs_time_mode", "elapsed")),
+        )
+        hiro_eval_modes.setdefault(
+            "high_obs_x_mode",
+            str(run_metadata.get("high_obs_x_mode", "elapsed")),
+        )
+    for mode_key, mode_val in hiro_eval_modes.items():
+        setattr(hiro_cfg, mode_key, mode_val)
     saved_metadata = env_run_config.get("run_metadata")
     if not isinstance(saved_metadata, Mapping):
         raise ValueError("run_config.json is missing the 'run_metadata' object")
@@ -1265,17 +1320,22 @@ if __name__ == "__main__":
     run_batch(
         models=[
             # HIROEvalModel(
-            #     name="lateGreen_lane2to1_newReset_dyna_buf100k_randStart",
-            #     model_dir="./models/hiro_260618_highonly_lateGreen_2to1_newReset_dyna_buf100k_randStart",
+            #     name="hiro_260331_highonly_rule_accwithSL_randomLane",
+            #     model_dir="./models/hiro_260331_highonly_rule_accwithSL_randomLane",
             # ),
             # HIROEvalModel(
             #     name="lateGreen_lane2to2_newReset",
             #     model_dir="./models/hiro_260618_highonly_lateGreen_2to2_newReset",
             # ),
-            HIROEvalModel(
-                name="lateGreen_lane2to2_newReset_largeBuf",
-                model_dir="./models/hiro_260618_highonly_lateGreen_2to2_newReset_largeBuf",
-            ),
+            # HIROEvalModel(
+            #     name="hiro_260619_highonly_lateGreen_2to0_newReset",
+            #     model_dir="./models/hiro_260619_highonly_lateGreen_2to0_newReset",
+            # ),
+            # HIROEvalModel(
+            #     name="hiro_260622_highonly_lateGreen_2to2_noGoalReshape",
+            #     model_dir="./models/hiro_260622_highonly_lateGreen_2to2_noGoalReshape",
+            #     model_suffix="step_6800000",
+            # ),
             # HIROEvalModel(
             #     name="lateGreen_lane2toR_latest",
             #     model_dir="./models/hiro_260614_highonly_lateGreen_2toRandom",
@@ -1288,17 +1348,23 @@ if __name__ == "__main__":
         # enable_rendering=False,
         # scenario_name="multi_lane",
         scenario_name="multi_lane_stop_to_int",
-        # shared_env_config_model_dir=(
-        #     "./models/hiro_260611_rule_oldEnv_lane2to1_005_randomstart"
-        # ),
-        # use_each_model_env_config=False,
+        shared_env_config_model_dir=None,
+        use_each_model_env_config=False,
         config_overrides={
             "environment": {
+                "initial_lane_id": "2",
+                "goal_lane_id": "2",
+                # "rule_follow_reset_on_high_interval": False,
+                # "rule_based_compute_action_mode": "goal_x_accel",
+                # "rule_based_compute_action_mode": "idm_mobil",
             },
             "hiro": {
                 "use_low_safety_layer": True,
                 "goal_sampler": {
                     "type": "reachable_uniform",
+                },
+                "high_goal_safety": {
+                    # "dynamic_feasible_lane_intervals": False,
                 },
             },
             "evaluation": {

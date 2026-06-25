@@ -267,6 +267,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._queue_takeover_active = False
         self._queue_takeover_enter_count = 0
         self._background_only_sim_time = 0.0
+        self._signal_green_launch_reset_vehicles: dict[int, object] = {}
 
     # ----------------- 配置 ----------------- #
     @classmethod
@@ -414,6 +415,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._episode_goal_lane_id = self._sample_goal_lane_id()
         self._inter_episode_active = False
         self._inter_episode_remaining = 0.0
+        self._signal_green_launch_reset_vehicles = {}
 
         if bool(self.config.get("background_snapshot_reset", False)):
             self._reset_from_background_snapshot()
@@ -463,6 +465,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._sync_episode_punctual_time()
         self._create_ego()
         self._episodes_started += 1
+        self._mark_signal_green_launch_reset_vehicles()
         self._update_signal_virtual_stops(query_time=0.0)
 
     def _compute_episode_start_offset_delta(self, strict_next: bool) -> float:
@@ -726,7 +729,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             raise ValueError("Background snapshot pool is missing config_signature")
 
         current = self._snapshot_config_signature()
-        ignored_keys: set[str] = set()
+        ignored_keys: set[str] = {"enable_signal_green_launch_behavior"}
         try:
             if len(self._background_snapshot_paths()) > 1:
                 ignored_keys.add("behavior_lane_probs")
@@ -1146,6 +1149,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._create_ego()
         self._episodes_started += 1
         self._did_global_warmup = True
+        self._mark_signal_green_launch_reset_vehicles()
         self._update_signal_virtual_stops(query_time=0.0)
         return True
 
@@ -1203,6 +1207,7 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         self._sync_episode_punctual_time()
         self._create_ego()
         self._episodes_started += 1
+        self._mark_signal_green_launch_reset_vehicles()
         self._update_signal_virtual_stops(query_time=0.0)
 
     def _nearest_same_lane_front(self):
@@ -1472,7 +1477,17 @@ class MultiLaneStopToIntEnv(AbstractEnv):
 
         # 维持渲染与下一步前的一致信号状�?
         self._update_signal_virtual_stops(query_time=self.time)
+        queue_takeover_was_active = self.get_queue_takeover_active()
         self._update_queue_takeover_state()
+        queue_takeover_active = self.get_queue_takeover_active()
+        queue_takeover_terminal = bool(
+            self.config.get("terminate_on_queue_takeover", False)
+            and queue_takeover_active
+            and not queue_takeover_was_active
+            and not bool(terminated or truncated)
+        )
+        if queue_takeover_terminal:
+            terminated = True
 
         # 把“加权后的分项奖励”塞�?info，方�?callback �?infos 里读
         weighted = getattr(self, "_last_weighted_rewards", None)
@@ -1494,7 +1509,8 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             info["inter_episode"] = False
             info["skip_replay"] = False
             info["next_obs_is_dummy"] = bool(next_obs_is_dummy)
-            info["queue_takeover_active"] = self.get_queue_takeover_active()
+            info["queue_takeover_active"] = bool(queue_takeover_active)
+            info["queue_takeover_terminal"] = bool(queue_takeover_terminal)
             info["env_diagnostics"] = self._env_diagnostics()
             if bool(terminated or truncated):
                 info["terminal_signal_features"] = tuple(self.get_hiro_signal_features())
@@ -1668,12 +1684,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             target_speed = min(target_speed, speed_limit)
         return max(target_speed, 0.1)
 
-    def _green_launch_candidate(self, vehicle, phase: dict[str, dict[str, float | str]]) -> bool:
+    def _green_launch_region_candidate(self, vehicle) -> bool:
         direction = self._vehicle_signal_direction(vehicle)
         if direction is None:
-            return False
-        state = str(phase.get(direction, {}).get("state", "red"))
-        if state != "green":
             return False
 
         try:
@@ -1687,6 +1700,32 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         intersection = max(float(self.config.get("intersection_length", 0.0)), 0.0)
         end_margin = max(float(self.config.get("signal_green_launch_end_margin", 5.0)), 0.0)
         return (stop_x - approach) <= x <= (stop_x + intersection + end_margin)
+
+    def _mark_signal_green_launch_reset_vehicles(self) -> None:
+        eligible: dict[int, object] = {}
+        if not hasattr(self, "road") or self.road is None:
+            self._signal_green_launch_reset_vehicles = eligible
+            return
+
+        controlled = tuple(getattr(self, "controlled_vehicles", []) or ())
+        for vehicle in list(getattr(self.road, "vehicles", []) or []):
+            if any(vehicle is controlled_vehicle for controlled_vehicle in controlled):
+                continue
+            if self._green_launch_region_candidate(vehicle):
+                eligible[id(vehicle)] = vehicle
+        self._signal_green_launch_reset_vehicles = eligible
+
+    def _green_launch_candidate(self, vehicle, phase: dict[str, dict[str, float | str]]) -> bool:
+        eligible = getattr(self, "_signal_green_launch_reset_vehicles", {})
+        if not isinstance(eligible, dict) or eligible.get(id(vehicle)) is not vehicle:
+            return False
+        direction = self._vehicle_signal_direction(vehicle)
+        if direction is None:
+            return False
+        state = str(phase.get(direction, {}).get("state", "red"))
+        if state != "green":
+            return False
+        return self._green_launch_region_candidate(vehicle)
 
     def _apply_signal_green_launch_behavior(self, vehicle) -> None:
         if not isinstance(getattr(vehicle, "_signal_green_launch_original", None), dict):
