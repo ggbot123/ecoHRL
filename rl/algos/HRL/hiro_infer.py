@@ -55,10 +55,13 @@ class HIROPolicyRunner:
         self.idx_vx = 2
         self.idx_vy = 3
         self.safety_controller: Optional[RuleBasedController] = None
+        self.low_safety_agent: Optional[RuleBasedAgentWrapper] = None
         self.rule_based_agent: Optional[RuleBasedAgentWrapper] = None
         self.last_action_pre_safety = np.zeros(0, dtype=np.float32)
         self.last_action_post_safety = np.zeros(0, dtype=np.float32)
         self.last_goal_action = np.zeros(0, dtype=np.float32)
+        self.last_goal_action_raw = np.zeros(0, dtype=np.float32)
+        self.last_goal_shielded = False
         self.high_goal_safe_bounds: Optional[HighGoalSafeBoundsCalculator] = None
         self.punctual_time_target = 0.0
         self.goal_longitudinal_default = 0.0
@@ -122,21 +125,27 @@ class HIROPolicyRunner:
         self.idx_vx = _idx("vx", 2)
         self.idx_vy = _idx("vy", 3)
 
-        if self.use_low_safety_layer and self.safety_controller is None:
-            self.safety_controller = RuleBasedController(
-                cfg,
-                low_safety_filter=getattr(self.cfg, "low_safety_filter", None),
-            )
-        if (
-            str(getattr(self.cfg, "low_level_type", "sac")).lower() == "rule_based"
-            and self.rule_based_agent is None
-        ):
-            self.rule_based_agent = RuleBasedAgentWrapper(
+        if self.use_low_safety_layer and self.low_safety_agent is None:
+            self.low_safety_agent = RuleBasedAgentWrapper(
                 _SingleEnvAdapter(env),
                 n_envs=1,
                 high_interval=int(self.hi),
                 low_safety_filter=getattr(self.cfg, "low_safety_filter", None),
             )
+            self.safety_controller = self.low_safety_agent.controller
+        if (
+            str(getattr(self.cfg, "low_level_type", "sac")).lower() == "rule_based"
+            and self.rule_based_agent is None
+        ):
+            if self.low_safety_agent is not None:
+                self.rule_based_agent = self.low_safety_agent
+            else:
+                self.rule_based_agent = RuleBasedAgentWrapper(
+                    _SingleEnvAdapter(env),
+                    n_envs=1,
+                    high_interval=int(self.hi),
+                    low_safety_filter=getattr(self.cfg, "low_safety_filter", None),
+                )
 
         action_cfg = cfg.get("action", {}) if isinstance(cfg, dict) else {}
         accel_range = action_cfg.get("acceleration_range", [-5.0, 5.0])
@@ -173,6 +182,13 @@ class HIROPolicyRunner:
             max_decel=float(max_decel),
             front_dmin=float(max(0.0, getattr(self.cfg, "high_goal_safe_front_dmin", 0.0))),
             lane_change_rear_dmin=float(max(0.0, getattr(self.cfg, "high_goal_safe_lane_change_rear_dmin", 0.0))),
+            use_idm_dynamic_margins=bool(getattr(self.cfg.high_goal_safety, "use_idm_dynamic_margins", False)),
+            front_standstill_dmin=float(max(0.0, getattr(self.cfg.high_goal_safety, "front_standstill_dmin", 8.0))),
+            rear_standstill_dmin=float(max(0.0, getattr(self.cfg.high_goal_safety, "rear_standstill_dmin", 6.0))),
+            idm_time_headway=float(max(0.0, getattr(self.cfg.high_goal_safety, "idm_time_headway", 0.5))),
+            idm_accel=float(max(1e-6, getattr(self.cfg.high_goal_safety, "idm_accel", 3.0))),
+            idm_decel=float(max(1e-6, getattr(self.cfg.high_goal_safety, "idm_decel", 5.0))),
+            rear_imposed_decel=float(max(0.0, getattr(self.cfg.high_goal_safety, "rear_imposed_decel", 4.0))),
             min_goal_x_span=float(max(0.0, getattr(self.cfg, "high_goal_safe_min_goal_x_span", 0.0))),
             dx_low=float(dx_low),
             dx_high=float(dx_high),
@@ -212,6 +228,12 @@ class HIROPolicyRunner:
                 high_actor.goal_safe_sampling_enabled = True
             elif need_bind_bounds:
                 high_actor.goal_safe_sampling_enabled = False
+            if hasattr(high_actor, "infeasible_action_mode"):
+                high_actor.infeasible_action_mode = (
+                    "preserve"
+                    if self._high_goal_infeasible_mode() == "shield_penalty"
+                    else "reroute"
+                )
 
         intrinsic_norm = getattr(self.cfg, "intrinsic_norm_ranges", None)
         self.norm_ranges = np.asarray(intrinsic_norm, dtype=np.float32)
@@ -258,6 +280,73 @@ class HIROPolicyRunner:
         others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
         return ego_abs, others_rel_arr
 
+    def _high_goal_infeasible_mode(self) -> str:
+        mode = str(getattr(self.cfg, "high_goal_infeasible_action_mode", "reroute")).lower().strip()
+        if mode in {"shield", "shield_penalty", "penalty", "fallback"}:
+            return "shield_penalty"
+        return "reroute"
+
+    def _goal_component_index(self, action: np.ndarray, ego_lane_idx: int, n_lanes: int) -> int:
+        y = float(np.asarray(action, dtype=np.float32).reshape(-1)[1])
+        if not bool(getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)):
+            if y <= -1.0 / 3.0:
+                return 0
+            if y < 1.0 / 3.0:
+                return 1
+            return 2
+        if int(n_lanes) <= 1:
+            return 1
+        if int(ego_lane_idx) == 0:
+            return 2 if y > 0.0 else 1
+        if int(ego_lane_idx) == int(n_lanes) - 1:
+            return 0 if y < 0.0 else 1
+        if y <= -1.0 / 3.0:
+            return 0
+        if y < 1.0 / 3.0:
+            return 1
+        return 2
+
+    def _shield_goal_action_if_needed(self, high_obs: np.ndarray, goal_action: np.ndarray) -> tuple[np.ndarray, bool]:
+        if (
+            self.high_goal_safe_bounds is None
+            or self._high_goal_infeasible_mode() != "shield_penalty"
+            or not bool(getattr(self.cfg, "use_high_goal_safety_layer", False))
+        ):
+            return goal_action, False
+        action = np.asarray(goal_action, dtype=np.float32).reshape(1, -1)
+        stats = self.high_goal_safe_bounds.compute_np(np.asarray(high_obs, dtype=np.float32).reshape(1, -1))
+        l2 = np.asarray(stats["l2"], dtype=np.float32)
+        u2 = np.asarray(stats["u2"], dtype=np.float32)
+        valid = u2 > l2
+        if action.shape[1] >= 3 and "l_vx" in stats and "u_vx" in stats:
+            valid = valid & (np.asarray(stats["u_vx"], dtype=np.float32) > np.asarray(stats["l_vx"], dtype=np.float32))
+
+        lane_idx = int(np.asarray(stats.get("ego_lane_idx", [0]), dtype=np.int64).reshape(-1)[0])
+        n_lanes = int(np.asarray(stats.get("n_lanes", len(self.lane_center_ys)), dtype=np.int64).reshape(-1)[0])
+        comp = self._goal_component_index(action[0], lane_idx, n_lanes)
+        if bool(valid[0, comp]):
+            return action, False
+
+        low = np.asarray(self.high_model.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(self.high_model.action_space.high, dtype=np.float32).reshape(-1)
+        fallback = action.copy()
+        y0, y1 = utils.semantic_y_interval(
+            1,
+            lane_idx,
+            n_lanes,
+            bool(getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)),
+        )
+        fallback[0, 1] = float(np.clip(0.5 * (y0 + y1), low[1], high[1]))
+        if bool(valid[0, 1]):
+            denom = max(float(high[0] - low[0]), 1e-6)
+            x_norm = np.clip(2.0 * (fallback[0, 0] - low[0]) / denom - 1.0, l2[0, 1], u2[0, 1])
+            fallback[0, 0] = float(np.clip(low[0] + 0.5 * (x_norm + 1.0) * (high[0] - low[0]), low[0], high[0]))
+        else:
+            fallback[0, 0] = low[0]
+            if fallback.shape[1] >= 3:
+                fallback[0, 2] = float(np.clip(0.0, low[2], high[2]))
+        return fallback.astype(np.float32), True
+
     def _sample_goal(self, obs: np.ndarray, kin: np.ndarray, env=None):
         ego_sub = self._ego_sub(kin)
         high_obs = self._build_high_obs(np.asarray(obs, dtype=np.float32), env)
@@ -266,7 +355,10 @@ class HIROPolicyRunner:
         else:
             goal_action, _ = self.high_model.predict(high_obs, deterministic=True)
         goal_action = np.asarray(goal_action, dtype=np.float32).reshape(1, -1)
+        self.last_goal_action_raw = np.asarray(goal_action[0], dtype=np.float32).copy()
+        goal_action, shielded = self._shield_goal_action_if_needed(high_obs, goal_action)
         self.last_goal_action = np.asarray(goal_action[0], dtype=np.float32).copy()
+        self.last_goal_shielded = bool(shielded)
         goal_phys = utils.goal_action_to_abs(
             ego_sub[None, :],
             goal_action,
@@ -428,17 +520,12 @@ class HIROPolicyRunner:
         action = np.asarray(action, dtype=np.float32)
         self.last_action_pre_safety = action.copy()
 
-        if self.use_low_safety_layer and self.safety_controller is not None:
-            ego_abs, others_rel = self._extract_ego_others(kin)
-            rem_time = float(self.hi - self.c) * float(self.dt)
-            action = self.safety_controller.safety_filter_action(
-                ego_abs,
-                others_rel,
-                self.goal_phys,
-                action,
-                self.dt,
-                remaining_time=rem_time,
-            )
+        if self.use_low_safety_layer and self.low_safety_agent is not None:
+            action = self.low_safety_agent.apply_safety_layer(
+                low_obs.reshape(1, -1),
+                self.goal_phys.reshape(1, -1),
+                action.reshape(1, -1),
+            )[0]
         self.last_action_post_safety = np.asarray(action, dtype=np.float32).copy()
         return np.asarray(action, dtype=np.float32)
 

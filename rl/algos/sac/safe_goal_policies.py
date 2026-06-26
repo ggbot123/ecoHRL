@@ -50,6 +50,7 @@ class SafeGoalActor(Actor):
         goal_safe_log_eps: float = 1e-30,
         goal_safe_bounds_fn: Optional[Callable[[th.Tensor], dict[str, th.Tensor]]] = None,
         dynamic_feasible_lane_intervals: bool = False,
+        infeasible_action_mode: str = "reroute",
     ):
         super().__init__(
             observation_space=observation_space,
@@ -70,6 +71,7 @@ class SafeGoalActor(Actor):
         self.goal_safe_log_eps = float(goal_safe_log_eps)
         self.goal_safe_bounds_fn = goal_safe_bounds_fn
         self.dynamic_feasible_lane_intervals = bool(dynamic_feasible_lane_intervals)
+        self.infeasible_action_mode = str(infeasible_action_mode).lower().strip()
 
     def forward(self, obs: PyTorchObs, deterministic: bool = False) -> th.Tensor:
         mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
@@ -190,14 +192,17 @@ class SafeGoalActor(Actor):
         valid_sel_base = valid_k[idx, k_base]
         feasible_any = th.any(valid_k, dim=1)
 
-        # If selected segment is infeasible, reroute to the nearest feasible segment.
+        # If selected segment is infeasible, either reroute to the nearest
+        # feasible segment (legacy behavior) or preserve the sampled semantic
+        # action so the outer HIRO shield can penalize it explicitly.
         seg_m, seg_r = self._segment_geometry(safe_stats, mean_actions)
         y1_base = y_base[:, 1]
         dist_to_center = th.abs(y1_base[:, None] - seg_m)
         inf = th.full_like(dist_to_center, 1e9)
         dist_masked = th.where(valid_k, dist_to_center, inf)
         k_fallback = th.argmin(dist_masked, dim=1)
-        use_fallback = (~valid_sel_base) & feasible_any
+        mode = str(getattr(self, "infeasible_action_mode", "reroute")).lower().strip()
+        use_fallback = (~valid_sel_base) & feasible_any & (mode in {"reroute", "nearest"})
         k = th.where(use_fallback, k_fallback, k_base)
         valid_sel = valid_k[idx, k]
 
@@ -394,10 +399,12 @@ class SafeGoalSACPolicy(SACPolicy):
         goal_safe_eps: float = 1e-6,
         goal_safe_log_eps: float = 1e-30,
         dynamic_feasible_lane_intervals: bool = False,
+        infeasible_action_mode: str = "reroute",
     ):
         self.goal_safe_eps = float(goal_safe_eps)
         self.goal_safe_log_eps = float(goal_safe_log_eps)
         self.dynamic_feasible_lane_intervals = bool(dynamic_feasible_lane_intervals)
+        self.infeasible_action_mode = str(infeasible_action_mode).lower().strip()
         super().__init__(
             observation_space=observation_space,
             action_space=action_space,
@@ -424,6 +431,7 @@ class SafeGoalSACPolicy(SACPolicy):
             goal_safe_eps=self.goal_safe_eps,
             goal_safe_log_eps=self.goal_safe_log_eps,
             dynamic_feasible_lane_intervals=self.dynamic_feasible_lane_intervals,
+            infeasible_action_mode=self.infeasible_action_mode,
         ).to(self.device)
 
 

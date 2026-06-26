@@ -9,6 +9,7 @@ import gymnasium as gym
 import numpy as np
 
 from rl.algos.sac.sac import SAC
+from rl.algos.sac.replay_buffer import SkipReplayBuffer
 from rl.algos.sac.safe_goal_policies import SafeGoalMlpPolicy
 from rl.utils import utils
 from rl.algos.HRL.rule_based import RuleBasedAgentWrapper
@@ -310,9 +311,18 @@ class HighGoalSafetyConfig:
     max_decel: Optional[float] = 3.0
     front_dmin: float = 15.0
     lane_change_rear_dmin: float = 10.0
+    use_idm_dynamic_margins: bool = False
+    front_standstill_dmin: float = 8.0
+    rear_standstill_dmin: float = 6.0
+    idm_time_headway: float = 0.5
+    idm_accel: float = 3.0
+    idm_decel: float = 5.0
+    rear_imposed_decel: float = 4.0
     min_goal_x_span: float = 0.0
     enable_goal_vx_bounds: bool = False
     dynamic_feasible_lane_intervals: bool = True
+    infeasible_action_mode: str = "reroute"  # "reroute" | "shield_penalty"
+    infeasible_action_penalty: float = 0.0
 
 
 @dataclass
@@ -386,6 +396,14 @@ class HIROConfig:
     @property
     def high_goal_dynamic_feasible_lane_intervals(self) -> bool:
         return bool(self.high_goal_safety.dynamic_feasible_lane_intervals)
+
+    @property
+    def high_goal_infeasible_action_mode(self) -> str:
+        return str(self.high_goal_safety.infeasible_action_mode)
+
+    @property
+    def high_goal_infeasible_action_penalty(self) -> float:
+        return float(self.high_goal_safety.infeasible_action_penalty)
 
 
 class HIROSAC:
@@ -490,6 +508,13 @@ class HIROSAC:
             max_decel=max_decel,
             front_dmin=float(max(0.0, getattr(self.cfg, "high_goal_safe_front_dmin", 0.0))),
             lane_change_rear_dmin=float(max(0.0, getattr(self.cfg, "high_goal_safe_lane_change_rear_dmin", 0.0))),
+            use_idm_dynamic_margins=bool(getattr(self.cfg.high_goal_safety, "use_idm_dynamic_margins", False)),
+            front_standstill_dmin=float(max(0.0, getattr(self.cfg.high_goal_safety, "front_standstill_dmin", 8.0))),
+            rear_standstill_dmin=float(max(0.0, getattr(self.cfg.high_goal_safety, "rear_standstill_dmin", 6.0))),
+            idm_time_headway=float(max(0.0, getattr(self.cfg.high_goal_safety, "idm_time_headway", 0.5))),
+            idm_accel=float(max(1e-6, getattr(self.cfg.high_goal_safety, "idm_accel", 3.0))),
+            idm_decel=float(max(1e-6, getattr(self.cfg.high_goal_safety, "idm_decel", 5.0))),
+            rear_imposed_decel=float(max(0.0, getattr(self.cfg.high_goal_safety, "rear_imposed_decel", 4.0))),
             min_goal_x_span=float(max(0.0, getattr(self.cfg, "high_goal_safe_min_goal_x_span", 0.0))),
             dx_low=float(goal_low[0]),
             dx_high=float(goal_high[0]),
@@ -536,7 +561,7 @@ class HIROSAC:
             low_sac_n_envs = self.n_envs
             if low_inference_only:
                 low_sac_kwargs["buffer_size"] = int(min(int(low_sac_kwargs.get("buffer_size", 1000000)), 1024))
-                low_sac_kwargs.pop("replay_buffer_class", None)
+                low_sac_kwargs["replay_buffer_class"] = SkipReplayBuffer
                 rb_kwargs_low = dict(low_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
                 rb_kwargs_low["handle_timeout_termination"] = False
                 low_sac_kwargs["replay_buffer_kwargs"] = rb_kwargs_low
@@ -619,6 +644,7 @@ class HIROSAC:
             policy_kwargs["dynamic_feasible_lane_intervals"] = bool(
                 getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
             )
+            policy_kwargs["infeasible_action_mode"] = self._safe_actor_infeasible_mode()
             high_sac_kwargs["policy_kwargs"] = policy_kwargs
 
         rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
@@ -661,6 +687,7 @@ class HIROSAC:
             high_sac.actor.dynamic_feasible_lane_intervals = bool(
                 getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
             )
+            high_sac.actor.infeasible_action_mode = self._safe_actor_infeasible_mode()
 
         self.high_agent = SB3AgentWrapper(high_sac, config.train_freq, config.gradient_steps_high, config.batch_size)
 
@@ -699,6 +726,135 @@ class HIROSAC:
             for cb in callback.callbacks: HIROSAC._propagate_log_interval(cb, log_interval)
         elif hasattr(callback, "log_interval"):
             callback.log_interval = int(log_interval)
+
+    def _high_goal_infeasible_mode(self) -> str:
+        mode = str(getattr(self.cfg, "high_goal_infeasible_action_mode", "reroute")).lower().strip()
+        if mode in {"shield", "shield_penalty", "penalty", "fallback"}:
+            return "shield_penalty"
+        return "reroute"
+
+    def _safe_actor_infeasible_mode(self) -> str:
+        return "preserve" if self._high_goal_infeasible_mode() == "shield_penalty" else "reroute"
+
+    @staticmethod
+    def _goal_action_component_indices(
+        actions: np.ndarray,
+        ego_lane_idx: np.ndarray,
+        n_lanes: int,
+        *,
+        dynamic_feasible_intervals: bool,
+    ) -> np.ndarray:
+        a = np.asarray(actions, dtype=np.float32)
+        y = a[:, 1] if a.ndim == 2 and a.shape[1] >= 2 else np.zeros((a.shape[0],), dtype=np.float32)
+        k = np.full((a.shape[0],), 2, dtype=np.int64)
+        k = np.where(y < (1.0 / 3.0), 1, k)
+        k = np.where(y <= (-1.0 / 3.0), 0, k)
+        if not dynamic_feasible_intervals:
+            return k.astype(np.int64)
+
+        lanes = np.asarray(ego_lane_idx, dtype=np.int64).reshape(-1)
+        if int(n_lanes) <= 1:
+            return np.ones_like(k, dtype=np.int64)
+        left_edge = lanes == 0
+        right_edge = lanes == (int(n_lanes) - 1)
+        k = np.where(left_edge, np.where(y > 0.0, 2, 1), k)
+        k = np.where(right_edge, np.where(y < 0.0, 0, 1), k)
+        return k.astype(np.int64)
+
+    def _normalized_dx_to_high_action(self, x_norm: np.ndarray) -> np.ndarray:
+        low = np.asarray(self.high_agent.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(self.high_agent.action_space.high, dtype=np.float32).reshape(-1)
+        return (low[0] + 0.5 * (np.asarray(x_norm, dtype=np.float32) + 1.0) * (high[0] - low[0])).astype(np.float32)
+
+    def _high_action_dx_to_normalized(self, x_action: np.ndarray) -> np.ndarray:
+        low = np.asarray(self.high_agent.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(self.high_agent.action_space.high, dtype=np.float32).reshape(-1)
+        denom = max(float(high[0] - low[0]), 1e-6)
+        return np.clip(2.0 * (np.asarray(x_action, dtype=np.float32) - low[0]) / denom - 1.0, -1.0, 1.0).astype(np.float32)
+
+    def _normalized_vx_to_high_action(self, v_norm: np.ndarray) -> np.ndarray:
+        low = np.asarray(self.high_agent.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(self.high_agent.action_space.high, dtype=np.float32).reshape(-1)
+        return (low[2] + 0.5 * (np.asarray(v_norm, dtype=np.float32) + 1.0) * (high[2] - low[2])).astype(np.float32)
+
+    def _high_action_vx_to_normalized(self, v_action: np.ndarray) -> np.ndarray:
+        low = np.asarray(self.high_agent.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(self.high_agent.action_space.high, dtype=np.float32).reshape(-1)
+        denom = max(float(high[2] - low[2]), 1e-6)
+        return np.clip(2.0 * (np.asarray(v_action, dtype=np.float32) - low[2]) / denom - 1.0, -1.0, 1.0).astype(np.float32)
+
+    def _shield_infeasible_high_goal_actions(
+        self,
+        high_obs: np.ndarray,
+        actions: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        actions = np.asarray(actions, dtype=np.float32)
+        if actions.ndim != 2 or actions.shape[0] == 0 or actions.shape[1] < 2:
+            n = int(actions.shape[0]) if actions.ndim >= 1 else 0
+            return actions, np.zeros(n, dtype=bool), np.zeros(n, dtype=bool), np.zeros(n, dtype=np.int64)
+
+        stats = self.high_goal_safe_bounds.compute_np(np.asarray(high_obs, dtype=np.float32))
+        l2 = np.asarray(stats["l2"], dtype=np.float32)
+        u2 = np.asarray(stats["u2"], dtype=np.float32)
+        valid_k = u2 > l2
+        if actions.shape[1] >= 3 and "l_vx" in stats and "u_vx" in stats:
+            l_vx = np.asarray(stats["l_vx"], dtype=np.float32)
+            u_vx = np.asarray(stats["u_vx"], dtype=np.float32)
+            valid_k = valid_k & (u_vx > l_vx)
+        else:
+            l_vx = None
+            u_vx = None
+
+        lane_idx = np.asarray(stats.get("ego_lane_idx", np.zeros(actions.shape[0])), dtype=np.int64).reshape(-1)
+        n_lanes = int(np.asarray(stats.get("n_lanes", self.n_lanes)).reshape(-1)[0])
+        use_dynamic = bool(getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False))
+        selected = self._goal_action_component_indices(
+            actions,
+            lane_idx,
+            n_lanes,
+            dynamic_feasible_intervals=use_dynamic,
+        )
+        row = np.arange(actions.shape[0])
+        invalid_selected = ~valid_k[row, selected]
+        shielded = invalid_selected.copy()
+        if not np.any(shielded):
+            return actions, invalid_selected, shielded, selected
+
+        executed = actions.copy()
+        keep = np.ones(actions.shape[0], dtype=np.int64)
+        keep_valid = valid_k[row, keep]
+        low = np.asarray(self.high_agent.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(self.high_agent.action_space.high, dtype=np.float32).reshape(-1)
+
+        y_intervals = np.asarray(
+            [
+                utils.semantic_y_interval(1, int(lane_idx[i]), n_lanes, use_dynamic)
+                for i in range(actions.shape[0])
+            ],
+            dtype=np.float32,
+        )
+        keep_y = 0.5 * (y_intervals[:, 0] + y_intervals[:, 1])
+
+        shield_idx = np.flatnonzero(shielded)
+        executed[shield_idx, 1] = np.clip(keep_y[shield_idx], low[1], high[1])
+
+        if np.any(keep_valid & shielded):
+            idx_valid = np.flatnonzero(keep_valid & shielded)
+            x_norm = self._high_action_dx_to_normalized(actions[idx_valid, 0])
+            x_norm = np.clip(x_norm, l2[idx_valid, keep[idx_valid]], u2[idx_valid, keep[idx_valid]])
+            executed[idx_valid, 0] = np.clip(self._normalized_dx_to_high_action(x_norm), low[0], high[0])
+            if actions.shape[1] >= 3 and l_vx is not None and u_vx is not None:
+                v_norm = self._high_action_vx_to_normalized(actions[idx_valid, 2])
+                v_norm = np.clip(v_norm, l_vx[idx_valid, keep[idx_valid]], u_vx[idx_valid, keep[idx_valid]])
+                executed[idx_valid, 2] = np.clip(self._normalized_vx_to_high_action(v_norm), low[2], high[2])
+
+        idx_wait = np.flatnonzero((~keep_valid) & shielded)
+        if idx_wait.size > 0:
+            executed[idx_wait, 0] = low[0]
+            if actions.shape[1] >= 3:
+                executed[idx_wait, 2] = np.clip(0.0, low[2], high[2])
+
+        return executed.astype(np.float32), invalid_selected, shielded, selected
 
     # ------------------------------------------------------------------
     # 内部工具函数：obs 处理
@@ -947,6 +1103,7 @@ class HIROSAC:
 
         high_obs_start = np.zeros((n_envs, int(self.high_obs_dim)), dtype=np.float32)
         goal_action = np.zeros((n_envs, int(self.high_agent.action_space.shape[0])), dtype=np.float32)
+        goal_action_raw = np.zeros_like(goal_action)
         goal_buffer_action = np.zeros_like(goal_action)
         goal_phys = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
         ego_start = np.zeros((n_envs, self.ego_dim), dtype=np.float32)
@@ -967,8 +1124,13 @@ class HIROSAC:
             "goal_lane_dense_reward",
             "punctual_reward",
             "wrong_lane_terminal_penalty",
+            "invalid_goal_penalty",
         ]
         high_comp_sums = {k: np.zeros(n_envs, dtype=np.float32) for k in high_comp_keys}
+        high_goal_invalid_selected = np.zeros(n_envs, dtype=bool)
+        high_goal_shielded = np.zeros(n_envs, dtype=bool)
+        high_goal_selected_component = np.full(n_envs, -1, dtype=np.int64)
+        high_goal_shield_penalty = np.zeros(n_envs, dtype=np.float32)
         high_acc_min = np.full(n_envs, np.inf, dtype=np.float32)
         high_acc_max = np.full(n_envs, -np.inf, dtype=np.float32)
         high_acc_sum = np.zeros(n_envs, dtype=np.float32)
@@ -1064,10 +1226,26 @@ class HIROSAC:
 
                 a = np.asarray(a, dtype=np.float32)
                 a_buf = np.asarray(a_buf, dtype=np.float32)
+                a_raw = a.copy()
+                invalid_selected = np.zeros(idx.size, dtype=bool)
+                shielded = np.zeros(idx.size, dtype=bool)
+                selected_component = np.full(idx.size, -1, dtype=np.int64)
+                if (
+                    bool(getattr(self.cfg, "use_high_goal_safety_layer", False))
+                    and self._high_goal_infeasible_mode() == "shield_penalty"
+                ):
+                    a, invalid_selected, shielded, selected_component = self._shield_infeasible_high_goal_actions(
+                        high_obs[idx],
+                        a_raw,
+                    )
 
                 high_obs_start[idx] = high_obs[idx]
+                goal_action_raw[idx] = a_raw
                 goal_action[idx] = a
                 goal_buffer_action[idx] = a_buf
+                high_goal_invalid_selected[idx] = invalid_selected
+                high_goal_shielded[idx] = shielded
+                high_goal_selected_component[idx] = selected_component
 
                 ego_sub = utils.extract_ego_substate(kin[idx], self.ego_feature_idx)
                 ego_start[idx] = ego_sub
@@ -1086,10 +1264,17 @@ class HIROSAC:
                 low_len[idx] = 0
                 high_len[idx] = 0
                 low_safety_clip_count[idx] = 0
+                high_goal_shield_penalty[idx] = 0.0
                 for v in low_comp_sums.values():
                     v[idx] = 0.0
                 for v in high_comp_sums.values():
                     v[idx] = 0.0
+                penalty = float(max(0.0, getattr(self.cfg, "high_goal_infeasible_action_penalty", 0.0)))
+                if penalty > 0.0 and np.any(shielded):
+                    shield_idx = idx[np.flatnonzero(shielded)]
+                    high_goal_shield_penalty[shield_idx] = -penalty
+                    high_ret[shield_idx] -= penalty
+                    high_comp_sums["invalid_goal_penalty"][shield_idx] -= penalty
                 high_acc_min[idx] = np.inf
                 high_acc_max[idx] = -np.inf
                 high_acc_sum[idx] = 0.0
@@ -1426,8 +1611,11 @@ class HIROSAC:
                 goal_err_end = goal_err_all[idx_end].copy()
                 intrinsic_unweighted_end = intrinsic_unweighted[idx_end].copy()
                 goal_dist_start_end = goal_dist_start[idx_end].copy()
+                high_goal_invalid_selected_end = high_goal_invalid_selected[idx_end].copy()
+                high_goal_shielded_end = high_goal_shielded[idx_end].copy()
+                high_goal_shield_penalty_end = high_goal_shield_penalty[idx_end].copy()
 
-                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_safety_clip_ratio": low_safety_clip_ratio_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end, "goal_dist_start": goal_dist_start_end})
+                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_safety_clip_ratio": low_safety_clip_ratio_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end, "goal_dist_start": goal_dist_start_end, "high_goal_invalid_selected": high_goal_invalid_selected_end, "high_goal_shielded": high_goal_shielded_end, "high_goal_shield_penalty": high_goal_shield_penalty_end})
                 callback.on_rollout_end()
 
                 if train_high:
@@ -1450,6 +1638,12 @@ class HIROSAC:
                         info_h["high_env_id"] = int(j)
                         info_h["high_global_step"] = int(self.total_timesteps)
                         info_h["high_segment_id"] = int(seg_id[j])
+                        info_h["high_goal_raw_action"] = np.asarray(goal_action_raw[j], dtype=np.float32).copy()
+                        info_h["high_goal_executed_action"] = np.asarray(goal_action[j], dtype=np.float32).copy()
+                        info_h["high_goal_invalid_selected"] = bool(high_goal_invalid_selected[j])
+                        info_h["high_goal_shielded"] = bool(high_goal_shielded[j])
+                        info_h["high_goal_selected_component"] = int(high_goal_selected_component[j])
+                        info_h["high_goal_shield_penalty"] = float(high_goal_shield_penalty[j])
                         info_h["high_components"] = {
                             k: float(v[j])
                             for k, v in high_comp_sums.items()
@@ -1486,6 +1680,10 @@ class HIROSAC:
                 low_len[idx_end] = 0
                 high_len[idx_end] = 0
                 low_safety_clip_count[idx_end] = 0
+                high_goal_invalid_selected[idx_end] = False
+                high_goal_shielded[idx_end] = False
+                high_goal_selected_component[idx_end] = -1
+                high_goal_shield_penalty[idx_end] = 0.0
                 for v in low_comp_sums.values():
                     v[idx_end] = 0.0
                 for v in high_comp_sums.values():
@@ -1514,6 +1712,10 @@ class HIROSAC:
                 low_len[idx_dummy_done] = 0
                 high_len[idx_dummy_done] = 0
                 low_safety_clip_count[idx_dummy_done] = 0
+                high_goal_invalid_selected[idx_dummy_done] = False
+                high_goal_shielded[idx_dummy_done] = False
+                high_goal_selected_component[idx_dummy_done] = -1
+                high_goal_shield_penalty[idx_dummy_done] = 0.0
                 for v in low_comp_sums.values():
                     v[idx_dummy_done] = 0.0
                 for v in high_comp_sums.values():

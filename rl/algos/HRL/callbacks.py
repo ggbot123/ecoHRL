@@ -40,6 +40,7 @@ class HIROLoggingCallback(BaseCallback):
         high_transition_csv_envs: str = "env0",
         low_transition_detail_csv: bool = False,
         low_transition_detail_envs: str = "env0",
+        low_transition_detail_interval_hi: int = 1,
         # HER relabel debug CSV
         her_debug_csv_interval_steps: int = 0,
         her_debug_csv_max_rows_per_flush: int = 200,
@@ -63,6 +64,9 @@ class HIROLoggingCallback(BaseCallback):
         self.low_transition_detail_envs = str(low_transition_detail_envs).strip().lower()
         if self.low_transition_detail_envs not in {"env0", "all"}:
             raise ValueError("low_transition_detail_envs must be 'env0' or 'all'")
+        self.low_transition_detail_interval_hi = max(1, int(low_transition_detail_interval_hi))
+        self._low_detail_hi_seen = np.zeros(0, dtype=np.int64)
+        self._low_detail_capture_active = np.zeros(0, dtype=bool)
         self._high_transition_capture_active = False
         self._env0_high_episode_idx = 0
         self._env0_hi_comp_seq: dict[str, list[float]] = {}
@@ -93,6 +97,7 @@ class HIROLoggingCallback(BaseCallback):
             "goal_lane_dense_reward",
             "punctual_reward",
             "wrong_lane_terminal_penalty",
+            "invalid_goal_penalty",
         ]
 
         self._traj_csv_enabled = (self.csv_log_freq > 0 or self.high_transition_csv_all > 0) and bool(self.csv_save_dir)
@@ -101,6 +106,7 @@ class HIROLoggingCallback(BaseCallback):
         self._low_transition_detail_csv_enabled = self.low_transition_detail_csv and bool(self.csv_save_dir)
         self._her_debug_csv_enabled = self.her_debug_csv_interval_steps > 0 and bool(self.csv_save_dir)
         self._low_debug_summary_enabled = self.low_debug_summary_interval_steps > 0 and bool(self.csv_save_dir)
+        self._event_sample_csv_enabled = bool(self.csv_save_dir)
 
         self.csv_active = False  # Whether current episode is being logged to CSV (env 0)
         self.csv_low_traj_recorded = False # Only record first interval's low traj per logged episode
@@ -117,6 +123,9 @@ class HIROLoggingCallback(BaseCallback):
         self._last_low_debug_summary_step = 0
         self._last_env_diag_step = 0
         self._high_buffers, self._low_buffers = {}, {}
+        self._high_goal_empty_total = 0
+        self._high_goal_empty_keep = 0
+        self._high_goal_empty_all = 0
 
         # CSV Headers
         self.comp_keys = [
@@ -283,6 +292,87 @@ class HIROLoggingCallback(BaseCallback):
                     "low_seq_acc_min",
                     "low_seq_acc_max",
                 ] + [f"diag_{k}" for k in env_diag_fields],
+            )
+
+        if self._event_sample_csv_enabled:
+            self.queue_takeover_samples_csv_path = os.path.join(self.csv_save_dir, "queue_takeover_samples.csv")
+            self._init_csv(
+                self.queue_takeover_samples_csv_path,
+                [
+                    "global_step",
+                    "env_id",
+                    "segment_id",
+                    "c",
+                    "done_env",
+                    "queue_takeover_active",
+                    "queue_takeover_terminal",
+                    "snapshot_time",
+                    "ego_x",
+                    "ego_y",
+                    "ego_speed",
+                    "ego_lane",
+                    "front_gap",
+                    "front_x",
+                    "front_speed",
+                    "vehicle_count",
+                    "snapshot_json",
+                    "high_obs",
+                    "low_obs",
+                    "goal_action",
+                    "goal_phys",
+                ],
+            )
+
+            self.high_goal_empty_reachable_csv_path = os.path.join(
+                self.csv_save_dir,
+                "high_goal_empty_reachable_samples.csv",
+            )
+            self._init_csv(
+                self.high_goal_empty_reachable_csv_path,
+                [
+                    "global_step",
+                    "env_id",
+                    "segment_id",
+                    "c",
+                    "empty_keep_lane",
+                    "empty_all_lanes",
+                    "ego_lane_idx",
+                    "safe_l2",
+                    "safe_u2",
+                    "safe_dx_l2",
+                    "safe_dx_u2",
+                    "high_obs",
+                    "kin",
+                    "low_obs",
+                    "goal_action",
+                    "goal_phys",
+                    "info_keys",
+                ],
+            )
+
+            self.high_goal_all_empty_reachable_csv_path = os.path.join(
+                self.csv_save_dir,
+                "high_goal_all_empty_reachable_samples.csv",
+            )
+            self._init_csv(
+                self.high_goal_all_empty_reachable_csv_path,
+                [
+                    "global_step",
+                    "env_id",
+                    "segment_id",
+                    "c",
+                    "ego_lane_idx",
+                    "safe_l2",
+                    "safe_u2",
+                    "safe_dx_l2",
+                    "safe_dx_u2",
+                    "high_obs",
+                    "kin",
+                    "low_obs",
+                    "goal_action",
+                    "goal_phys",
+                    "info_keys",
+                ],
             )
 
         if self._low_transition_detail_csv_enabled:
@@ -610,6 +700,7 @@ class HIROLoggingCallback(BaseCallback):
             "wrong_lane_terminal_penalty": float(rc.get("wrong_lane_terminal_penalty", 0.0)),
         }
         comp["comfort_reward_for_high"] = float(rc.get("comfort_reward", 0.0))
+        comp["invalid_goal_penalty"] = float(rc.get("invalid_goal_penalty", 0.0))
         return comp
 
     def _to_physical_acc(self, a1: float) -> float:
@@ -626,6 +717,8 @@ class HIROLoggingCallback(BaseCallback):
         self._env0_high_episode_idx = 0
         self._high_episode_idx = np.zeros(n_envs, dtype=np.int64)
         self._high_transition_capture_active = np.zeros(n_envs, dtype=bool)
+        self._low_detail_hi_seen = np.zeros(n_envs, dtype=np.int64)
+        self._low_detail_capture_active = np.zeros(n_envs, dtype=bool)
         for env_i in self._csv_env_indices(n_envs):
             self._high_transition_capture_active[env_i] = self.high_transition_csv_all > 0
             self._reset_hi_buffers(env_i)
@@ -728,6 +821,49 @@ class HIROLoggingCallback(BaseCallback):
             self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/start_dist_vx", float(goal_dist_start[:, 2].mean()))
             self._record_smooth(self.model.low_logger, self._low_buffers, "goal_err/start_dist_vy", float(goal_dist_start[:, 3].mean()))
 
+        high_goal_invalid_selected = np.asarray(loc.get("high_goal_invalid_selected", []), dtype=np.float32).reshape(-1)
+        high_goal_shielded = np.asarray(loc.get("high_goal_shielded", []), dtype=np.float32).reshape(-1)
+        high_goal_shield_penalty = np.asarray(loc.get("high_goal_shield_penalty", []), dtype=np.float32).reshape(-1)
+        if hasattr(self.model, "high_logger") and high_goal_shielded.size:
+            self._record_smooth(
+                self.model.high_logger,
+                self._high_buffers,
+                "high_goal/shield_rate",
+                float(high_goal_shielded.mean()),
+                window=50,
+            )
+            if high_goal_invalid_selected.size:
+                self._record_smooth(
+                    self.model.high_logger,
+                    self._high_buffers,
+                    "high_goal/invalid_selected_rate",
+                    float(high_goal_invalid_selected.mean()),
+                    window=50,
+                )
+            if high_goal_shield_penalty.size:
+                self._record_smooth(
+                    self.model.high_logger,
+                    self._high_buffers,
+                    "high_goal/shield_penalty",
+                    float(high_goal_shield_penalty.mean()),
+                    window=50,
+                )
+            self.model.high_logger.dump(step=self.model.num_timesteps)
+
+        if hasattr(self.model, "high_logger") and self._high_goal_empty_total > 0:
+            total = float(max(int(self._high_goal_empty_total), 1))
+            keep_count = float(int(self._high_goal_empty_keep))
+            all_count = float(int(self._high_goal_empty_all))
+            self.model.high_logger.record("high_goal/empty_reachable_checked", total)
+            self.model.high_logger.record("high_goal/keep_lane_empty_count", keep_count)
+            self.model.high_logger.record("high_goal/keep_lane_empty_rate", keep_count / total)
+            self.model.high_logger.record("high_goal/all_lanes_empty_count", all_count)
+            self.model.high_logger.record("high_goal/all_lanes_empty_rate", all_count / total)
+            self.model.high_logger.dump(step=self.model.num_timesteps)
+            self._high_goal_empty_total = 0
+            self._high_goal_empty_keep = 0
+            self._high_goal_empty_all = 0
+
         if self._rollout_counter - self._last_dump_low >= self.low_log_interval_hi:
             self.model.low_logger.dump(step=self.model.num_timesteps)
             self._last_dump_low = self._rollout_counter
@@ -798,6 +934,15 @@ class HIROLoggingCallback(BaseCallback):
             for env_i in self._csv_env_indices(min(c.size, replay_mask.size)):
                 if env_i < replay_mask.size and bool(replay_mask[env_i]) and int(c[env_i]) == 0:
                     self._reset_hi_buffers(env_i)
+            if self._low_transition_detail_csv_enabled:
+                for env_i in self._detail_csv_env_indices(min(c.size, replay_mask.size)):
+                    if env_i >= replay_mask.size or not bool(replay_mask[env_i]) or int(c[env_i]) != 0:
+                        continue
+                    if env_i >= self._low_detail_hi_seen.size:
+                        continue
+                    hi_seen = int(self._low_detail_hi_seen[env_i])
+                    self._low_detail_capture_active[env_i] = (hi_seen % self.low_transition_detail_interval_hi) == 0
+                    self._low_detail_hi_seen[env_i] = hi_seen + 1
 
         if self._her_debug_csv_enabled and hasattr(self, "her_debug_csv_path"):
             if (step_now - self._last_her_debug_dump_step) >= self.her_debug_csv_interval_steps:
@@ -894,6 +1039,8 @@ class HIROLoggingCallback(BaseCallback):
         goal_action_arr = np.asarray(loc.get("goal_action", []), dtype=np.float32)
         goal_phys_arr = np.asarray(loc.get("goal_phys", []), dtype=np.float32)
         done_low_arr = np.asarray(loc.get("done_low", np.zeros_like(replay_mask)), dtype=bool).reshape(-1)
+        high_obs_arr_for_events = np.asarray(loc.get("high_obs", []), dtype=np.float32)
+        low_obs_arr_for_events = np.asarray(loc.get("low_obs", []), dtype=np.float32)
 
         write_env_diag = (
             self._diagnostic_csv_enabled
@@ -926,6 +1073,48 @@ class HIROLoggingCallback(BaseCallback):
             self._append_csv(self.env_step_diag_csv_path, row)
             self._last_env_diag_step = step_now
 
+        if self._event_sample_csv_enabled and infos and hasattr(self, "queue_takeover_samples_csv_path"):
+            for env_i, info_i in enumerate(infos):
+                if env_i >= replay_mask.size or not bool(replay_mask[env_i]):
+                    continue
+                if not isinstance(info_i, dict):
+                    continue
+                active_i = bool(info_i.get("queue_takeover_active", False))
+                terminal_i = bool(info_i.get("queue_takeover_terminal", False))
+                if not (active_i or terminal_i):
+                    continue
+                snapshot = info_i.get("queue_takeover_snapshot", {})
+                if not isinstance(snapshot, dict):
+                    snapshot = {}
+                ego = snapshot.get("ego", {}) if isinstance(snapshot.get("ego", {}), dict) else {}
+                front = snapshot.get("front", {}) if isinstance(snapshot.get("front", {}), dict) else {}
+                vehicles = snapshot.get("vehicles", [])
+                row = [
+                    int(getattr(self.model, "num_timesteps", 0)),
+                    int(env_i),
+                    int(seg_id_arr[env_i]) if seg_id_arr.size > env_i else -1,
+                    int(c[env_i]) if c.size > env_i else -1,
+                    int(dones[env_i]) if dones.size > env_i else 0,
+                    int(active_i),
+                    int(terminal_i),
+                    float(snapshot.get("time", np.nan)),
+                    float(ego.get("x", np.nan)),
+                    float(ego.get("y", np.nan)),
+                    float(ego.get("speed", np.nan)),
+                    int((ego.get("lane_index") or [None, None, -1])[2]) if isinstance(ego.get("lane_index"), (list, tuple)) and len(ego.get("lane_index")) >= 3 else -1,
+                    float(snapshot.get("front_gap", np.nan)),
+                    float(snapshot.get("front_x", front.get("x", np.nan))),
+                    float(snapshot.get("front_speed", front.get("speed", np.nan))),
+                    int(len(vehicles)) if isinstance(vehicles, list) else 0,
+                    self._json_obj(snapshot),
+                    self._json_arr(high_obs_arr_for_events[env_i]) if high_obs_arr_for_events.ndim == 2 and high_obs_arr_for_events.shape[0] > env_i else "[]",
+                    self._json_arr(low_obs_arr_for_events[env_i]) if low_obs_arr_for_events.ndim == 2 and low_obs_arr_for_events.shape[0] > env_i else "[]",
+                    self._json_arr(goal_action_arr[env_i]) if goal_action_arr.ndim == 2 and goal_action_arr.shape[0] > env_i else "[]",
+                    self._json_arr(goal_phys_arr[env_i]) if goal_phys_arr.ndim == 2 and goal_phys_arr.shape[0] > env_i else "[]",
+                ]
+                self._append_csv(self.queue_takeover_samples_csv_path, row)
+
+        low_detail_step = int(getattr(self.model, "num_timesteps", 0))
         if self._low_transition_detail_csv_enabled and hasattr(self, "low_transition_detail_csv_path"):
             obs_arr = np.asarray(loc.get("obs", []), dtype=np.float32)
             next_obs_arr = np.asarray(loc.get("next_obs", []), dtype=np.float32)
@@ -948,12 +1137,14 @@ class HIROLoggingCallback(BaseCallback):
             for env_i in self._detail_csv_env_indices(max_rows):
                 if env_i >= replay_mask.size or not bool(replay_mask[env_i]):
                     continue
+                if env_i >= self._low_detail_capture_active.size or not bool(self._low_detail_capture_active[env_i]):
+                    continue
                 info_i = infos[env_i] if infos and len(infos) > env_i and isinstance(infos[env_i], dict) else {}
                 diag = info_i.get("env_diagnostics", {}) if isinstance(info_i, dict) else {}
                 terminal_obs = info_i.get("terminal_observation", [])
                 rc_i = info_i.get("reward_components", {}) if isinstance(info_i, dict) else {}
                 row_detail = [
-                    int(getattr(self.model, "num_timesteps", 0)),
+                    low_detail_step,
                     int(env_i),
                     int(seg_id_arr[env_i]) if seg_id_arr.size > env_i else -1,
                     int(c[env_i]) if c.size > env_i else -1,
@@ -990,6 +1181,14 @@ class HIROLoggingCallback(BaseCallback):
                 row_detail.extend(self._diag_value(diag, k) for k in getattr(self, "env_diag_fields", []))
                 self._append_csv(self.low_transition_detail_csv_path, row_detail)
 
+            for env_i in self._detail_csv_env_indices(max_rows):
+                if env_i >= self._low_detail_capture_active.size:
+                    continue
+                done_low_i = env_i < done_low_arr.size and bool(done_low_arr[env_i])
+                done_env_i = env_i < dones.size and bool(dones[env_i])
+                if done_low_i or done_env_i:
+                    self._low_detail_capture_active[env_i] = False
+
         # Collect per-step weighted component values and low acceleration in current high interval.
         if (
             self.high_transition_csv_all > 0
@@ -1021,7 +1220,8 @@ class HIROLoggingCallback(BaseCallback):
             c = np.asarray(loc.get("c", []), dtype=np.int32).reshape(-1)
             low_obs = np.asarray(loc.get("low_obs", []), dtype=np.float32)
             if c.size and low_obs.size and low_obs.ndim == 2 and low_obs.shape[0] == c.size:
-                start_idx = np.flatnonzero((c == 0) & replay_mask)
+                start_idx_all = np.flatnonzero((c == 0) & replay_mask)
+                start_idx = start_idx_all.copy()
                 if self.low_obs_csv_env0_only:
                     start_idx = start_idx[start_idx == 0]
 
@@ -1056,6 +1256,82 @@ class HIROLoggingCallback(BaseCallback):
                         safe_bounds = None
                         safe_dx_l2 = None
                         safe_dx_u2 = None
+
+                if (
+                    self._event_sample_csv_enabled
+                    and hasattr(self, "high_goal_empty_reachable_csv_path")
+                    and start_idx_all.size
+                    and hasattr(self.model, "high_goal_safe_bounds")
+                    and high_obs.ndim == 2
+                    and high_obs.shape[0] == c.size
+                ):
+                    try:
+                        bounds_all = self.model.high_goal_safe_bounds.compute_np(high_obs[start_idx_all])
+                        l2_all = np.asarray(bounds_all.get("l2", []), dtype=np.float32)
+                        u2_all = np.asarray(bounds_all.get("u2", []), dtype=np.float32)
+                        if l2_all.ndim == 2 and u2_all.ndim == 2 and l2_all.shape == u2_all.shape and l2_all.shape[1] >= 3:
+                            dx_low = float(getattr(self.model.high_goal_safe_bounds, "dx_low", 0.0))
+                            dx_high = float(getattr(self.model.high_goal_safe_bounds, "dx_high", 1.0))
+                            dx_l2_all = self._safe_norm_to_dx(l2_all, dx_low, dx_high)
+                            dx_u2_all = self._safe_norm_to_dx(u2_all, dx_low, dx_high)
+                            empty_mask_all = l2_all > u2_all
+                            dx_l2_all = np.where(empty_mask_all, np.nan, dx_l2_all)
+                            dx_u2_all = np.where(empty_mask_all, np.nan, dx_u2_all)
+                            valid_all = u2_all > l2_all
+                            keep_empty = ~valid_all[:, 1]
+                            all_empty = ~np.any(valid_all, axis=1)
+                            self._high_goal_empty_total += int(start_idx_all.size)
+                            self._high_goal_empty_keep += int(np.count_nonzero(keep_empty))
+                            self._high_goal_empty_all += int(np.count_nonzero(all_empty))
+                            ego_lane_idx_all = np.asarray(
+                                bounds_all.get("ego_lane_idx", np.full(start_idx_all.size, -1)),
+                                dtype=np.int64,
+                            ).reshape(-1)
+                            for pos, env_i in enumerate(start_idx_all.tolist()):
+                                if pos >= keep_empty.size or not bool(keep_empty[pos] or all_empty[pos]):
+                                    continue
+                                info_i = infos[env_i] if infos and len(infos) > env_i and isinstance(infos[env_i], dict) else {}
+                                row_empty = [
+                                    int(getattr(self.model, "num_timesteps", 0)),
+                                    int(env_i),
+                                    int(seg_id[int(env_i)]) if seg_id.size > int(env_i) else -1,
+                                    int(c[int(env_i)]) if c.size > int(env_i) else -1,
+                                    int(bool(keep_empty[pos])),
+                                    int(bool(all_empty[pos])),
+                                    int(ego_lane_idx_all[pos]) if ego_lane_idx_all.size > pos else -1,
+                                    self._json_arr(l2_all[pos]),
+                                    self._json_arr(u2_all[pos]),
+                                    self._json_arr(dx_l2_all[pos]),
+                                    self._json_arr(dx_u2_all[pos]),
+                                    self._json_arr(high_obs[int(env_i)]) if high_obs.ndim == 2 and high_obs.shape[0] > int(env_i) else "[]",
+                                    self._json_arr(kin[int(env_i)]) if kin.ndim == 3 and kin.shape[0] > int(env_i) else "[]",
+                                    self._json_arr(low_obs[int(env_i)]) if low_obs.ndim == 2 and low_obs.shape[0] > int(env_i) else "[]",
+                                    self._json_arr(goal_action[int(env_i)]) if goal_action.ndim == 2 and goal_action.shape[0] > int(env_i) else "[]",
+                                    self._json_arr(goal_phys[int(env_i)]) if goal_phys.ndim == 2 and goal_phys.shape[0] > int(env_i) else "[]",
+                                    self._json_obj(sorted(list(info_i.keys()))) if isinstance(info_i, dict) else "[]",
+                                ]
+                                self._append_csv(self.high_goal_empty_reachable_csv_path, row_empty)
+                                if bool(all_empty[pos]) and hasattr(self, "high_goal_all_empty_reachable_csv_path"):
+                                    row_all_empty = [
+                                        int(getattr(self.model, "num_timesteps", 0)),
+                                        int(env_i),
+                                        int(seg_id[int(env_i)]) if seg_id.size > int(env_i) else -1,
+                                        int(c[int(env_i)]) if c.size > int(env_i) else -1,
+                                        int(ego_lane_idx_all[pos]) if ego_lane_idx_all.size > pos else -1,
+                                        self._json_arr(l2_all[pos]),
+                                        self._json_arr(u2_all[pos]),
+                                        self._json_arr(dx_l2_all[pos]),
+                                        self._json_arr(dx_u2_all[pos]),
+                                        self._json_arr(high_obs[int(env_i)]) if high_obs.ndim == 2 and high_obs.shape[0] > int(env_i) else "[]",
+                                        self._json_arr(kin[int(env_i)]) if kin.ndim == 3 and kin.shape[0] > int(env_i) else "[]",
+                                        self._json_arr(low_obs[int(env_i)]) if low_obs.ndim == 2 and low_obs.shape[0] > int(env_i) else "[]",
+                                        self._json_arr(goal_action[int(env_i)]) if goal_action.ndim == 2 and goal_action.shape[0] > int(env_i) else "[]",
+                                        self._json_arr(goal_phys[int(env_i)]) if goal_phys.ndim == 2 and goal_phys.shape[0] > int(env_i) else "[]",
+                                        self._json_obj(sorted(list(info_i.keys()))) if isinstance(info_i, dict) else "[]",
+                                    ]
+                                    self._append_csv(self.high_goal_all_empty_reachable_csv_path, row_all_empty)
+                    except Exception:
+                        pass
 
                 start_pos = {int(env_i): pos for pos, env_i in enumerate(start_idx.tolist())}
 

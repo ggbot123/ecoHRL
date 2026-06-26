@@ -25,6 +25,13 @@ class HighGoalSafeBoundsCalculator:
         max_decel: float = 5.0,
         front_dmin: float = 0.0,
         lane_change_rear_dmin: float = 0.0,
+        use_idm_dynamic_margins: bool = False,
+        front_standstill_dmin: float | None = None,
+        rear_standstill_dmin: float | None = None,
+        idm_time_headway: float = 0.5,
+        idm_accel: float = 3.0,
+        idm_decel: float = 5.0,
+        rear_imposed_decel: float = 4.0,
         min_goal_x_span: float = 0.0,
         dx_low: float = 0.0,
         dx_high: float = 37.5,
@@ -47,6 +54,17 @@ class HighGoalSafeBoundsCalculator:
         self.max_decel = float(max_decel)
         self.front_dmin = float(max(0.0, front_dmin))
         self.lane_change_rear_dmin = float(max(0.0, lane_change_rear_dmin))
+        self.use_idm_dynamic_margins = bool(use_idm_dynamic_margins)
+        self.front_standstill_dmin = float(
+            self.front_dmin if front_standstill_dmin is None else max(0.0, front_standstill_dmin)
+        )
+        self.rear_standstill_dmin = float(
+            self.lane_change_rear_dmin if rear_standstill_dmin is None else max(0.0, rear_standstill_dmin)
+        )
+        self.idm_time_headway = float(max(0.0, idm_time_headway))
+        self.idm_accel = float(max(1e-6, idm_accel))
+        self.idm_decel = float(max(1e-6, idm_decel))
+        self.rear_imposed_decel = float(max(0.0, rear_imposed_decel))
         self.min_goal_x_span = float(max(0.0, min_goal_x_span))
         self.dx_low = float(dx_low)
         self.dx_high = float(dx_high)
@@ -137,6 +155,94 @@ class HighGoalSafeBoundsCalculator:
             rear_dx = np.where(upd_rear, np.maximum(rear_dx, rel), rear_dx)
 
         return rear_dx.astype(np.float32), front_dx.astype(np.float32)
+
+    def lane_future_front_rear_state(
+        self,
+        high_obs_np: np.ndarray,
+        lane_id: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return nearest future rear/front positions and absolute vx."""
+        high_obs_np = np.asarray(high_obs_np, dtype=np.float32)
+        batch = int(high_obs_np.shape[0])
+        kin = self._extract_kinematics(high_obs_np)
+        horizon_t = float(self.high_interval) * float(self.dt)
+
+        ego_y = kin[:, 0, self.y_idx]
+        ego_vx = kin[:, 0, self.vx_idx]
+        ego_vy = kin[:, 0, self.vy_idx] if self.vy_idx < kin.shape[2] else np.zeros((batch,), dtype=np.float32)
+        ego_lane_idx = np.argmin(np.abs(ego_y[:, None] - self.lane_center_ys[None, :]), axis=1)
+
+        rear_dx = np.full((batch,), -1e9, dtype=np.float32)
+        front_dx = np.full((batch,), 1e9, dtype=np.float32)
+        rear_vx = np.zeros((batch,), dtype=np.float32)
+        front_vx = np.zeros((batch,), dtype=np.float32)
+
+        n_veh = int(kin.shape[1])
+        for j in range(1, n_veh):
+            present = kin[:, j, self.presence_idx] > 0.5
+            veh_x_rel = kin[:, j, self.x_idx]
+            veh_y_rel = kin[:, j, self.y_idx]
+            veh_vx_rel = kin[:, j, self.vx_idx]
+            veh_vy_rel = kin[:, j, self.vy_idx] if self.vy_idx < kin.shape[2] else np.zeros((batch,), dtype=np.float32)
+            veh_vx_abs = veh_vx_rel + ego_vx
+            veh_vy_abs = veh_vy_rel + ego_vy
+            veh_y_abs = veh_y_rel + ego_y
+
+            lane_idx_now = np.argmin(np.abs(veh_y_abs[:, None] - self.lane_center_ys[None, :]), axis=1)
+            lane_delta = np.where(
+                veh_vy_abs > self.lane_assign_vy_eps,
+                1,
+                np.where(veh_vy_abs < -self.lane_assign_vy_eps, -1, 0),
+            )
+            lane_idx = np.clip(lane_idx_now + lane_delta, 0, self.n_lanes - 1)
+            valid = present & (lane_idx == int(np.clip(lane_id, 0, self.n_lanes - 1)))
+            if not np.any(valid):
+                continue
+
+            rel_h = veh_x_rel + veh_vx_rel * horizon_t
+            is_front_future = rel_h >= 0.0
+            is_front_now = veh_x_rel >= 0.0
+            is_ego_lane = lane_idx == ego_lane_idx
+            is_front = np.where(is_ego_lane, is_front_now, is_front_future)
+            rel = veh_x_rel + veh_vx_abs * horizon_t
+
+            upd_front = valid & is_front & (rel < front_dx)
+            upd_rear = valid & (~is_front) & (rel > rear_dx)
+            front_dx = np.where(upd_front, rel, front_dx)
+            rear_dx = np.where(upd_rear, rel, rear_dx)
+            front_vx = np.where(upd_front, veh_vx_abs, front_vx)
+            rear_vx = np.where(upd_rear, veh_vx_abs, rear_vx)
+
+        return (
+            rear_dx.astype(np.float32),
+            front_dx.astype(np.float32),
+            rear_vx.astype(np.float32),
+            front_vx.astype(np.float32),
+        )
+
+    def _idm_front_margin(self, ego_vx: np.ndarray, front_vx: np.ndarray) -> np.ndarray:
+        if not self.use_idm_dynamic_margins:
+            return np.full_like(np.asarray(ego_vx, dtype=np.float32), self.front_dmin, dtype=np.float32)
+        ego_vx = np.maximum(np.asarray(ego_vx, dtype=np.float32), 0.0)
+        front_vx = np.maximum(np.asarray(front_vx, dtype=np.float32), 0.0)
+        closing = np.maximum(ego_vx - front_vx, 0.0)
+        denom = 2.0 * np.sqrt(max(self.idm_accel * self.idm_decel, 1e-6))
+        margin = self.front_standstill_dmin + ego_vx * self.idm_time_headway + ego_vx * closing / denom
+        return np.maximum(margin, self.front_standstill_dmin).astype(np.float32)
+
+    def _idm_rear_margin(self, rear_vx: np.ndarray, ego_vx: np.ndarray) -> np.ndarray:
+        if not self.use_idm_dynamic_margins:
+            return np.full_like(np.asarray(rear_vx, dtype=np.float32), self.lane_change_rear_dmin, dtype=np.float32)
+        rear_vx = np.maximum(np.asarray(rear_vx, dtype=np.float32), 0.0)
+        ego_vx = np.maximum(np.asarray(ego_vx, dtype=np.float32), 0.0)
+        closing = np.maximum(rear_vx - ego_vx, 0.0)
+        denom = 2.0 * np.sqrt(max(self.idm_accel * self.idm_decel, 1e-6))
+        desired = self.rear_standstill_dmin + rear_vx * self.idm_time_headway + rear_vx * closing / denom
+        # MOBIL allows a finite imposed braking on the new follower, so rear
+        # cut-in distance can be milder than the full IDM desired gap.
+        relax = np.sqrt(1.0 + self.rear_imposed_decel / max(self.idm_accel, 1e-6))
+        margin = desired / max(float(relax), 1e-6)
+        return np.maximum(margin, self.rear_standstill_dmin).astype(np.float32)
 
     def _extract_kinematics(self, high_obs_np: np.ndarray) -> np.ndarray:
         if self.n_veh is not None:
@@ -300,10 +406,14 @@ class HighGoalSafeBoundsCalculator:
         # per-sample to relative components [left, keep, right].
         abs_rear = np.zeros((n, self.n_lanes), dtype=np.float32)
         abs_front = np.zeros((n, self.n_lanes), dtype=np.float32)
+        abs_rear_vx = np.zeros((n, self.n_lanes), dtype=np.float32)
+        abs_front_vx = np.zeros((n, self.n_lanes), dtype=np.float32)
         for lane_id in range(self.n_lanes):
-            rear_dx, front_dx = self.lane_future_front_rear(high_obs_np, lane_id)
+            rear_dx, front_dx, rear_vx, front_vx = self.lane_future_front_rear_state(high_obs_np, lane_id)
             abs_rear[:, lane_id] = rear_dx
             abs_front[:, lane_id] = front_dx
+            abs_rear_vx[:, lane_id] = rear_vx
+            abs_front_vx[:, lane_id] = front_vx
 
         rel_offsets = np.asarray([-1, 0, 1], dtype=np.int32)
         for comp_idx, rel_off in enumerate(rel_offsets):
@@ -314,15 +424,19 @@ class HighGoalSafeBoundsCalculator:
             lane_clamped = np.clip(target_lane, 0, self.n_lanes - 1)
             front_dx = np.where(valid_lane, abs_front[np.arange(n), lane_clamped], 1e9)
             rear_dx = np.where(valid_lane, abs_rear[np.arange(n), lane_clamped], -1e9)
+            front_vx = np.where(valid_lane, abs_front_vx[np.arange(n), lane_clamped], ego_vx)
+            rear_vx = np.where(valid_lane, abs_rear_vx[np.arange(n), lane_clamped], ego_vx)
+            front_margin = self._idm_front_margin(ego_vx, front_vx)
+            rear_margin = self._idm_rear_margin(rear_vx, ego_vx)
 
             # Front safety margin applies to all components.
-            hi = np.minimum(front_dx - self.front_dmin, s_max)
+            hi = np.minimum(front_dx - front_margin, s_max)
 
             # Rear safety margin applies only when changing lane.
             if int(rel_off) == 0:
                 lo = s_min
             else:
-                lo = np.maximum(s_min, rear_dx + self.lane_change_rear_dmin)
+                lo = np.maximum(s_min, rear_dx + rear_margin)
 
             if self.enable_goal_vx_bounds:
                 v_lo_x, v_hi_x = self._vx_bounds_from_distance_interval(ego_vx, lo, hi, horizon_t)

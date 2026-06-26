@@ -677,10 +677,10 @@ def main(
     mpc_plot_alternative_optima: bool = False,
     mpc_max_alternative_optima: int = 3,
     mpc_eval_actions_cont: Optional[Sequence[Sequence[float]]] = None,
-    lane_change_min_front_gap: float = 10.0,
-    lane_change_min_rear_gap: float = 8.0,
-    lane_change_min_front_ttc: float = 3.0,
-    lane_change_min_rear_ttc: float = 2.0,
+    lane_change_min_front_gap: Optional[float] = None,
+    lane_change_min_rear_gap: Optional[float] = None,
+    lane_change_min_front_ttc: Optional[float] = None,
+    lane_change_min_rear_ttc: Optional[float] = None,
     record_q_sa_curve: bool = True,
     q_sa_a0_min: float = -1.0,
     q_sa_a0_max: float = 1.0,
@@ -859,11 +859,16 @@ def main(
         "screen_height": 300,
         "scaling": 3,
         "centering_position": [0.5, 0.5],
-        "lane_change_min_front_gap": float(lane_change_min_front_gap),
-        "lane_change_min_rear_gap": float(lane_change_min_rear_gap),
-        "lane_change_min_front_ttc": float(lane_change_min_front_ttc),
-        "lane_change_min_rear_ttc": float(lane_change_min_rear_ttc),
     }
+    safety_override_values = {
+        "lane_change_min_front_gap": lane_change_min_front_gap,
+        "lane_change_min_rear_gap": lane_change_min_rear_gap,
+        "lane_change_min_front_ttc": lane_change_min_front_ttc,
+        "lane_change_min_rear_ttc": lane_change_min_rear_ttc,
+    }
+    for key, value in safety_override_values.items():
+        if value is not None:
+            test_overrides[key] = float(value)
     if env_overrides:
         deep_update(test_overrides, env_overrides)
 
@@ -898,7 +903,13 @@ def main(
     if run_config_path:
         print(f"[LOW TEST] config_source={run_config_path}")
 
-    if saved_env_config is not None and effective_scenario_name == saved_scenario_name:
+    if saved_env_config is not None:
+        if saved_scenario_name and effective_scenario_name != saved_scenario_name:
+            print(
+                "[LOW TEST][WARN] requested scenario differs from training scenario: "
+                f"requested={effective_scenario_name}, saved={saved_scenario_name}; "
+                "merging saved run_config env settings to keep low-level inputs consistent"
+            )
         env_config = get_env_config_for_scenario(effective_scenario_name)
         deep_update(env_config, saved_env_config)
         env_config.pop("_env_seed", None)
@@ -928,6 +939,16 @@ def main(
         f"warmup_time={env_config.get('warmup_time')}, "
         f"initial_lane_id={env_config.get('initial_lane_id')}, "
         f"goal_lane_id={env_config.get('goal_lane_id')}"
+    )
+    print(
+        "[LOW TEST] action/safety_config "
+        f"acceleration_range={env_config.get('action', {}).get('acceleration_range')}, "
+        f"low_safety_type={getattr(getattr(hiro_cfg, 'low_safety_filter', None), 'type', None)}, "
+        f"use_low_safety_layer={bool(use_low_safety_layer) if use_low_safety_layer is not None else bool(getattr(hiro_cfg, 'use_low_safety_layer', False))}, "
+        f"front_gap={env_config.get('lane_change_min_front_gap')}, "
+        f"rear_gap={env_config.get('lane_change_min_rear_gap')}, "
+        f"front_ttc={env_config.get('lane_change_min_front_ttc')}, "
+        f"rear_ttc={env_config.get('lane_change_min_rear_ttc')}"
     )
     n_local = int(env_config.get("observation", {}).get("vehicles_count_local", 1))
     if not neighbors_snapshot and len(neighbors_state) > max(0, n_local - 1):
@@ -1028,6 +1049,103 @@ def main(
                 local_kin_flat_local[idx_y_local] = 0.0
 
         return np.concatenate([t_norm_local, local_kin_flat_local, extra_local, goal_rel_local]).astype(np.float32)
+
+    def _goal_lane_extra_values() -> np.ndarray:
+        agent = getattr(runner, "low_safety_agent", None)
+        if agent is None or not bool(getattr(agent, "append_goal_lane_id", False)):
+            return np.zeros(0, dtype=np.float32)
+        lanes = max(int(env_config.get("lanes_count", 1)), 1)
+        getter = getattr(env.unwrapped, "get_goal_lane_id", None)
+        if callable(getter):
+            lane_id = float(getter())
+        else:
+            lane_id = float(env_config.get("goal_lane_id", 0))
+        encoding = str(getattr(agent, "goal_lane_feature_encoding", "scalar")).lower().strip()
+        if encoding in {"one_hot", "onehot"}:
+            out = np.zeros(lanes, dtype=np.float32)
+            out[int(np.clip(int(round(lane_id)), 0, lanes - 1))] = 1.0
+            return out
+        if bool(getattr(agent, "obs_extra_normalize", False)):
+            denom = float(max(lanes - 1, 1))
+            lane_id = 2.0 * float(lane_id) / denom - 1.0
+            lane_id = float(np.clip(lane_id, -1.0, 1.0))
+        return np.asarray([lane_id], dtype=np.float32)
+
+    def _synthetic_extra_from_rel_neighbors(others_rel: np.ndarray) -> np.ndarray:
+        agent = getattr(runner, "low_safety_agent", None)
+        extra = np.zeros(int(runner.obs_extra_dim), dtype=np.float32)
+        if agent is None or extra.size <= 0:
+            return extra
+
+        cursor = 0
+        if bool(getattr(agent, "append_front_vehicle_features", False)) and cursor + 2 <= extra.size:
+            dist_max = max(float(getattr(agent, "front_distance_range", 150.0)), 1e-6)
+            ttc_max = max(float(getattr(agent, "front_ttc_range", 30.0)), 1e-6)
+            lane_width = float(env_config.get("lane_width", 4.0))
+            same_lane_half_width = 0.5 * max(lane_width, 1e-6)
+            best_gap = dist_max
+            best_ttc = ttc_max
+            for row in np.asarray(others_rel, dtype=np.float32).reshape(-1, 4):
+                dx, dy, dvx, _dvy = [float(v) for v in row]
+                if dx <= 0.0 or abs(dy) > same_lane_half_width:
+                    continue
+                if dx >= best_gap:
+                    continue
+                closing = max(-dvx, 0.0)
+                best_gap = float(np.clip(dx, 0.0, dist_max))
+                best_ttc = ttc_max if closing <= 1e-6 else float(np.clip(dx / closing, 0.0, ttc_max))
+            if bool(getattr(agent, "obs_extra_normalize", False)):
+                best_gap = 2.0 * best_gap / dist_max - 1.0
+                best_ttc = 2.0 * best_ttc / ttc_max - 1.0
+                best_gap = float(np.clip(best_gap, -1.0, 1.0))
+                best_ttc = float(np.clip(best_ttc, -1.0, 1.0))
+            extra[cursor : cursor + 2] = np.asarray([best_gap, best_ttc], dtype=np.float32)
+            cursor += 2
+
+        goal_lane_extra = _goal_lane_extra_values()
+        if goal_lane_extra.size > 0 and cursor < extra.size:
+            n = min(int(goal_lane_extra.size), int(extra.size - cursor))
+            extra[cursor : cursor + n] = goal_lane_extra[:n]
+        return extra
+
+    def _build_synthetic_low_obs_for_safety(
+        step_in_interval: int,
+        ego_abs: np.ndarray,
+        others_rel: np.ndarray,
+        goal_phys: np.ndarray,
+    ) -> np.ndarray:
+        ego = np.asarray(ego_abs, dtype=np.float32).reshape(-1)
+        rel = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
+        kin = np.zeros((int(runner.n_veh_local), int(runner.feat_dim)), dtype=np.float32)
+
+        def _fill_vehicle(row_idx: int, x: float, y: float, vx: float, vy: float, present: bool) -> None:
+            if row_idx < 0 or row_idx >= kin.shape[0]:
+                return
+            if int(runner.idx_presence) >= 0:
+                kin[row_idx, int(runner.idx_presence)] = 1.0 if present else 0.0
+            kin[row_idx, int(runner.idx_x)] = float(x)
+            kin[row_idx, int(runner.idx_y)] = float(y)
+            kin[row_idx, int(runner.idx_vx)] = float(vx)
+            kin[row_idx, int(runner.idx_vy)] = float(vy)
+
+        _fill_vehicle(0, float(ego[0]), float(ego[1]), float(ego[2]), float(ego[3]), True)
+        for j, row in enumerate(rel[: max(0, int(runner.n_veh_local) - 1)], start=1):
+            dx, dy, dvx, dvy = [float(v) for v in row]
+            _fill_vehicle(j, dx, dy, dvx, dvy, True)
+
+        local_kin_flat = kin.reshape(-1).astype(np.float32)
+        if bool(getattr(runner.cfg, "mask_ego_position_in_low_obs", False)):
+            if local_kin_flat.shape[0] >= int(runner.feat_dim):
+                local_kin_flat[int(runner.idx_x)] = 0.0
+                local_kin_flat[int(runner.idx_y)] = 0.0
+
+        t_norm = np.array(
+            [float(np.clip(float(step_in_interval) / max(float(runner.hi), 1.0), 0.0, 1.0))],
+            dtype=np.float32,
+        )
+        extra = _synthetic_extra_from_rel_neighbors(rel)
+        goal_rel = (np.asarray(goal_phys, dtype=np.float32).reshape(-1) - ego[: int(runner.ego_dim)]).astype(np.float32)
+        return np.concatenate([t_norm, local_kin_flat, extra, goal_rel]).astype(np.float32)
 
     def _record_q_sa_for_step(step_idx: int, low_obs_state: np.ndarray, action_ref: np.ndarray, chosen_action: Optional[np.ndarray] = None):
         nonlocal q_sa_a0_mesh_ref, q_sa_a1_mesh_ref
@@ -1190,6 +1308,56 @@ def main(
         comfort_base = -(min(abs(float(acc_phys_val)) / comfort_max_accel, 1.0) ** 2) * float(runner.dt)
         return float(comfort_base * comfort_weight)
 
+    low_gamma = float(getattr(low_model, "gamma", 0.99))
+
+    def _compute_intrinsic_for_transition(
+        obs_now_raw: np.ndarray,
+        obs_next_raw: np.ndarray,
+        *,
+        is_regular_interval_end: bool,
+    ) -> tuple[float, np.ndarray, float]:
+        _, kin_now_local, _ = runner._split(obs_now_raw)
+        _, kin_next_local, _ = runner._split(obs_next_raw)
+        ego_now_rel = runner._ego_sub(kin_now_local) - runner.ego_start
+        ego_next_rel = runner._ego_sub(kin_next_local) - runner.ego_start
+        goal_rel_interval = (goal_phys_arr - runner.ego_start).astype(np.float32)
+        norm_ranges = np.asarray(getattr(runner.cfg, "intrinsic_norm_ranges", None), dtype=np.float32)
+        weights = getattr(runner.cfg, "intrinsic_weights", None)
+        weights_arr = None if weights is None else np.asarray(weights, dtype=np.float32)
+        intrinsic_type = str(getattr(runner.cfg, "intrinsic_type", "l2")).lower().strip()
+
+        if intrinsic_type == "huber_shaping":
+            reward, goal_err, reward_unweighted, _terminal_bonus = hiro_utils.intrinsic_reward_shaping_huber(
+                ego_now_rel.reshape(1, -1),
+                ego_next_rel.reshape(1, -1),
+                goal_rel_interval.reshape(1, -1),
+                norm_ranges,
+                float(getattr(runner.cfg, "intrinsic_coef", 1.0)),
+                weights_arr,
+                gamma=low_gamma,
+                is_terminal=np.asarray([bool(is_regular_interval_end)], dtype=bool),
+            )
+            return (
+                float(np.asarray(reward, dtype=np.float32).reshape(-1)[0]),
+                np.asarray(goal_err, dtype=np.float32).reshape(-1),
+                float(np.asarray(reward_unweighted, dtype=np.float32).reshape(-1)[0]),
+            )
+
+        if bool(is_regular_interval_end):
+            reward, goal_err, reward_unweighted = hiro_utils.intrinsic_reward_l2(
+                ego_next_rel.reshape(1, -1),
+                goal_rel_interval.reshape(1, -1),
+                norm_ranges,
+                float(getattr(runner.cfg, "intrinsic_coef", 1.0)),
+                weights_arr,
+            )
+            return (
+                float(np.asarray(reward, dtype=np.float32).reshape(-1)[0]),
+                np.asarray(goal_err, dtype=np.float32).reshape(-1),
+                float(np.asarray(reward_unweighted, dtype=np.float32).reshape(-1)[0]),
+            )
+        return 0.0, (ego_next_rel - goal_rel_interval).astype(np.float32), 0.0
+
     _, kin_init, _ = runner._split(obs)
     ego_init = runner._ego_sub(kin_init)
     init_speed = float(ego_init[2]) if ego_init.shape[0] > 2 else 0.0
@@ -1230,17 +1398,27 @@ def main(
 
         if getattr(runner, "safety_controller", None) is not None:
             safety_upper_in = np.array([lane_rl, 1.0], dtype=np.float32)
-            safety_upper = np.asarray(
-                runner.safety_controller.safety_filter_action(
-                    ego_abs_now,
-                    others_rel_now,
-                    runner.goal_phys,
-                    safety_upper_in,
-                    runner.dt,
-                    remaining_time=float(runner.hi - runner.c) * float(runner.dt),
-                ),
-                dtype=np.float32,
-            ).reshape(-1)
+            if getattr(runner, "low_safety_agent", None) is not None:
+                safety_upper = np.asarray(
+                    runner.low_safety_agent.apply_safety_layer(
+                        low_obs_now.reshape(1, -1),
+                        runner.goal_phys.reshape(1, -1),
+                        safety_upper_in.reshape(1, -1),
+                    )[0],
+                    dtype=np.float32,
+                ).reshape(-1)
+            else:
+                safety_upper = np.asarray(
+                    runner.safety_controller.safety_filter_action(
+                        ego_abs_now,
+                        others_rel_now,
+                        runner.goal_phys,
+                        safety_upper_in,
+                        runner.dt,
+                        remaining_time=float(runner.hi - runner.c) * float(runner.dt),
+                    ),
+                    dtype=np.float32,
+                ).reshape(-1)
             lane_safety_upper = float(safety_upper[0]) if safety_upper.shape[0] > 0 else 0.0
             acc_norm_safety_upper = float(safety_upper[1]) if safety_upper.shape[0] > 1 else 0.0
         else:
@@ -1278,7 +1456,11 @@ def main(
             reward_sums[k] += float(rc.get(k, 0.0))
 
         last_step = bool(runner.c == runner.hi - 1)
-        intrinsic = runner.intrinsic_if_last(obs_next) if last_step else 0.0
+        intrinsic, intrinsic_goal_err, intrinsic_unweighted = _compute_intrinsic_for_transition(
+            obs,
+            obs_next,
+            is_regular_interval_end=last_step,
+        )
         rl_safety_intrinsic_curve.append(float(intrinsic))
         rl_safety_comfort_curve.append(_comfort_reward_from_acc(acc_phys_rl_safety))
         reward_sums["intrinsic_reward"] += float(intrinsic)
@@ -1297,8 +1479,11 @@ def main(
                 "punctual_reward": float(punctual),
                 "low_ext_reward": float(low_ext),
                 "intrinsic_reward": float(intrinsic),
+                "intrinsic_unweighted": float(intrinsic_unweighted),
                 "low_total_step_reward": float(low_ext + intrinsic),
             }
+            for i, v in enumerate(np.asarray(intrinsic_goal_err, dtype=np.float32).reshape(-1)):
+                row[f"intrinsic_goal_err_{i}"] = float(v)
             for i, v in enumerate(state_now):
                 row[f"state_{i}"] = float(v)
             for i, v in enumerate(action_before_safety):
@@ -1371,17 +1556,33 @@ def main(
 
                 lane_mpc_t = float(mpc_actions[t, 0]) if mpc_actions.shape[1] > 0 else 0.0
                 safety_upper_in_mpc = np.array([lane_mpc_t, 1.0], dtype=np.float32)
-                safety_upper_mpc = np.asarray(
-                    runner.safety_controller.safety_filter_action(
+                if getattr(runner, "low_safety_agent", None) is not None:
+                    low_obs_mpc_t = _build_synthetic_low_obs_for_safety(
+                        t,
                         ego_abs_t,
                         others_rel_t,
                         goal_phys_arr,
-                        safety_upper_in_mpc,
-                        mpc_dt,
-                        remaining_time=max(float(n_mpc - t), 1.0) * mpc_dt,
-                    ),
-                    dtype=np.float32,
-                ).reshape(-1)
+                    )
+                    safety_upper_mpc = np.asarray(
+                        runner.low_safety_agent.apply_safety_layer(
+                            low_obs_mpc_t.reshape(1, -1),
+                            goal_phys_arr.reshape(1, -1),
+                            safety_upper_in_mpc.reshape(1, -1),
+                        )[0],
+                        dtype=np.float32,
+                    ).reshape(-1)
+                else:
+                    safety_upper_mpc = np.asarray(
+                        runner.safety_controller.safety_filter_action(
+                            ego_abs_t,
+                            others_rel_t,
+                            goal_phys_arr,
+                            safety_upper_in_mpc,
+                            mpc_dt,
+                            remaining_time=max(float(n_mpc - t), 1.0) * mpc_dt,
+                        ),
+                        dtype=np.float32,
+                    ).reshape(-1)
 
                 lane_upper_t = float(safety_upper_mpc[0]) if safety_upper_mpc.shape[0] > 0 else 0.0
                 acc_norm_upper_t = float(safety_upper_mpc[1]) if safety_upper_mpc.shape[0] > 1 else 0.0
@@ -1482,15 +1683,25 @@ def main(
     _, kin_final, _ = runner._split(obs)
     ego_final = runner._ego_sub(kin_final)
     goal_err = goal_phys_arr[: ego_final.shape[0]] - ego_final
-    abs_dx = float(abs(goal_err[0])) if goal_err.shape[0] > 0 else 0.0
-    abs_dy = float(abs(goal_err[1])) if goal_err.shape[0] > 1 else 0.0
-    abs_dv = float(abs(goal_err[2])) if goal_err.shape[0] > 2 else 0.0
-    goal_error_l2 = float(np.linalg.norm(goal_err))
+    eval_goal_err = np.asarray(goal_err, dtype=np.float32).copy()
+    fixed_goal_vx = getattr(runner.cfg, "fixed_goal_vx", None)
+    vx_masked = bool(
+        fixed_goal_vx is not None
+        and np.isclose(float(fixed_goal_vx), 0.0)
+        and eval_goal_err.shape[0] > 2
+    )
+    raw_abs_dv = float(abs(goal_err[2])) if goal_err.shape[0] > 2 else 0.0
+    if vx_masked:
+        eval_goal_err[2] = 0.0
+    abs_dx = float(abs(eval_goal_err[0])) if eval_goal_err.shape[0] > 0 else 0.0
+    abs_dy = float(abs(eval_goal_err[1])) if eval_goal_err.shape[0] > 1 else 0.0
+    abs_dv = float(abs(eval_goal_err[2])) if eval_goal_err.shape[0] > 2 else 0.0
+    goal_error_l2 = float(np.linalg.norm(eval_goal_err))
     collision = bool(getattr(env.unwrapped.vehicle, "crashed", False))
     success = bool(
         abs_dx <= 5.0
         and abs_dy <= 1.2
-        and abs_dv <= 2.5
+        and (vx_masked or abs_dv <= 2.5)
         and not collision
         and not any_queue_takeover_terminal
     )
@@ -1499,6 +1710,8 @@ def main(
         "abs_dx": abs_dx,
         "abs_dy": abs_dy,
         "abs_dv": abs_dv,
+        "abs_dv_raw": raw_abs_dv,
+        "goal_vx_masked": int(vx_masked),
         "success": int(success),
         "collision": int(collision),
         "done": int(any_done),
@@ -1548,11 +1761,10 @@ if __name__ == "__main__":
     #    to replay the offline low-eval case set with behavior-model neighbors.
 
     main(
-        # low_model_path="./models/hiro_260620_lowonly_uniform_randomStart_snapshot02_queue_lc05_fixedHER/hiro_low_final.zip",
         # low_model_path="./models/hiro_260622_lowonly_uniform_randomStart_snapshot02_queueNew_lc05_fixedHER/hiro_low_final.zip",
-        # low_model_path="./models/hiro_260619_lowonly_uniform_randomStart_lateGreen_snapshot02_fixedHER/hiro_low_final.zip",
+        low_model_path="./models/hiro_260624_lowonly_uniform_oldEnv_lc05_fixedHER/hiro_low_final.zip",
         # low_model_path="./models/hiro_260321_lowonly_reachableUniform_newSLv2_vio03_HER_reDim_amax3_dmin0/hiro_low_final.zip",
-        low_model_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
         # low_model_path="./models/hiro_260415_lowonly_reUni_fixedHERv2_amax3_dmin15_10/hiro_low_final.zip",
         steps=25,
         # ego_state=[0.0, 4.0, 10.0, 0.0],
@@ -1573,7 +1785,7 @@ if __name__ == "__main__":
         goal_phys=[20, 8, 0, 0],
         # batch_cases_csv="low_test_cases.csv",
         # batch_cases_csv="low_test_cases_debug.csv",
-        batch_cases_json="debug/hiro_low_eval_cases_snapshot012.json",
+        # batch_cases_json="debug/hiro_low_eval_cases_snapshot012.json",
         # batch_max_cases=10,
         hiro_overrides={
             # "goal_sampler": {"type": "reachable_uniform"},
@@ -1626,8 +1838,8 @@ if __name__ == "__main__":
         lane_change_min_rear_gap=10.0,
         lane_change_min_front_ttc=3.0,
         lane_change_min_rear_ttc=2.0,
-        scenario_name="multi_lane_stop_to_int",
-        # scenario_name="multi_lane",
+        # scenario_name="multi_lane_stop_to_int",
+        scenario_name="multi_lane",
         # uniform_trials=1000,
         # uniform_metric_name="abs_dy",
         # uniform_metric_fn=_abs_dy_metric_fn,

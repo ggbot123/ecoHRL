@@ -360,9 +360,19 @@ _HIRO_HIGH_GOAL_SAFETY_CONFIG: Dict[str, Any] = {
     "max_decel": 3.0,
     "front_dmin": 15.0,
     "lane_change_rear_dmin": 10.0,
+    "use_idm_dynamic_margins": False,
+    "front_standstill_dmin": 8.0,
+    "rear_standstill_dmin": 6.0,
+    "idm_time_headway": 0.5,
+    "idm_accel": 3.0,
+    "idm_decel": 5.0,
+    "rear_imposed_decel": 4.0,
     "min_goal_x_span": 0.0,
     "enable_goal_vx_bounds": False,
     "dynamic_feasible_lane_intervals": True,
+    # "infeasible_action_mode": "reroute",
+    "infeasible_action_mode": "shield_penalty",
+    "infeasible_action_penalty": 3.0,
 }
 
 _HIRO_HIGH_REPLAY_BUFFER_KWARGS: Dict[str, Any] = {
@@ -419,36 +429,40 @@ TRAIN_CONFIG: Dict[str, Any] = {
     "n_envs": 8,
     "render": False,
 
-    # "run_name": "sac_260623_withPrior_2to0_noGoalReshape",
     # "run_name": "sac_260624_withPrior_2to0",
     # "run_name": "sac_260624_base_2to0",
     # "run_name": "hiro_260623_highonly_2to0_noGoalReshape",
-    # "run_name": "hiro_260622_highonly_pretrained_2to2",
     # "run_name": "hiro_260620_highonly_lateGreen_2to1_newReset_dyna_buf100k_randStart_slowLane1",
     # "run_name": "hiro_260624_lowonly_uniform_oldEnv_lc05_fixedHER",
-    "run_name": "hiro_260624_lowonly_uniform_newEnv_lc05_fixedHER",
-    # "run_name": "hiro_260624_lowonly_uniform_oldEnv_lc05_legacyHER",
+    # "run_name": "hiro_260624_lowonly_uniform_newEnv_lc05_fixedHER",
+    # "run_name": "hiro_260625_lowonly_reUni_newEnv_fixedHER_SLmix",
+    # "run_name": "hiro_260625_lowonly_reUni_oldEnv_fixedHER_SLmix",
+    # "run_name": "hiro_260625_lowonly_reUni_oldEnv_fixedHER_SLold",
+    # "run_name": "hiro_260625_lowonly_recover0318",
+    "run_name": "hiro_260626_highonly_pretrained0415_oldEnv",
 
-    # "scenario_name": "multi_lane",
-    "scenario_name": "multi_lane_stop_to_int",
+
+    "scenario_name": "multi_lane",
+    # "scenario_name": "multi_lane_stop_to_int",
 
     # Train-time config overrides. Keep sections empty unless you want to override defaults.
     "config_overrides": {
         "environment": {
-            # "rule_based_compute_action_mode": "goal_x_accel",
+            "rule_based_compute_action_mode": "goal_x_accel",
             # "rule_follow_reset_on_high_interval": False,
-            "rule_based_compute_action_mode": "goal_x_accel_follow",
+            # "rule_based_compute_action_mode": "goal_x_accel_follow",
             "observation": {
-                # "append_front_vehicle_features": False,
-                "append_front_vehicle_features": True,
+                "append_front_vehicle_features": False,
+                # "append_front_vehicle_features": True,
                 "goal_lane_feature_encoding": "one_hot",
             },
             # "initial_lane_probs": None,
             # "initial_lane_id": "random",
-            "initial_lane_id": 2,
-            "goal_lane_id": 0,
+            # "initial_lane_id": 2,
+            "initial_lane_id": 1,
+            # "goal_lane_id": 0,
             # "goal_lane_id": 1,
-            # "goal_lane_id": 2,
+            "goal_lane_id": 2,
             # "goal_lane_id": "random",
             "goal_lane_probs": None,
             # "behavior_lane_probs": [
@@ -487,16 +501,15 @@ TRAIN_CONFIG: Dict[str, Any] = {
             "enable_queue_takeover": True,
             "terminate_on_queue_takeover": True,  # low_only queue training: terminal/reset instead of pending replay
             # "enable_queue_takeover": False,
-            # "goal_lane_dense_reward": 0,
-            "goal_lane_dense_reward": 1.0,
-            # "lane_change_reward": -1.0,
-            "lane_change_reward": -0.5,
+            "goal_lane_dense_reward": 0,
+            # "goal_lane_dense_reward": 1.0,
+            "lane_change_reward": -1.0,
+            # "lane_change_reward": -0.5,
             "action": {
-                # "acceleration_range": [-5.0, 5.0],
-                "acceleration_range": [-3.0, 2.0],
+                "acceleration_range": [-5.0, 5.0],
+                # "acceleration_range": [-3.0, 2.0],
             },
             "enable_signal_green_launch_behavior": False,
-            # "enable_signal_green_launch_behavior": True,
         },
         # SAC-only environment overrides, used only when algo="sac".
         "sac_environment": {
@@ -504,12 +517,27 @@ TRAIN_CONFIG: Dict[str, Any] = {
             "speed_ref_aux_reward": 0,
         },
         "hiro": {
-            # "train_mode": "high_only",
+            "train_mode": "high_only",
             # "low_level_type": "rule_based",
-            "train_mode": "low_only",
+            # "train_mode": "low_only",
             "low_level_type": "sac",
             "goal_sampler": {
-                "type": "uniform",
+                "type": "reachable_uniform",
+                # "type": "uniform",
+            },
+            "low_safety_filter": {
+                # "type": "legacy_mpc_max",
+                "type": "mpc_constraints",
+            },
+            "high_goal_safety": {
+                "enabled": True,
+                # "enabled": False,
+                # "dynamic_feasible_lane_intervals": False,
+                "infeasible_action_mode": "reroute",
+                # "infeasible_action_mode": "shield_penalty",
+                # "infeasible_action_penalty": 3.0,
+                "max_accel": 3.0,
+                "max_decel": 3.0,
             },
             "low_use_her": True,
             "low_her_ratio": 0.8,
@@ -525,7 +553,8 @@ TRAIN_CONFIG: Dict[str, Any] = {
 
     # Optional pretrained / implementation switches.
     "hiro_high_pretrained_path": None,
-    "hiro_low_pretrained_path": None,
+    # "hiro_low_pretrained_path": None,
+    "hiro_low_pretrained_path": "models/hiro_260415_lowonly_reUni_fixedHERv2_amax3_dmin15_10/hiro_low_final.zip",
     "hiro_low_target_entropy": "auto",
     "hiro_low_target_entropy_scale": 1,
 
@@ -534,6 +563,7 @@ TRAIN_CONFIG: Dict[str, Any] = {
     "hiro_high_transition_csv_envs": "env0",
     "hiro_high_q_replay_debug": True,
     "hiro_low_transition_detail_csv": True,
+    "hiro_low_transition_detail_interval_hi": 10,
     # "hiro_low_transition_detail_csv": False,
     "hiro_low_her_debug_csv_interval_steps": 5_000,
     "hiro_low_her_debug_sample_prob": 0.001,
@@ -541,7 +571,8 @@ TRAIN_CONFIG: Dict[str, Any] = {
 
     # Low-only offline evaluator. The callback is only attached when
     # HIRO train_mode="low_only"; high-only/joint runs ignore this switch.
-    "hiro_low_offline_eval_enabled": True,
+    # "hiro_low_offline_eval_enabled": True,
+    "hiro_low_offline_eval_enabled": False,
     "hiro_low_offline_eval_cases_path": "debug/hiro_low_eval_cases_snapshot012.json",
     "hiro_low_offline_eval_freq": 200_000,
     "hiro_low_offline_eval_sample_size": 90,

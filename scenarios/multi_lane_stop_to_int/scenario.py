@@ -1239,6 +1239,76 @@ class MultiLaneStopToIntEnv(AbstractEnv):
                 best_gap = gap
         return best_vehicle, best_gap
 
+    def _queue_takeover_vehicle_record(self, vehicle, ego_x: float | None = None) -> dict[str, Any]:
+        pos = np.asarray(getattr(vehicle, "position", [np.nan, np.nan]), dtype=float)
+        vel = np.asarray(getattr(vehicle, "velocity", [np.nan, np.nan]), dtype=float)
+        lane_index = getattr(vehicle, "lane_index", None)
+        target_lane_index = getattr(vehicle, "target_lane_index", None)
+        x = float(pos[0]) if pos.size > 0 else np.nan
+        return {
+            "class": vehicle.__class__.__name__,
+            "vid": int(getattr(vehicle, "vid", -1)),
+            "x": x,
+            "y": float(pos[1]) if pos.size > 1 else np.nan,
+            "rel_x": float(x - ego_x) if ego_x is not None and np.isfinite(x) else np.nan,
+            "vx": float(vel[0]) if vel.size > 0 else float(getattr(vehicle, "speed", np.nan)),
+            "vy": float(vel[1]) if vel.size > 1 else 0.0,
+            "speed": float(getattr(vehicle, "speed", np.nan)),
+            "heading": float(getattr(vehicle, "heading", 0.0)),
+            "lane_index": self._snapshot_lane_index(lane_index),
+            "target_lane_index": self._snapshot_lane_index(target_lane_index),
+            "crashed": bool(getattr(vehicle, "crashed", False)),
+            "hidden": bool(getattr(vehicle, "hidden", False)),
+        }
+
+    def _queue_takeover_snapshot(self) -> dict[str, Any]:
+        ego = getattr(self, "vehicle", None)
+        ego_x = np.nan
+        if ego is not None:
+            ego_pos = np.asarray(getattr(ego, "position", [np.nan, np.nan]), dtype=float)
+            ego_x = float(ego_pos[0]) if ego_pos.size > 0 else np.nan
+
+        front, front_gap = self._nearest_same_lane_front()
+        signal_is_green, signal_remaining = self.get_hiro_signal_features()
+        vehicles = []
+        controlled = tuple(getattr(self, "controlled_vehicles", []) or ())
+        if hasattr(self, "road") and self.road is not None:
+            for vehicle in list(getattr(self.road, "vehicles", []) or []):
+                if ego is not None and vehicle is ego:
+                    continue
+                if any(vehicle is controlled_vehicle for controlled_vehicle in controlled):
+                    continue
+                vehicles.append(self._queue_takeover_vehicle_record(vehicle, ego_x=ego_x))
+
+        front_x = np.nan
+        front_speed = np.nan
+        if front is not None:
+            front_pos = np.asarray(getattr(front, "position", [np.nan, np.nan]), dtype=float)
+            front_x = float(front_pos[0]) if front_pos.size > 0 else np.nan
+            front_speed = float(getattr(front, "speed", np.nan))
+
+        return {
+            "time": float(getattr(self, "time", 0.0)),
+            "steps": int(getattr(self, "steps", 0)),
+            "signal_time_global": float(getattr(self, "_signal_time_global", np.nan)),
+            "signal_is_green": float(signal_is_green),
+            "signal_remaining": float(signal_remaining),
+            "goal_longitudinal": float(self._goal_longitudinal()),
+            "release_x": float(self._goal_longitudinal())
+            + float(self.config.get("queue_takeover_release_x_margin", 3.0)),
+            "enter_count": int(getattr(self, "_queue_takeover_enter_count", 0)),
+            "enter_steps_required": max(int(self.config.get("queue_takeover_enter_steps", 3)), 1),
+            "threshold_front_gap": float(self.config.get("queue_takeover_front_gap", 30.0)),
+            "threshold_front_speed": float(self.config.get("queue_takeover_front_speed", 2.0)),
+            "threshold_release_x_margin": float(self.config.get("queue_takeover_release_x_margin", 3.0)),
+            "ego": self._queue_takeover_vehicle_record(ego, ego_x=ego_x) if ego is not None else {},
+            "front": self._queue_takeover_vehicle_record(front, ego_x=ego_x) if front is not None else {},
+            "front_gap": float(front_gap) if front_gap is not None else np.nan,
+            "front_x": front_x,
+            "front_speed": front_speed,
+            "vehicles": vehicles,
+        }
+
     def _queue_takeover_enter_candidate(self) -> bool:
         if not bool(self.config.get("enable_queue_takeover", False)):
             return False
@@ -1511,6 +1581,8 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             info["next_obs_is_dummy"] = bool(next_obs_is_dummy)
             info["queue_takeover_active"] = bool(queue_takeover_active)
             info["queue_takeover_terminal"] = bool(queue_takeover_terminal)
+            if bool(queue_takeover_active or queue_takeover_terminal):
+                info["queue_takeover_snapshot"] = self._queue_takeover_snapshot()
             info["env_diagnostics"] = self._env_diagnostics()
             if bool(terminated or truncated):
                 info["terminal_signal_features"] = tuple(self.get_hiro_signal_features())
