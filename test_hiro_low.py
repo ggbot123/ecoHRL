@@ -1762,7 +1762,7 @@ if __name__ == "__main__":
 
     main(
         # low_model_path="./models/hiro_260622_lowonly_uniform_randomStart_snapshot02_queueNew_lc05_fixedHER/hiro_low_final.zip",
-        low_model_path="./models/hiro_260624_lowonly_uniform_oldEnv_lc05_fixedHER/hiro_low_final.zip",
+        low_model_path="./models/hiro_260625_recover0318_oldbranch_lane1/hiro_low_final.zip",
         # low_model_path="./models/hiro_260321_lowonly_reachableUniform_newSLv2_vio03_HER_reDim_amax3_dmin0/hiro_low_final.zip",
         # low_model_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
         # low_model_path="./models/hiro_260415_lowonly_reUni_fixedHERv2_amax3_dmin15_10/hiro_low_final.zip",
@@ -1782,14 +1782,14 @@ if __name__ == "__main__":
             [30.0, 0.0, 10.0, 0.0],
             [25.0, 8.0, 15.0, 0.0],
         ],
-        goal_phys=[20, 8, 0, 0],
+        goal_phys=[30, 8, 0, 0],
         # batch_cases_csv="low_test_cases.csv",
         # batch_cases_csv="low_test_cases_debug.csv",
         # batch_cases_json="debug/hiro_low_eval_cases_snapshot012.json",
         # batch_max_cases=10,
         hiro_overrides={
             # "goal_sampler": {"type": "reachable_uniform"},
-            # "goal_sampler": {"type": "uniform"},
+            "goal_sampler": {"type": "uniform"},
         },
         use_low_safety_layer=True,
         out_dir="./models/debug/low_level_rollout",

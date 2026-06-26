@@ -1273,7 +1273,9 @@ class RuleBasedAgentWrapper:
 
             others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
             extra_start = int(1 + self.n_veh_local * self.feat_dim)
-            extra = low_obs[i, extra_start : extra_start + self.obs_extra_dim]
+            available_extra_dim = max(0, int(low_obs.shape[1]) - extra_start - int(self.goal_dim))
+            effective_extra_dim = min(int(self.obs_extra_dim), available_extra_dim)
+            extra = low_obs[i, extra_start : extra_start + effective_extra_dim]
             front_gap, front_ttc = self._front_follow_metrics(others_rel_arr, float(ego_abs[2]), extra)
             others_rel_arr = self._augment_others_with_front_extra(others_rel_arr, float(ego_abs[2]), extra)
             a = self.controller.compute_action(ego_abs, others_rel_arr, goal_phys[i], self.dt, remaining_time=rem_time)
@@ -1315,9 +1317,11 @@ class RuleBasedAgentWrapper:
 
             others_rel_arr = np.asarray(others_rel, dtype=np.float32).reshape(-1, 4)
             extra_start = int(1 + self.n_veh_local * self.feat_dim)
-            extra = low_obs[i, extra_start : extra_start + self.obs_extra_dim]
+            available_extra_dim = max(0, int(low_obs.shape[1]) - extra_start - int(self.goal_dim))
+            effective_extra_dim = min(int(self.obs_extra_dim), available_extra_dim)
+            extra = low_obs[i, extra_start : extra_start + effective_extra_dim]
             others_rel_arr = self._augment_others_with_front_extra(others_rel_arr, float(ego_vel[0]), extra)
-            g0 = int(1 + self.n_veh_local * self.feat_dim + self.obs_extra_dim)
+            g0 = int(1 + self.n_veh_local * self.feat_dim + effective_extra_dim)
             g1 = int(g0 + self.goal_dim)
             goal_rel = low_obs[i, g0:g1]
             ego_abs = (np.asarray(goal_phys[i], dtype=np.float32) - np.asarray(goal_rel, dtype=np.float32)).astype(np.float32)
