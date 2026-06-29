@@ -347,6 +347,10 @@ class HIROConfig:
     low_her_future_mode: str | None = None  # None->compat map, or "episode_timeaware"|"segment_timeaware"|"segment_legacy"
     low_her_episode_timeaware_steps_ahead_range: Optional[tuple[int, int] | List[int]] = None  # e.g. (1, 8)
     low_her_future_timeaware: bool = True  # True: new episode-time HER, False: legacy segment-future HER
+    low_snapshot_training_enabled: bool = False
+    low_snapshot_training_duration_hi: int = 1
+    low_snapshot_ego_x_range: Optional[tuple[float, float] | List[float]] = None
+    low_snapshot_ego_speed_range: Optional[tuple[float, float] | List[float]] = None
     high_pretrained_path: Optional[str] = None
     low_pretrained_path: Optional[str] = None
     mask_ego_position_in_low_obs: bool = False
@@ -487,6 +491,7 @@ class HIROSAC:
         accel_range = action_cfg.get("acceleration_range", [-5.0, 5.0])
         self._acc_min = float(accel_range[0])
         self._acc_max = float(accel_range[1])
+        obs_cfg = dict(env_cfg.get("observation", {}) or {})
         default_max_accel = float(max(abs(float(accel_range[0])), abs(float(accel_range[1]))))
         use_custom_kin = bool(getattr(self.cfg, "high_goal_safe_use_custom_kinematics", False))
         if use_custom_kin:
@@ -526,6 +531,11 @@ class HIROSAC:
             vx_idx=int(self.feature_names.index("vx")),
             vy_idx=int(self.feature_names.index("vy")),
             enable_goal_vx_bounds=bool(enable_goal_vx_bounds),
+            obs_extra_dim=int(self.obs_extra_dim),
+            append_front_vehicle_features=bool(obs_cfg.get("append_front_vehicle_features", False)),
+            obs_extra_normalize=bool(obs_cfg.get("normalize", False)),
+            front_vehicle_distance_range=float(obs_cfg.get("front_vehicle_distance_range", 150.0)),
+            front_vehicle_ttc_range=float(obs_cfg.get("front_vehicle_ttc_range", 30.0)),
         )
 
         low_obs_dim = self.local_kin_flat_dim + self.obs_extra_dim + self.ego_dim + 1

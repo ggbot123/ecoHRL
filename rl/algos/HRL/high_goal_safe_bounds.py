@@ -43,6 +43,11 @@ class HighGoalSafeBoundsCalculator:
         vx_idx: int = 3,
         vy_idx: int = 4,
         enable_goal_vx_bounds: bool = True,
+        obs_extra_dim: int = 0,
+        append_front_vehicle_features: bool = False,
+        obs_extra_normalize: bool = False,
+        front_vehicle_distance_range: float = 150.0,
+        front_vehicle_ttc_range: float = 30.0,
     ):
         self.n_lanes = int(max(1, n_lanes))
         self.lane_width = float(lane_width)
@@ -77,6 +82,11 @@ class HighGoalSafeBoundsCalculator:
         self.vx_idx = int(vx_idx)
         self.vy_idx = int(vy_idx)
         self.enable_goal_vx_bounds = bool(enable_goal_vx_bounds)
+        self.obs_extra_dim = int(max(0, obs_extra_dim))
+        self.append_front_vehicle_features = bool(append_front_vehicle_features)
+        self.obs_extra_normalize = bool(obs_extra_normalize)
+        self.front_vehicle_distance_range = float(max(front_vehicle_distance_range, 1e-6))
+        self.front_vehicle_ttc_range = float(max(front_vehicle_ttc_range, 1e-6))
         # Hardcoded threshold for vy-based target-lane classification.
         self.lane_assign_vy_eps = 0.05
         self.lane_center_ys = (np.arange(self.n_lanes, dtype=np.float32) * self.lane_width).astype(np.float32)
@@ -93,67 +103,7 @@ class HighGoalSafeBoundsCalculator:
         NOTE: In HIRO high_obs used here, ego kinematics are absolute while neighboring
         vehicles are represented in ego-relative coordinates for x/y/vx/vy.
         """
-        high_obs_np = np.asarray(high_obs_np, dtype=np.float32)
-        batch = int(high_obs_np.shape[0])
-        kin = self._extract_kinematics(high_obs_np)
-        horizon_t = float(self.high_interval) * float(self.dt)
-
-        ego_y = kin[:, 0, self.y_idx]
-        ego_vx = kin[:, 0, self.vx_idx]
-        ego_vy = kin[:, 0, self.vy_idx] if self.vy_idx < kin.shape[2] else np.zeros((batch,), dtype=np.float32)
-        ego_lane_idx = np.argmin(np.abs(ego_y[:, None] - self.lane_center_ys[None, :]), axis=1)
-
-        rear_dx = np.full((batch,), -1e9, dtype=np.float32)
-        front_dx = np.full((batch,), 1e9, dtype=np.float32)
-
-        n_veh = int(kin.shape[1])
-        for j in range(1, n_veh):
-            present = kin[:, j, self.presence_idx] > 0.5
-            # Neighbor states are ego-relative in high_obs.
-            veh_x_rel = kin[:, j, self.x_idx]
-            veh_y_rel = kin[:, j, self.y_idx]
-            veh_vx_rel = kin[:, j, self.vx_idx]
-            veh_vy_rel = kin[:, j, self.vy_idx] if self.vy_idx < kin.shape[2] else np.zeros((batch,), dtype=np.float32)
-            veh_vx_abs = veh_vx_rel + ego_vx
-            veh_vy_abs = veh_vy_rel + ego_vy
-
-            # Use absolute y for lane assignment.
-            veh_y_abs = veh_y_rel + ego_y
-
-            # Classify lane by lane-change direction when lateral velocity is significant:
-            # if vy > eps -> target right lane; if vy < -eps -> target left lane.
-            lane_idx_now = np.argmin(np.abs(veh_y_abs[:, None] - self.lane_center_ys[None, :]), axis=1)
-            lane_delta = np.where(
-                veh_vy_abs > self.lane_assign_vy_eps,
-                1,
-                np.where(veh_vy_abs < -self.lane_assign_vy_eps, -1, 0),
-            )
-            lane_idx = np.clip(lane_idx_now + lane_delta, 0, self.n_lanes - 1)
-            in_lane = lane_idx == int(np.clip(lane_id, 0, self.n_lanes - 1))
-            valid = present & in_lane
-            if not np.any(valid):
-                continue
-
-            # Use future relative ordering at t+h (constant longitudinal velocities)
-            # to decide front/rear membership.
-            # rel_h = x_veh(t+h) - x_ego(t+h) = rel_x(t0) + rel_vx * h
-            rel_h = veh_x_rel + veh_vx_rel * horizon_t
-            is_front_future = rel_h >= 0.0
-            # Keep-lane semantics: vehicles that are front/rear at t0 in ego lane
-            # keep that membership during reachable-set front/rear partitioning.
-            is_front_now = veh_x_rel >= 0.0
-            is_ego_lane = lane_idx == ego_lane_idx
-            is_front = np.where(is_ego_lane, is_front_now, is_front_future)
-
-            # Keep bound values in ego-t0 frame (same frame as goal dx):
-            # x_veh(t+h) - x_ego(t0) = rel_x(t0) + v_veh_abs * h
-            rel = veh_x_rel + veh_vx_abs * horizon_t
-
-            upd_front = valid & is_front
-            upd_rear = valid & (~is_front)
-            front_dx = np.where(upd_front, np.minimum(front_dx, rel), front_dx)
-            rear_dx = np.where(upd_rear, np.maximum(rear_dx, rel), rear_dx)
-
+        rear_dx, front_dx, _rear_vx, _front_vx = self.lane_future_front_rear_state(high_obs_np, lane_id)
         return rear_dx.astype(np.float32), front_dx.astype(np.float32)
 
     def lane_future_front_rear_state(
@@ -213,6 +163,17 @@ class HighGoalSafeBoundsCalculator:
             front_vx = np.where(upd_front, veh_vx_abs, front_vx)
             rear_vx = np.where(upd_rear, veh_vx_abs, rear_vx)
 
+        extra_valid, extra_front_dx, extra_front_vx = self._front_extra_future_state(
+            high_obs_np,
+            ego_vx,
+            ego_lane_idx,
+            int(np.clip(lane_id, 0, self.n_lanes - 1)),
+            horizon_t,
+        )
+        upd_extra_front = extra_valid & (extra_front_dx < front_dx)
+        front_dx = np.where(upd_extra_front, extra_front_dx, front_dx)
+        front_vx = np.where(upd_extra_front, extra_front_vx, front_vx)
+
         return (
             rear_dx.astype(np.float32),
             front_dx.astype(np.float32),
@@ -270,9 +231,65 @@ class HighGoalSafeBoundsCalculator:
             if total_dim % self.feat_dim != 0:
                 raise ValueError(
                     f"high_obs kinematics dim {total_dim} is not divisible by feat_dim {self.feat_dim}"
-                )
+            )
         n_veh = total_dim // self.feat_dim
         return kin_flat.reshape(high_obs_np.shape[0], n_veh, self.feat_dim)
+
+    def _extract_extra(self, high_obs_np: np.ndarray) -> np.ndarray:
+        if self.obs_extra_dim <= 0 or self.n_veh is None:
+            return np.zeros((high_obs_np.shape[0], 0), dtype=np.float32)
+        start = 1 + int(self.n_veh) * int(self.feat_dim)
+        available = max(0, int(high_obs_np.shape[1]) - start)
+        width = min(int(self.obs_extra_dim), available)
+        if width <= 0:
+            return np.zeros((high_obs_np.shape[0], 0), dtype=np.float32)
+        return np.asarray(high_obs_np[:, start : start + width], dtype=np.float32)
+
+    def _decode_front_extra_np(self, high_obs_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        n = int(high_obs_np.shape[0])
+        valid = np.zeros((n,), dtype=bool)
+        distance = np.zeros((n,), dtype=np.float32)
+        ttc = np.full((n,), self.front_vehicle_ttc_range, dtype=np.float32)
+        if not self.append_front_vehicle_features:
+            return valid, distance, ttc
+
+        extra = self._extract_extra(high_obs_np)
+        if extra.shape[1] < 2:
+            return valid, distance, ttc
+
+        distance = np.asarray(extra[:, 0], dtype=np.float32)
+        ttc = np.asarray(extra[:, 1], dtype=np.float32)
+        if self.obs_extra_normalize:
+            distance = 0.5 * (distance + 1.0) * self.front_vehicle_distance_range
+            ttc = 0.5 * (ttc + 1.0) * self.front_vehicle_ttc_range
+        distance = np.clip(distance, 0.0, self.front_vehicle_distance_range).astype(np.float32)
+        ttc = np.clip(ttc, 0.0, self.front_vehicle_ttc_range).astype(np.float32)
+        valid = ~(
+            (distance >= self.front_vehicle_distance_range - 1e-6)
+            & (ttc >= self.front_vehicle_ttc_range - 1e-6)
+        )
+        return valid, distance, ttc
+
+    def _front_extra_future_state(
+        self,
+        high_obs_np: np.ndarray,
+        ego_vx: np.ndarray,
+        ego_lane_idx: np.ndarray,
+        lane_id: int,
+        horizon_t: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        valid, distance, ttc = self._decode_front_extra_np(high_obs_np)
+        in_lane = np.asarray(ego_lane_idx, dtype=np.int64) == int(lane_id)
+        valid = valid & in_lane
+        closing = np.where(
+            ttc >= self.front_vehicle_ttc_range - 1e-6,
+            0.0,
+            distance / np.maximum(ttc, 1e-6),
+        ).astype(np.float32)
+        rel_vx = -np.maximum(closing, 0.0)
+        front_vx = (np.asarray(ego_vx, dtype=np.float32) + rel_vx).astype(np.float32)
+        front_dx = (distance + front_vx * float(horizon_t)).astype(np.float32)
+        return valid, front_dx, front_vx
 
     def _disp_const_accel_with_speed_cap(self, v0: np.ndarray, a: float, t: float) -> np.ndarray:
         v0 = np.asarray(v0, dtype=np.float32)

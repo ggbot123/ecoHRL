@@ -52,6 +52,7 @@ def _write_hiro_run_config(
     seed: int,
     high_transition_csv_all: int,
     high_transition_csv_envs: str,
+    high_reachable_diagnostics: bool,
     low_transition_detail_csv: bool,
     low_transition_detail_envs: str,
     low_transition_detail_interval_hi: int,
@@ -79,6 +80,7 @@ def _write_hiro_run_config(
             "n_envs": int(getattr(env, "num_envs", len(env_configs) if isinstance(env_configs, list) else 1)),
             "high_transition_csv_all": int(high_transition_csv_all),
             "high_transition_csv_envs": str(high_transition_csv_envs),
+            "high_reachable_diagnostics": bool(high_reachable_diagnostics),
             "low_transition_detail_csv": bool(low_transition_detail_csv),
             "low_transition_detail_envs": str(low_transition_detail_envs),
             "low_transition_detail_interval_hi": int(low_transition_detail_interval_hi),
@@ -105,6 +107,43 @@ def _write_hiro_run_config(
         print(f"[HIRO Trainer] Saved model-side run config: {model_config_path}")
 
 
+def _configure_low_snapshot_training(env, cfg: Any, train_mode: str) -> bool:
+    if train_mode != "low_only" or not bool(getattr(cfg, "low_snapshot_training_enabled", False)):
+        return False
+
+    env_configs = env.get_attr("config")
+    duration_hi = max(1, int(getattr(cfg, "low_snapshot_training_duration_hi", 1)))
+    high_interval = max(1, int(getattr(cfg, "high_interval", 1)))
+    for i, env_cfg in enumerate(env_configs):
+        if not isinstance(env_cfg, dict):
+            continue
+        cfg_new = dict(env_cfg)
+        if not cfg_new.get("background_snapshot_path") and not cfg_new.get("background_snapshot_paths"):
+            raise ValueError(
+                "low_snapshot_training_enabled=True requires environment "
+                "background_snapshot_path or background_snapshot_paths"
+            )
+        policy_frequency = float(cfg_new.get("policy_frequency", 10.0))
+        cfg_new["background_snapshot_reset"] = True
+        cfg_new["low_snapshot_ego_from_background"] = True
+        ego_x_range = getattr(cfg, "low_snapshot_ego_x_range", None)
+        if ego_x_range is not None:
+            cfg_new["low_snapshot_ego_x_range"] = list(ego_x_range)
+        ego_speed_range = getattr(cfg, "low_snapshot_ego_speed_range", None)
+        if ego_speed_range is not None:
+            cfg_new["low_snapshot_ego_speed_range"] = list(ego_speed_range)
+        cfg_new["duration"] = float(duration_hi * high_interval) / max(policy_frequency, 1e-6)
+        cfg_new["inter_episode_as_steps"] = False
+        cfg_new["warmup_each_episode"] = False
+        env.set_attr("config", cfg_new, indices=i)
+
+    print(
+        "[HIRO Trainer] Enabled low snapshot training: "
+        f"duration={duration_hi} high interval(s), ego_from_background=True"
+    )
+    return True
+
+
 def train_hiro(
     env,
     total_timesteps: int,
@@ -117,6 +156,7 @@ def train_hiro(
     seed: int = 42,
     high_transition_csv_all: int = 1,
     high_transition_csv_envs: str = "env0",
+    high_reachable_diagnostics: bool = False,
     low_transition_detail_csv: bool = False,
     low_transition_detail_envs: str = "env0",
     low_transition_detail_interval_hi: int = 1,
@@ -140,6 +180,7 @@ def train_hiro(
     train_mode = str(getattr(cfg, "train_mode", "joint")).lower()
     if train_mode not in {"joint", "low_only", "high_only"}:
         raise ValueError(f"Unknown train_mode: {train_mode}")
+    low_snapshot_training_enabled = _configure_low_snapshot_training(env, cfg, train_mode)
     env_configs = env.get_attr("config")
     terminate_on_queue_envs = [
         int(i)
@@ -166,6 +207,15 @@ def train_hiro(
         low_level_type=low_level_type,
         goal_sampler=goal_sampler_cfg,
     )
+    if (
+        low_snapshot_training_enabled
+        and bool(getattr(effective_cfg, "low_use_her", False))
+        and str(getattr(effective_cfg, "low_her_strategy", "future")).lower() == "future"
+        and str(getattr(effective_cfg, "low_her_future_mode", "")).lower()
+        not in {"segment_timeaware", "segment_legacy"}
+    ):
+        effective_cfg = replace(effective_cfg, low_her_future_mode="segment_timeaware")
+        print("[HIRO Trainer] low_snapshot_training uses low_her_future_mode='segment_timeaware'")
 
     high_sac_kwargs = dict(high_sac_kwargs)
     if train_mode == "low_only":
@@ -222,6 +272,7 @@ def train_hiro(
         seed=seed,
         high_transition_csv_all=logging_high_transition_csv_all,
         high_transition_csv_envs=high_transition_csv_envs,
+        high_reachable_diagnostics=bool(high_reachable_diagnostics),
         low_transition_detail_csv=bool(low_transition_detail_csv),
         low_transition_detail_envs=low_transition_detail_envs,
         low_transition_detail_interval_hi=max(1, int(low_transition_detail_interval_hi)),
@@ -268,6 +319,7 @@ def train_hiro(
         low_obs_csv_env0_only=True,
         high_transition_csv_all=logging_high_transition_csv_all,
         high_transition_csv_envs=high_transition_csv_envs,
+        high_reachable_diagnostics=bool(high_reachable_diagnostics),
         low_transition_detail_csv=bool(low_transition_detail_csv),
         low_transition_detail_envs=low_transition_detail_envs,
         low_transition_detail_interval_hi=max(1, int(low_transition_detail_interval_hi)),

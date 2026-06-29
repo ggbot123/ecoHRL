@@ -1608,6 +1608,9 @@ class MultiLaneStopToIntEnv(AbstractEnv):
         near_goal_low = sum(1 for x, s in zip(xs, speeds) if goal_x - 40.0 <= x <= goal_x + 10.0 and s < 2.0)
         ego_pos = np.asarray(getattr(self.vehicle, "position", [np.nan, np.nan]), dtype=float)
         lane_index = getattr(self.vehicle, "lane_index", (None, None, -1))
+        front, front_gap = self._nearest_same_lane_front()
+        front_pos = np.asarray(getattr(front, "position", [np.nan, np.nan]), dtype=float) if front is not None else np.asarray([np.nan, np.nan], dtype=float)
+        front_vel = np.asarray(getattr(front, "velocity", [np.nan, np.nan]), dtype=float) if front is not None else np.asarray([np.nan, np.nan], dtype=float)
         signal_is_green, signal_remaining = self.get_hiro_signal_features()
         punctual_window = self.get_punctual_time_window()
         return {
@@ -1638,6 +1641,13 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             "signal_remaining": float(signal_remaining),
             "queue_takeover_active": float(self.get_queue_takeover_active()),
             "inter_episode_active": float(bool(getattr(self, "_inter_episode_active", False))),
+            "same_lane_front_present": float(front is not None and front_gap is not None),
+            "same_lane_front_gap": float(front_gap) if front_gap is not None else np.nan,
+            "same_lane_front_x": float(front_pos[0]) if front is not None and front_pos.size > 0 else np.nan,
+            "same_lane_front_y": float(front_pos[1]) if front is not None and front_pos.size > 1 else np.nan,
+            "same_lane_front_vx": float(front_vel[0]) if front is not None and front_vel.size > 0 else np.nan,
+            "same_lane_front_vy": float(front_vel[1]) if front is not None and front_vel.size > 1 else np.nan,
+            "same_lane_front_speed": float(getattr(front, "speed", np.nan)) if front is not None else np.nan,
         }
 
     def _update_signal_render_items(

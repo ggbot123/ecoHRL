@@ -106,6 +106,7 @@ class HIROPolicyRunner:
             self.high_obs_extra_dim, self.high_obs_include_signal_features = matched_layout
         self.ego_dim = int(len(self.ego_feature_idx))
         cfg = getattr(env.unwrapped, "config", getattr(env, "config", {}))
+        obs_cfg = dict(cfg.get("observation", {}) or {}) if isinstance(cfg, dict) else {}
         self.punctual_time_target = float(cfg.get("punctual_time_target", cfg.get("duration", 0.0)))
         self.goal_longitudinal_default = float(cfg.get("goal_longitudinal", cfg.get("road_length", 0.0)))
         self.queue_takeover_enabled = bool(cfg.get("enable_queue_takeover", False))
@@ -200,6 +201,11 @@ class HIROPolicyRunner:
             vx_idx=int(self.idx_vx),
             vy_idx=int(self.idx_vy),
             enable_goal_vx_bounds=bool(enable_goal_vx_bounds),
+            obs_extra_dim=int(self.high_obs_extra_dim),
+            append_front_vehicle_features=bool(obs_cfg.get("append_front_vehicle_features", False)),
+            obs_extra_normalize=bool(obs_cfg.get("normalize", False)),
+            front_vehicle_distance_range=float(obs_cfg.get("front_vehicle_distance_range", 150.0)),
+            front_vehicle_ttc_range=float(obs_cfg.get("front_vehicle_ttc_range", 30.0)),
         )
 
         # In training we bind high-goal safe bounds explicitly. During standalone

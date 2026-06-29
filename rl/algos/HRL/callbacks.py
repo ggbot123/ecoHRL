@@ -38,6 +38,7 @@ class HIROLoggingCallback(BaseCallback):
         # Record env0 full high-episode every k episodes (k<=0 disables)
         high_transition_csv_all: int = 1,
         high_transition_csv_envs: str = "env0",
+        high_reachable_diagnostics: bool = False,
         low_transition_detail_csv: bool = False,
         low_transition_detail_envs: str = "env0",
         low_transition_detail_interval_hi: int = 1,
@@ -60,6 +61,7 @@ class HIROLoggingCallback(BaseCallback):
         self.high_transition_csv_envs = str(high_transition_csv_envs).strip().lower()
         if self.high_transition_csv_envs not in {"env0", "all"}:
             raise ValueError("high_transition_csv_envs must be 'env0' or 'all'")
+        self.high_reachable_diagnostics = bool(high_reachable_diagnostics)
         self.low_transition_detail_csv = bool(low_transition_detail_csv)
         self.low_transition_detail_envs = str(low_transition_detail_envs).strip().lower()
         if self.low_transition_detail_envs not in {"env0", "all"}:
@@ -107,6 +109,7 @@ class HIROLoggingCallback(BaseCallback):
         self._her_debug_csv_enabled = self.her_debug_csv_interval_steps > 0 and bool(self.csv_save_dir)
         self._low_debug_summary_enabled = self.low_debug_summary_interval_steps > 0 and bool(self.csv_save_dir)
         self._event_sample_csv_enabled = bool(self.csv_save_dir)
+        self._high_reachable_diag_csv_enabled = self.high_reachable_diagnostics and bool(self.csv_save_dir)
 
         self.csv_active = False  # Whether current episode is being logged to CSV (env 0)
         self.csv_low_traj_recorded = False # Only record first interval's low traj per logged episode
@@ -126,6 +129,10 @@ class HIROLoggingCallback(BaseCallback):
         self._high_goal_empty_total = 0
         self._high_goal_empty_keep = 0
         self._high_goal_empty_all = 0
+        self._env_front_checked_total = 0
+        self._env_front_present_total = 0
+        self._env_front_invisible_total = 0
+        self._env_front_diag_missing_total = 0
 
         # CSV Headers
         self.comp_keys = [
@@ -757,6 +764,73 @@ class HIROLoggingCallback(BaseCallback):
         # logger.record_mean(tag, float(sum(buf) / len(buf)))
         logger.record(tag, float(sum(buf) / len(buf)))
 
+    @staticmethod
+    def _visible_same_lane_front_mask(calc: Any, high_obs: np.ndarray) -> np.ndarray:
+        high_obs_np = np.asarray(high_obs, dtype=np.float32)
+        checked = int(high_obs_np.shape[0]) if high_obs_np.ndim == 2 else 0
+        if checked <= 0 or calc is None or not hasattr(calc, "_extract_kinematics"):
+            return np.zeros((checked,), dtype=bool)
+
+        kin = calc._extract_kinematics(high_obs_np)
+        if kin.ndim != 3 or kin.shape[0] != checked or kin.shape[1] <= 1:
+            return np.zeros((checked,), dtype=bool)
+
+        y_idx = int(getattr(calc, "y_idx", 2))
+        x_idx = int(getattr(calc, "x_idx", 1))
+        presence_idx = int(getattr(calc, "presence_idx", 0))
+        lane_centers = np.asarray(getattr(calc, "lane_center_ys", []), dtype=np.float32).reshape(-1)
+        if lane_centers.size == 0:
+            return np.zeros((checked,), dtype=bool)
+
+        ego_y = kin[:, 0, y_idx]
+        ego_lane_idx = np.argmin(np.abs(ego_y[:, None] - lane_centers[None, :]), axis=1)
+        visible_same_lane_front = np.zeros((checked,), dtype=bool)
+        for veh_i in range(1, int(kin.shape[1])):
+            veh = kin[:, veh_i, :]
+            present_i = veh[:, presence_idx] > 0.5
+            front_i = veh[:, x_idx] > 0.0
+            veh_y_abs = veh[:, y_idx] + ego_y
+            veh_lane_idx = np.argmin(np.abs(veh_y_abs[:, None] - lane_centers[None, :]), axis=1)
+            visible_same_lane_front |= present_i & front_i & (veh_lane_idx == ego_lane_idx)
+        return visible_same_lane_front
+
+    @staticmethod
+    def _env_front_invisible_counts(
+        calc: Any,
+        high_obs: np.ndarray,
+        infos: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
+    ) -> tuple[int, int, int]:
+        """Count true same-lane fronts missing from kinematics obs."""
+        if calc is None or high_obs is None:
+            return 0, 0, 0
+        high_obs_np = np.asarray(high_obs, dtype=np.float32)
+        if high_obs_np.ndim != 2 or high_obs_np.shape[0] == 0:
+            return 0, 0, 0
+        visible_same_lane_front = HIROLoggingCallback._visible_same_lane_front_mask(calc, high_obs_np)
+        checked = 0
+        actual_present = np.zeros((int(high_obs_np.shape[0]),), dtype=bool)
+
+        if infos is not None:
+            for i, info in enumerate(infos):
+                if i >= actual_present.size:
+                    break
+                if not isinstance(info, dict):
+                    continue
+                diag = info.get("env_diagnostics", {})
+                if not isinstance(diag, dict) or "same_lane_front_present" not in diag:
+                    continue
+                checked += 1
+                try:
+                    actual_present[i] = bool(float(diag.get("same_lane_front_present", 0.0)) > 0.5)
+                except Exception:
+                    actual_present[i] = bool(diag.get("same_lane_front_present", False))
+
+        if checked <= 0:
+            return 0, 0, 0
+        visible = visible_same_lane_front[: actual_present.size]
+        invisible = actual_present & (~visible)
+        return checked, int(np.count_nonzero(actual_present)), int(np.count_nonzero(invisible))
+
     def _on_rollout_end(self) -> None:
         loc = self.locals
         low_ret = np.asarray(loc.get("low_ret", []), dtype=np.float32).reshape(-1)
@@ -864,6 +938,44 @@ class HIROLoggingCallback(BaseCallback):
             self._high_goal_empty_keep = 0
             self._high_goal_empty_all = 0
 
+        if hasattr(self.model, "high_logger") and self._env_front_checked_total > 0:
+            checked = float(max(int(self._env_front_checked_total), 1))
+            present = float(int(self._env_front_present_total))
+            invisible = float(int(self._env_front_invisible_total))
+            self.model.high_logger.record("high_obs_front/env_front_checked_count", checked)
+            self.model.high_logger.record("high_obs_front/env_front_present_count", present)
+            self.model.high_logger.record("high_obs_front/env_front_invisible_count", invisible)
+            self.model.high_logger.record(
+                "high_obs_front/env_front_diag_missing_count",
+                float(int(self._env_front_diag_missing_total)),
+            )
+            self._record_smooth(
+                self.model.high_logger,
+                self._high_buffers,
+                "high_obs_front/env_front_present_rate",
+                present / checked,
+                window=20,
+            )
+            self._record_smooth(
+                self.model.high_logger,
+                self._high_buffers,
+                "high_obs_front/env_front_invisible_rate",
+                invisible / checked,
+                window=20,
+            )
+            self._record_smooth(
+                self.model.high_logger,
+                self._high_buffers,
+                "high_obs_front/env_front_invisible_given_present_rate",
+                invisible / max(present, 1.0),
+                window=20,
+            )
+            self.model.high_logger.dump(step=self.model.num_timesteps)
+            self._env_front_checked_total = 0
+            self._env_front_present_total = 0
+            self._env_front_invisible_total = 0
+            self._env_front_diag_missing_total = 0
+
         if self._rollout_counter - self._last_dump_low >= self.low_log_interval_hi:
             self.model.low_logger.dump(step=self.model.num_timesteps)
             self._last_dump_low = self._rollout_counter
@@ -943,6 +1055,29 @@ class HIROLoggingCallback(BaseCallback):
                     hi_seen = int(self._low_detail_hi_seen[env_i])
                     self._low_detail_capture_active[env_i] = (hi_seen % self.low_transition_detail_interval_hi) == 0
                     self._low_detail_hi_seen[env_i] = hi_seen + 1
+
+        monitor_idx = np.flatnonzero(replay_mask)
+        if monitor_idx.size and hasattr(self.model, "high_goal_safe_bounds"):
+            high_obs_monitor = np.asarray(loc.get("next_high_obs", []), dtype=np.float32)
+            if high_obs_monitor.ndim != 2:
+                high_obs_monitor = np.asarray(loc.get("high_obs", []), dtype=np.float32)
+            if high_obs_monitor.ndim == 2 and high_obs_monitor.shape[0] >= int(monitor_idx.max()) + 1:
+                infos_monitor = [
+                    infos[int(env_i)] if infos and len(infos) > int(env_i) and isinstance(infos[int(env_i)], dict) else {}
+                    for env_i in monitor_idx.tolist()
+                ]
+                try:
+                    checked, present, invisible = self._env_front_invisible_counts(
+                        self.model.high_goal_safe_bounds,
+                        high_obs_monitor[monitor_idx],
+                        infos_monitor,
+                    )
+                    self._env_front_checked_total += int(checked)
+                    self._env_front_present_total += int(present)
+                    self._env_front_invisible_total += int(invisible)
+                    self._env_front_diag_missing_total += int(max(0, len(infos_monitor) - checked))
+                except Exception:
+                    pass
 
         if self._her_debug_csv_enabled and hasattr(self, "her_debug_csv_path"):
             if (step_now - self._last_her_debug_dump_step) >= self.her_debug_csv_interval_steps:
@@ -1235,7 +1370,8 @@ class HIROLoggingCallback(BaseCallback):
                 safe_dx_l2 = None
                 safe_dx_u2 = None
                 if (
-                    start_idx.size
+                    self._high_reachable_diag_csv_enabled
+                    and start_idx.size
                     and hasattr(self.model, "high_goal_safe_bounds")
                     and high_obs.ndim == 2
                     and high_obs.shape[0] == c.size
@@ -1258,7 +1394,7 @@ class HIROLoggingCallback(BaseCallback):
                         safe_dx_u2 = None
 
                 if (
-                    self._event_sample_csv_enabled
+                    self._high_reachable_diag_csv_enabled
                     and hasattr(self, "high_goal_empty_reachable_csv_path")
                     and start_idx_all.size
                     and hasattr(self.model, "high_goal_safe_bounds")

@@ -1,5 +1,10 @@
 ﻿import numpy as np
 
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any
+import pickle
+
 from custom_env.envs.common.abstract import AbstractEnv
 from custom_env.road.road import Road, RoadNetwork
 from custom_env.envs.common.action import Action
@@ -49,6 +54,21 @@ class MultiLaneEnv(AbstractEnv):
         "render_modes": ["human", "rgb_array"],
         "render_fps": 10,  #  10fps?policy_frequency=10Hz
     }
+    BACKGROUND_SNAPSHOT_VEHICLE_ATTRS = (
+        "target_speed",
+        "TIME_WANTED",
+        "DISTANCE_WANTED",
+        "COMFORT_ACC_MAX",
+        "COMFORT_ACC_MIN",
+        "DELTA",
+        "POLITENESS",
+        "LANE_CHANGE_MIN_ACC_GAIN",
+        "LANE_CHANGE_MAX_BRAKING_IMPOSED",
+        "LANE_CHANGE_DELAY",
+        "imperfection",
+    )
+    BACKGROUND_SNAPSHOT_OFFSET_KEY_SCALE = 1000
+
     def __init__(self, config: dict = None, render_mode: str | None = None):
         super().__init__(config=config, render_mode=render_mode)
         if self.config['PERCEPTION_DISTANCE'] is not None:
@@ -88,6 +108,10 @@ class MultiLaneEnv(AbstractEnv):
         # episode
         self._episode_initial_lane_id = self._sample_initial_lane_id()
         self._episode_goal_lane_id = self._sample_goal_lane_id()
+
+        if bool(self.config.get("background_snapshot_reset", False)):
+            self._reset_from_background_snapshot()
+            return
 
         if self.config["warmup_each_episode"] is True:
             self._create_road()
@@ -195,6 +219,9 @@ class MultiLaneEnv(AbstractEnv):
         )
         ego_pos = np.asarray(getattr(self.vehicle, "position", [np.nan, np.nan]), dtype=float)
         lane_index = getattr(self.vehicle, "lane_index", (None, None, -1))
+        front, front_gap = self._nearest_same_lane_front()
+        front_pos = np.asarray(getattr(front, "position", [np.nan, np.nan]), dtype=float) if front is not None else np.asarray([np.nan, np.nan], dtype=float)
+        front_vel = np.asarray(getattr(front, "velocity", [np.nan, np.nan]), dtype=float) if front is not None else np.asarray([np.nan, np.nan], dtype=float)
         return {
             "time": float(getattr(self, "time", 0.0)),
             "initial_lane": int(self._initial_lane_id()),
@@ -214,7 +241,43 @@ class MultiLaneEnv(AbstractEnv):
             "virtual_stop_count": 0,
             "signal_is_green": -1.0,
             "signal_remaining": -1.0,
+            "same_lane_front_present": float(front is not None and front_gap is not None),
+            "same_lane_front_gap": float(front_gap) if front_gap is not None else np.nan,
+            "same_lane_front_x": float(front_pos[0]) if front is not None and front_pos.size > 0 else np.nan,
+            "same_lane_front_y": float(front_pos[1]) if front is not None and front_pos.size > 1 else np.nan,
+            "same_lane_front_vx": float(front_vel[0]) if front is not None and front_vel.size > 0 else np.nan,
+            "same_lane_front_vy": float(front_vel[1]) if front is not None and front_vel.size > 1 else np.nan,
+            "same_lane_front_speed": float(getattr(front, "speed", np.nan)) if front is not None else np.nan,
         }
+
+    def _nearest_same_lane_front(self):
+        ego = getattr(self, "vehicle", None)
+        if ego is None or not hasattr(self, "road") or self.road is None:
+            return None, None
+        ego_lane = getattr(ego, "lane_index", None)
+        if ego_lane is None or len(ego_lane) < 3:
+            return None, None
+
+        ego_x = float(np.asarray(ego.position, dtype=float)[0])
+        best_vehicle = None
+        best_gap = None
+        for vehicle in self.road.vehicles:
+            if vehicle is ego or any(vehicle is controlled for controlled in self.controlled_vehicles):
+                continue
+            if getattr(vehicle, "crashed", False):
+                continue
+            lane_index = getattr(vehicle, "lane_index", None)
+            if lane_index is None or len(lane_index) < 3:
+                continue
+            if tuple(lane_index[:3]) != tuple(ego_lane[:3]):
+                continue
+            gap = float(np.asarray(vehicle.position, dtype=float)[0]) - ego_x
+            if gap <= 0.0:
+                continue
+            if best_gap is None or gap < best_gap:
+                best_vehicle = vehicle
+                best_gap = gap
+        return best_vehicle, best_gap
 
     def get_hiro_signal_features(self) -> tuple[float, float]:
         """
@@ -564,6 +627,493 @@ class MultiLaneEnv(AbstractEnv):
 
     def get_goal_lane_id(self) -> int:
         return self._goal_lane_id()
+
+    @staticmethod
+    def _snapshot_scalar(value: Any) -> Any:
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    @staticmethod
+    def _snapshot_lane_index(value: Any) -> tuple[str, str, int | None] | None:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) < 3:
+            return None
+        lane_id = None if value[2] is None else int(value[2])
+        return (str(value[0]), str(value[1]), lane_id)
+
+    def _snapshot_route(self, value: Any) -> list[tuple[str, str, int | None]] | None:
+        if value is None:
+            return None
+        route: list[tuple[str, str, int | None]] = []
+        for lane_index in value:
+            parsed = self._snapshot_lane_index(lane_index)
+            if parsed is not None:
+                route.append(parsed)
+        return route
+
+    def _snapshot_config_signature(self) -> dict[str, Any]:
+        keys = [
+            "lanes_count",
+            "road_length",
+            "speed_limit",
+            "flow_speed_range",
+            "speed_distribution",
+            "spawn_probability",
+            "spawn_min_gap",
+            "spawn_min_t_headway",
+            "spawn_check_adjacent_cutins",
+            "spawn_adjacent_cutin_front_gap",
+            "spawn_adjacent_cutin_back_gap",
+            "behavior_vehicle_types",
+            "behavior_lane_probs",
+        ]
+        return {key: self.config.get(key, None) for key in keys}
+
+    def _vehicle_to_background_snapshot(self, vehicle) -> dict[str, Any]:
+        attrs: dict[str, Any] = {}
+        for attr in self.BACKGROUND_SNAPSHOT_VEHICLE_ATTRS:
+            if hasattr(vehicle, attr):
+                attrs[attr] = self._snapshot_scalar(getattr(vehicle, attr))
+        action = dict(getattr(vehicle, "action", {}) or {})
+        action = {
+            str(k): float(v)
+            for k, v in action.items()
+            if isinstance(v, (int, float, np.floating))
+        }
+        cls = vehicle.__class__
+        return {
+            "class_path": f"{cls.__module__}.{cls.__qualname__}",
+            "position": np.asarray(vehicle.position, dtype=float).copy(),
+            "heading": float(getattr(vehicle, "heading", 0.0)),
+            "speed": float(getattr(vehicle, "speed", 0.0)),
+            "lane_index": self._snapshot_lane_index(getattr(vehicle, "lane_index", None)),
+            "target_lane_index": self._snapshot_lane_index(getattr(vehicle, "target_lane_index", None)),
+            "target_speed": float(getattr(vehicle, "target_speed", getattr(vehicle, "speed", 0.0))),
+            "route": self._snapshot_route(getattr(vehicle, "route", None)),
+            "enable_lane_change": bool(getattr(vehicle, "enable_lane_change", True)),
+            "timer": float(getattr(vehicle, "timer", 0.0)),
+            "vid": int(getattr(vehicle, "vid", -1)),
+            "action": action,
+            "crashed": bool(getattr(vehicle, "crashed", False)),
+            "attrs": attrs,
+        }
+
+    def export_background_snapshot(self) -> dict[str, Any]:
+        if not hasattr(self, "road") or self.road is None:
+            raise RuntimeError("Cannot export a background snapshot before the road exists")
+
+        self._clear_background()
+        controlled = tuple(getattr(self, "controlled_vehicles", []) or ())
+        vehicles = [
+            self._vehicle_to_background_snapshot(vehicle)
+            for vehicle in list(getattr(self.road, "vehicles", []) or [])
+            if not any(vehicle is controlled_vehicle for controlled_vehicle in controlled)
+        ]
+        return {
+            "version": 1,
+            "phase_offset": 0.0,
+            "snapshot_time": float(
+                getattr(self, "_background_only_sim_time", getattr(self, "time", 0.0))
+            ),
+            "vid": int(self.config.get("vid", 0)),
+            "background_count": int(len(vehicles)),
+            "config_signature": self._snapshot_config_signature(),
+            "vehicles": vehicles,
+        }
+
+    def _validate_background_snapshot_config_signature(self, saved: Any) -> None:
+        if not isinstance(saved, dict):
+            raise ValueError("Background snapshot pool is missing config_signature")
+        current = self._snapshot_config_signature()
+        # Snapshot reset restores concrete vehicles; traffic-generation knobs
+        # only affect later spawning and should not block loading pools collected
+        # under a different sampler/env variant.
+        ignored_keys: set[str] = {
+            "flow_speed_range",
+            "speed_distribution",
+            "spawn_probability",
+            "spawn_min_gap",
+            "spawn_min_t_headway",
+            "spawn_check_adjacent_cutins",
+            "spawn_adjacent_cutin_front_gap",
+            "spawn_adjacent_cutin_back_gap",
+            "behavior_lane_probs",
+        }
+        mismatches = [
+            key
+            for key, current_value in current.items()
+            if key not in ignored_keys and saved.get(key, None) != current_value
+        ]
+        if mismatches:
+            detail = ", ".join(mismatches[:12])
+            if len(mismatches) > 12:
+                detail += f", ... (+{len(mismatches) - 12} more)"
+            raise ValueError(
+                "Background snapshot pool config does not match current env config: "
+                + detail
+            )
+
+    def _background_snapshot_paths(self) -> list[Path]:
+        path_raw = self.config.get("background_snapshot_paths", None)
+        if path_raw is None:
+            path_raw = self.config.get("background_snapshot_path", None)
+        if not path_raw:
+            raise ValueError(
+                "background_snapshot_reset=True requires background_snapshot_path "
+                "or background_snapshot_paths"
+            )
+        if isinstance(path_raw, (list, tuple)):
+            paths = [Path(p) for p in path_raw if p]
+        else:
+            paths = [Path(path_raw)]
+        if not paths:
+            raise ValueError("background_snapshot_paths must contain at least one path")
+        return paths
+
+    def _load_background_snapshot_chunk(
+        self,
+        path: Path,
+        chunk_info: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        chunk_file = str(chunk_info.get("file", ""))
+        if not chunk_file:
+            raise ValueError(f"Invalid background snapshot chunk metadata in {path}")
+        cache_size = max(1, int(self.config.get("background_snapshot_chunk_cache_size", 16)))
+        cache = getattr(self, "_background_snapshot_chunk_lru_cache", None)
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict()
+            self._background_snapshot_chunk_lru_cache = cache
+        cache_key = (str(path), chunk_file)
+        if cache_key in cache:
+            snapshots_cached = cache.pop(cache_key)
+            cache[cache_key] = snapshots_cached
+            return snapshots_cached
+
+        chunk_path = path / chunk_file
+        with chunk_path.open("rb") as f:
+            chunk = pickle.load(f)
+        if not isinstance(chunk, dict):
+            raise ValueError(f"Invalid background snapshot chunk payload in {chunk_path}")
+        self._validate_background_snapshot_config_signature(chunk.get("config_signature", None))
+        snapshots = chunk.get("snapshots", None)
+        if not isinstance(snapshots, list) or not snapshots:
+            raise ValueError(f"No background snapshots found in chunk {chunk_path}")
+        cache[cache_key] = snapshots
+        while len(cache) > cache_size:
+            cache.popitem(last=False)
+        return snapshots
+
+    def _background_snapshot_selected_offset_key(self) -> str | None:
+        selected_offset_raw = self.config.get("background_snapshot_phase_offset", None)
+        if selected_offset_raw is None:
+            selected_offset_raw = self.config.get("background_snapshot_offset", None)
+        if selected_offset_raw is None:
+            return None
+        return str(
+            int(round(float(selected_offset_raw) * self.BACKGROUND_SNAPSHOT_OFFSET_KEY_SCALE))
+        )
+
+    def _background_snapshot_chunk_index(
+        self,
+        path: Path,
+        meta: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], np.ndarray]:
+        selected_offset_key = self._background_snapshot_selected_offset_key()
+        cached_path = getattr(self, "_background_snapshot_chunk_index_path", None)
+        cached_offset_key = getattr(self, "_background_snapshot_chunk_index_offset_key", None)
+        cached_chunks = getattr(self, "_background_snapshot_chunk_index_chunks", None)
+        cached_cumsum = getattr(self, "_background_snapshot_chunk_index_cumsum", None)
+        if (
+            cached_path == str(path)
+            and cached_offset_key == selected_offset_key
+            and isinstance(cached_chunks, list)
+            and isinstance(cached_cumsum, np.ndarray)
+            and cached_cumsum.size > 0
+        ):
+            return cached_chunks, cached_cumsum
+
+        chunks: list[dict[str, Any]] = []
+        shards = meta.get("shards", {})
+        if isinstance(shards, dict):
+            if selected_offset_key is not None:
+                if selected_offset_key not in shards:
+                    raise ValueError(
+                        "background_snapshot_phase_offset/background_snapshot_offset "
+                        f"requested missing source shard key {selected_offset_key!r}; "
+                        f"available keys include {sorted(shards)[:10]}"
+                    )
+                selected_shards = [shards[selected_offset_key]]
+            else:
+                selected_shards = list(shards.values())
+            for shard in selected_shards:
+                if isinstance(shard, dict) and isinstance(shard.get("chunks", None), list):
+                    chunks.extend([c for c in shard["chunks"] if isinstance(c, dict)])
+        if not chunks and isinstance(meta.get("chunks", None), list):
+            if selected_offset_key is not None:
+                raise ValueError(
+                    "background_snapshot_phase_offset/background_snapshot_offset "
+                    "requires a sharded snapshot pool with offset shards"
+                )
+            chunks = [c for c in meta["chunks"] if isinstance(c, dict)]
+        if not chunks:
+            raise ValueError(f"No background snapshot chunks found in {path}")
+
+        counts = np.asarray([max(int(c.get("count", 0)), 0) for c in chunks], dtype=np.float64)
+        keep = counts > 0.0
+        if not bool(np.any(keep)):
+            raise ValueError(f"Empty background snapshot chunk pool in {path}")
+        chunks = [chunk for chunk, keep_i in zip(chunks, keep) if bool(keep_i)]
+        cumsum = np.cumsum(counts[keep], dtype=np.float64)
+
+        self._background_snapshot_chunk_index_path = str(path)
+        self._background_snapshot_chunk_index_offset_key = selected_offset_key
+        self._background_snapshot_chunk_index_chunks = chunks
+        self._background_snapshot_chunk_index_cumsum = cumsum
+        return chunks, cumsum
+
+    def _sample_background_snapshot_from_dir(self, path: Path) -> dict[str, Any]:
+        cached_path = getattr(self, "_background_snapshot_meta_cache_path", None)
+        meta = getattr(self, "_background_snapshot_meta", None)
+        if cached_path != str(path) or not isinstance(meta, dict):
+            with (path / "meta.pkl").open("rb") as f:
+                meta = pickle.load(f)
+            if not isinstance(meta, dict):
+                raise ValueError(f"Invalid sharded background snapshot pool metadata in {path}")
+            self._validate_background_snapshot_config_signature(meta.get("config_signature", None))
+            self._background_snapshot_meta_cache_path = str(path)
+            self._background_snapshot_meta = meta
+
+        selected_offset_key = self._background_snapshot_selected_offset_key()
+        if bool(self.config.get("background_snapshot_chunk_reuse_enabled", False)):
+            active_path = getattr(self, "_background_snapshot_active_chunk_path", None)
+            active_offset_key = getattr(self, "_background_snapshot_active_chunk_offset_key", None)
+            active_snapshots = getattr(self, "_background_snapshot_active_chunk_snapshots", None)
+            active_remaining = int(getattr(self, "_background_snapshot_active_chunk_remaining", 0))
+            if (
+                active_path == str(path)
+                and active_offset_key == selected_offset_key
+                and isinstance(active_snapshots, list)
+                and active_remaining > 0
+            ):
+                self._background_snapshot_active_chunk_remaining = active_remaining - 1
+                return active_snapshots[int(self.np_random.integers(len(active_snapshots)))]
+
+        chunks, cumsum = self._background_snapshot_chunk_index(path, meta)
+        sample_value = float(self.np_random.random()) * float(cumsum[-1])
+        chunk_idx = int(np.searchsorted(cumsum, sample_value, side="right"))
+        chunk_idx = min(max(chunk_idx, 0), len(chunks) - 1)
+        snapshots = self._load_background_snapshot_chunk(path, chunks[chunk_idx])
+        if bool(self.config.get("background_snapshot_chunk_reuse_enabled", False)):
+            reuse_count = max(1, int(self.config.get("background_snapshot_chunk_reuse_count", 16)))
+            self._background_snapshot_active_chunk_path = str(path)
+            self._background_snapshot_active_chunk_offset_key = selected_offset_key
+            self._background_snapshot_active_chunk_snapshots = snapshots
+            self._background_snapshot_active_chunk_remaining = reuse_count - 1
+        return snapshots[int(self.np_random.integers(len(snapshots)))]
+
+    def _sample_background_snapshot(self) -> dict[str, Any]:
+        paths = self._background_snapshot_paths()
+        path = paths[int(self.np_random.integers(len(paths)))]
+        if path.is_dir():
+            return self._sample_background_snapshot_from_dir(path)
+        with path.open("rb") as f:
+            data = pickle.load(f)
+        if isinstance(data, dict):
+            self._validate_background_snapshot_config_signature(data.get("config_signature", None))
+            snapshots = data.get("snapshots", data.get("pool", None))
+        else:
+            snapshots = data
+        if not isinstance(snapshots, list) or not snapshots:
+            raise ValueError(f"No background snapshots found in {path}")
+        return snapshots[int(self.np_random.integers(len(snapshots)))]
+
+    def _vehicle_from_background_snapshot(self, data: dict[str, Any]):
+        vehicle_cls = utils.class_from_path(str(data["class_path"]))
+        position = np.asarray(data.get("position", [0.0, 0.0]), dtype=float).copy()
+        heading = float(data.get("heading", 0.0))
+        speed = float(data.get("speed", 0.0))
+        lane_index = self._snapshot_lane_index(data.get("lane_index", None))
+        target_lane_index = self._snapshot_lane_index(data.get("target_lane_index", lane_index))
+        route = self._snapshot_route(data.get("route", None))
+        target_speed = float(data.get("target_speed", speed))
+        enable_lane_change = bool(data.get("enable_lane_change", True))
+        timer = float(data.get("timer", 0.0))
+
+        try:
+            vehicle = vehicle_cls(
+                self.road,
+                position,
+                heading,
+                speed,
+                target_lane_index=target_lane_index,
+                target_speed=target_speed,
+                route=route,
+                enable_lane_change=enable_lane_change,
+                timer=timer,
+            )
+        except TypeError:
+            try:
+                vehicle = vehicle_cls(
+                    self.road,
+                    position,
+                    heading,
+                    speed,
+                    target_lane_index=target_lane_index,
+                    target_speed=target_speed,
+                    route=route,
+                )
+            except TypeError:
+                vehicle = vehicle_cls(self.road, position, heading, speed)
+
+        if lane_index is None:
+            lane_index = self.road.network.get_closest_lane_index(position, heading)
+        vehicle.lane_index = lane_index
+        vehicle.lane = self.road.network.get_lane(lane_index)
+        if target_lane_index is not None:
+            vehicle.target_lane_index = target_lane_index
+        if route is not None:
+            vehicle.route = list(route)
+        if hasattr(vehicle, "enable_lane_change"):
+            vehicle.enable_lane_change = enable_lane_change
+        if hasattr(vehicle, "timer"):
+            vehicle.timer = timer
+        vehicle.target_speed = target_speed
+        action = {"steering": 0.0, "acceleration": 0.0}
+        action.update(dict(data.get("action", {}) or {}))
+        vehicle.action = action
+        vehicle.crashed = bool(data.get("crashed", False))
+        vehicle.impact = None
+        if int(data.get("vid", -1)) >= 0:
+            vehicle.vid = int(data["vid"])
+        for attr, value in dict(data.get("attrs", {}) or {}).items():
+            setattr(vehicle, str(attr), self._snapshot_scalar(value))
+        return vehicle
+
+    def _snapshot_ego_candidate_indices(self, vehicles: list[dict[str, Any]]) -> list[int]:
+        x_min, x_max = self.config.get(
+            "low_snapshot_ego_x_range",
+            [0.0, float(self.config["road_length"]) - 50.0],
+        )
+        speed_min, speed_max = self.config.get(
+            "low_snapshot_ego_speed_range",
+            [0.0, float(self.config["speed_limit"])],
+        )
+        candidates: list[int] = []
+        for i, data in enumerate(vehicles):
+            if bool(data.get("crashed", False)):
+                continue
+            lane_index = self._snapshot_lane_index(data.get("lane_index", None))
+            if lane_index is None or lane_index[2] is None:
+                continue
+            if not (0 <= int(lane_index[2]) < int(self.config["lanes_count"])):
+                continue
+            pos = np.asarray(data.get("position", [np.nan, np.nan]), dtype=float)
+            speed = float(data.get("speed", 0.0))
+            if pos.size < 2 or not np.all(np.isfinite(pos[:2])):
+                continue
+            if (
+                float(x_min) <= float(pos[0]) <= float(x_max)
+                and float(speed_min) <= speed <= float(speed_max)
+            ):
+                candidates.append(i)
+        return candidates
+
+    def _make_ego_from_snapshot_vehicle(self, data: dict[str, Any]):
+        position = np.asarray(data.get("position", [0.0, 0.0]), dtype=float).copy()
+        heading = float(data.get("heading", 0.0))
+        speed = float(data.get("speed", 0.0))
+        lane_index = self._snapshot_lane_index(data.get("lane_index", None))
+        if lane_index is None:
+            lane_index = self.road.network.get_closest_lane_index(position, heading)
+        ego = self.action_type.vehicle_class(self.road, position, heading, speed)
+        ego.lane_index = lane_index
+        ego.lane = self.road.network.get_lane(lane_index)
+        ego.target_lane_index = self._snapshot_lane_index(
+            data.get("target_lane_index", lane_index)
+        ) or lane_index
+        ego.target_speed = float(data.get("target_speed", speed))
+        ego.action = dict(data.get("action", {}) or {"steering": 0.0, "acceleration": 0.0})
+        if int(data.get("vid", -1)) >= 0:
+            ego.vid = int(data["vid"])
+        return ego
+
+    def _reset_from_background_snapshot(self) -> bool:
+        use_ego_from_background = bool(self.config.get("low_snapshot_ego_from_background", False))
+        max_attempts = max(
+            1,
+            int(self.config.get("background_snapshot_max_resample_attempts", 64)),
+        )
+        last_error = "no snapshot sampled"
+        snapshot: dict[str, Any] | None = None
+        vehicles_data: list[dict[str, Any]] = []
+        ego_index = None
+        for _ in range(max_attempts):
+            sampled = self._sample_background_snapshot()
+            if not isinstance(sampled, dict):
+                last_error = "background snapshot entries must be dictionaries"
+                continue
+            sampled_vehicles = list(sampled.get("vehicles", []) or [])
+            if use_ego_from_background:
+                candidates = self._snapshot_ego_candidate_indices(sampled_vehicles)
+                if not candidates:
+                    last_error = "no valid ego candidate found in background snapshot"
+                    continue
+                ego_index = int(candidates[int(self.np_random.integers(len(candidates)))])
+            snapshot = sampled
+            vehicles_data = sampled_vehicles
+            break
+
+        if snapshot is None:
+            raise ValueError(
+                "Failed to sample a usable background snapshot after "
+                f"{max_attempts} attempts: {last_error}"
+            )
+
+        snapshot_signature = snapshot.get("config_signature", None)
+        if isinstance(snapshot_signature, dict) and "behavior_lane_probs" in snapshot_signature:
+            self.config["behavior_lane_probs"] = snapshot_signature["behavior_lane_probs"]
+
+        self._create_road()
+        self.road.vehicles = []
+        self.controlled_vehicles = []
+
+        if ego_index is not None:
+            lane_index = self._snapshot_lane_index(vehicles_data[ego_index].get("lane_index", None))
+            if lane_index is not None and lane_index[2] is not None:
+                self._episode_initial_lane_id = int(lane_index[2])
+                self._episode_goal_lane_id = self._sample_goal_lane_id()
+
+        max_vid = int(snapshot.get("vid", self.config.get("vid", 0)))
+        for i, vehicle_data in enumerate(vehicles_data):
+            if ego_index is not None and i == ego_index:
+                continue
+            vehicle = self._vehicle_from_background_snapshot(vehicle_data)
+            self.road.vehicles.append(vehicle)
+            max_vid = max(max_vid, int(getattr(vehicle, "vid", -1)))
+
+        if ego_index is None:
+            self.config["vid"] = max(int(self.config.get("vid", 0)), max_vid)
+            self._create_ego()
+        else:
+            ego = self._make_ego_from_snapshot_vehicle(vehicles_data[ego_index])
+            self.vehicle = ego
+            self.controlled_vehicles = [ego]
+            self.road.vehicles.append(ego)
+            max_vid = max(max_vid, int(getattr(ego, "vid", -1)))
+            self.config["vid"] = max(int(self.config.get("vid", 0)), max_vid)
+            self._last_speed = float(getattr(ego, "speed", 0.0))
+            self._last_longitudinal = float(np.asarray(ego.position, dtype=float)[0])
+            self._last_lane_id = int(getattr(ego, "lane_index", ("0", "1", self._initial_lane_id()))[2])
+            self._has_arrived = False
+            self._arrival_time = None
+
+        self.time = 0.0
+        self.steps = 0
+        self._did_global_warmup = True
+        self._background_only_sim_time = float(snapshot.get("snapshot_time", 0.0))
+        return True
 
     def _create_ego(self):
         cfg = self.config
