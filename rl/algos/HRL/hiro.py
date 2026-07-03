@@ -10,7 +10,7 @@ import numpy as np
 
 from rl.algos.sac.sac import SAC
 from rl.algos.sac.replay_buffer import SkipReplayBuffer
-from rl.algos.sac.safe_goal_policies import SafeGoalMlpPolicy
+from rl.algos.sac.safe_goal_policies import SafeGoalCategoricalBetaMlpPolicy, SafeGoalMlpPolicy
 from rl.utils import utils
 from rl.algos.HRL.rule_based import RuleBasedAgentWrapper
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig
@@ -305,6 +305,7 @@ class LowSafetyFilterConfig:
 @dataclass
 class HighGoalSafetyConfig:
     enabled: bool = False
+    policy_distribution: str = "tanh_gaussian"  # "tanh_gaussian" | "categorical_beta"
     eps: float = 1e-6
     use_custom_kinematics: bool = True
     max_accel: Optional[float] = 2.0
@@ -323,6 +324,19 @@ class HighGoalSafetyConfig:
     dynamic_feasible_lane_intervals: bool = True
     infeasible_action_mode: str = "reroute"  # "reroute" | "shield_penalty"
     infeasible_action_penalty: float = 0.0
+    endpoint_penalty_enabled: bool = False
+    endpoint_penalty_frac_limit: float = 0.85
+    endpoint_penalty_coef: float = 0.0
+    endpoint_penalty_min_span: float = 5.0
+    categorical_beta_gumbel_temperature: float = 1.0
+    categorical_beta_min_concentration: float = 1.1
+    categorical_beta_u_eps: float = 1e-4
+    categorical_beta_include_x_jacobian: bool = False
+    comfort_prior_enabled: bool = False
+    comfort_prior_coef: float = 0.0
+    comfort_prior_accel_deadband: float = 1.5
+    comfort_prior_accel_norm: float = 3.0
+    comfort_prior_horizon_scale: float = 1.0
 
 
 @dataclass
@@ -364,6 +378,10 @@ class HIROConfig:
     @property
     def use_high_goal_safety_layer(self) -> bool:
         return bool(self.high_goal_safety.enabled)
+
+    @property
+    def high_goal_policy_distribution(self) -> str:
+        return str(self.high_goal_safety.policy_distribution)
 
     @property
     def high_goal_safe_eps(self) -> float:
@@ -408,6 +426,58 @@ class HIROConfig:
     @property
     def high_goal_infeasible_action_penalty(self) -> float:
         return float(self.high_goal_safety.infeasible_action_penalty)
+
+    @property
+    def high_goal_endpoint_penalty_enabled(self) -> bool:
+        return bool(self.high_goal_safety.endpoint_penalty_enabled)
+
+    @property
+    def high_goal_endpoint_penalty_frac_limit(self) -> float:
+        return float(self.high_goal_safety.endpoint_penalty_frac_limit)
+
+    @property
+    def high_goal_endpoint_penalty_coef(self) -> float:
+        return float(self.high_goal_safety.endpoint_penalty_coef)
+
+    @property
+    def high_goal_endpoint_penalty_min_span(self) -> float:
+        return float(self.high_goal_safety.endpoint_penalty_min_span)
+
+    @property
+    def high_goal_categorical_beta_gumbel_temperature(self) -> float:
+        return float(self.high_goal_safety.categorical_beta_gumbel_temperature)
+
+    @property
+    def high_goal_categorical_beta_min_concentration(self) -> float:
+        return float(self.high_goal_safety.categorical_beta_min_concentration)
+
+    @property
+    def high_goal_categorical_beta_u_eps(self) -> float:
+        return float(self.high_goal_safety.categorical_beta_u_eps)
+
+    @property
+    def high_goal_categorical_beta_include_x_jacobian(self) -> bool:
+        return bool(self.high_goal_safety.categorical_beta_include_x_jacobian)
+
+    @property
+    def high_goal_comfort_prior_enabled(self) -> bool:
+        return bool(self.high_goal_safety.comfort_prior_enabled)
+
+    @property
+    def high_goal_comfort_prior_coef(self) -> float:
+        return float(self.high_goal_safety.comfort_prior_coef)
+
+    @property
+    def high_goal_comfort_prior_accel_deadband(self) -> float:
+        return float(self.high_goal_safety.comfort_prior_accel_deadband)
+
+    @property
+    def high_goal_comfort_prior_accel_norm(self) -> float:
+        return float(self.high_goal_safety.comfort_prior_accel_norm)
+
+    @property
+    def high_goal_comfort_prior_horizon_scale(self) -> float:
+        return float(self.high_goal_safety.comfort_prior_horizon_scale)
 
 
 class HIROSAC:
@@ -646,7 +716,15 @@ class HIROSAC:
         # ----- High-level buffer config (dynamic OPC metadata only) ----- #
         high_sac_kwargs = dict(high_sac_kwargs)
         if bool(getattr(self.cfg, "use_high_goal_safety_layer", False)):
-            high_sac_kwargs["policy"] = SafeGoalMlpPolicy
+            policy_distribution = str(
+                getattr(self.cfg, "high_goal_policy_distribution", "tanh_gaussian")
+            ).lower().strip()
+            if policy_distribution in {"categorical_beta", "cat_beta", "beta_categorical"}:
+                high_sac_kwargs["policy"] = SafeGoalCategoricalBetaMlpPolicy
+            elif policy_distribution in {"tanh_gaussian", "safe_tanh_gaussian", "gaussian", ""}:
+                high_sac_kwargs["policy"] = SafeGoalMlpPolicy
+            else:
+                raise ValueError(f"Unknown high-goal safe policy_distribution: {policy_distribution!r}")
             high_sac_kwargs["safe_warmup_sampling"] = True
 
             policy_kwargs = dict(high_sac_kwargs.get("policy_kwargs", {}) or {})
@@ -655,6 +733,19 @@ class HIROSAC:
                 getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
             )
             policy_kwargs["infeasible_action_mode"] = self._safe_actor_infeasible_mode()
+            if policy_distribution in {"categorical_beta", "cat_beta", "beta_categorical"}:
+                policy_kwargs["categorical_beta_gumbel_temperature"] = float(
+                    getattr(self.cfg, "high_goal_categorical_beta_gumbel_temperature", 1.0)
+                )
+                policy_kwargs["categorical_beta_min_concentration"] = float(
+                    getattr(self.cfg, "high_goal_categorical_beta_min_concentration", 1.1)
+                )
+                policy_kwargs["categorical_beta_u_eps"] = float(
+                    getattr(self.cfg, "high_goal_categorical_beta_u_eps", 1e-4)
+                )
+                policy_kwargs["categorical_beta_include_x_jacobian"] = bool(
+                    getattr(self.cfg, "high_goal_categorical_beta_include_x_jacobian", False)
+                )
             high_sac_kwargs["policy_kwargs"] = policy_kwargs
 
         rb_kwargs = dict(high_sac_kwargs.get("replay_buffer_kwargs", {}) or {})
@@ -698,6 +789,22 @@ class HIROSAC:
                 getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False)
             )
             high_sac.actor.infeasible_action_mode = self._safe_actor_infeasible_mode()
+            if hasattr(high_sac.actor, "categorical_beta_gumbel_temperature"):
+                high_sac.actor.categorical_beta_gumbel_temperature = float(
+                    getattr(self.cfg, "high_goal_categorical_beta_gumbel_temperature", 1.0)
+                )
+            if hasattr(high_sac.actor, "categorical_beta_min_concentration"):
+                high_sac.actor.categorical_beta_min_concentration = float(
+                    getattr(self.cfg, "high_goal_categorical_beta_min_concentration", 1.1)
+                )
+            if hasattr(high_sac.actor, "categorical_beta_u_eps"):
+                high_sac.actor.categorical_beta_u_eps = float(
+                    getattr(self.cfg, "high_goal_categorical_beta_u_eps", 1e-4)
+                )
+            if hasattr(high_sac.actor, "categorical_beta_include_x_jacobian"):
+                high_sac.actor.categorical_beta_include_x_jacobian = bool(
+                    getattr(self.cfg, "high_goal_categorical_beta_include_x_jacobian", False)
+                )
 
         self.high_agent = SB3AgentWrapper(high_sac, config.train_freq, config.gradient_steps_high, config.batch_size)
 
@@ -736,6 +843,188 @@ class HIROSAC:
             for cb in callback.callbacks: HIROSAC._propagate_log_interval(cb, log_interval)
         elif hasattr(callback, "log_interval"):
             callback.log_interval = int(log_interval)
+
+    @staticmethod
+    def _empty_high_policy_debug(n_envs: int) -> dict[str, np.ndarray]:
+        n = int(n_envs)
+        out: dict[str, np.ndarray] = {
+            "policy_distribution": np.full(n, "", dtype=object),
+        }
+        for key in (
+            "selected_component",
+            "selected_component_base",
+            "selected_component_fallback",
+            "feasible_any",
+            "fallback_to_base",
+            "valid_selected",
+            "valid_selected_base",
+            "use_fallback",
+        ):
+            out[key] = np.full(n, -1, dtype=np.int64)
+        for key in (
+            "beta_alpha_selected",
+            "beta_beta_selected",
+            "beta_u",
+            "x_norm",
+            "y_code",
+            "raw_x_norm",
+            "raw_y_code",
+            "log_prob",
+            "log_prob_k",
+            "log_prob_x",
+            "log_prob_lateral",
+            "log_prob_vx",
+            "log_prob_other",
+        ):
+            out[key] = np.full(n, np.nan, dtype=np.float32)
+        for key in (
+            "valid_mask",
+            "lateral_logits",
+            "lateral_probs",
+            "beta_alpha",
+            "beta_beta",
+        ):
+            out[key] = np.full((n, 3), np.nan, dtype=np.float32)
+        return out
+
+    @staticmethod
+    def _assign_high_policy_debug(
+        store: dict[str, np.ndarray],
+        env_idx: np.ndarray,
+        debug: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(debug, dict) or env_idx.size == 0:
+            return
+        idx = np.asarray(env_idx, dtype=np.int64).reshape(-1)
+        batch = int(idx.size)
+        dist = str(debug.get("policy_distribution", ""))
+        if dist and "policy_distribution" in store:
+            store["policy_distribution"][idx] = dist
+        for key in (
+            "selected_component",
+            "selected_component_base",
+            "selected_component_fallback",
+            "feasible_any",
+            "fallback_to_base",
+            "valid_selected",
+            "valid_selected_base",
+            "use_fallback",
+        ):
+            if key not in debug or key not in store:
+                continue
+            arr = np.asarray(debug[key]).reshape(-1)
+            if arr.size == batch:
+                store[key][idx] = arr.astype(np.int64)
+        for key in (
+            "beta_alpha_selected",
+            "beta_beta_selected",
+            "beta_u",
+            "x_norm",
+            "y_code",
+            "raw_x_norm",
+            "raw_y_code",
+            "log_prob",
+            "log_prob_k",
+            "log_prob_x",
+            "log_prob_lateral",
+            "log_prob_vx",
+            "log_prob_other",
+        ):
+            if key not in debug or key not in store:
+                continue
+            arr = np.asarray(debug[key], dtype=np.float32).reshape(-1)
+            if arr.size == batch:
+                store[key][idx] = arr
+        for key in (
+            "valid_mask",
+            "lateral_logits",
+            "lateral_probs",
+            "beta_alpha",
+            "beta_beta",
+        ):
+            if key not in debug or key not in store:
+                continue
+            arr = np.asarray(debug[key], dtype=np.float32)
+            if arr.shape == (batch, 3):
+                store[key][idx] = arr
+
+    @staticmethod
+    def _reset_high_policy_debug_rows(store: dict[str, np.ndarray], env_idx: np.ndarray) -> None:
+        if not isinstance(store, dict):
+            return
+        idx = np.asarray(env_idx, dtype=np.int64).reshape(-1)
+        if idx.size == 0:
+            return
+        fresh = HIROSAC._empty_high_policy_debug(int(idx.size))
+        for key, value in store.items():
+            if key not in fresh:
+                continue
+            if value.ndim == 1:
+                value[idx] = fresh[key]
+            elif value.ndim == 2:
+                value[idx, :] = fresh[key]
+
+    @staticmethod
+    def _concat_high_policy_debug(debug_batches: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+        if not debug_batches or any(not isinstance(item, dict) for item in debug_batches):
+            return None
+        batches = [item for item in debug_batches if isinstance(item, dict)]
+        out: dict[str, Any] = {}
+        dist = next((str(item.get("policy_distribution", "")) for item in batches if item.get("policy_distribution")), "")
+        if dist:
+            out["policy_distribution"] = dist
+
+        keys = sorted(set().union(*(set(item.keys()) for item in batches)))
+        for key in keys:
+            if key == "policy_distribution":
+                continue
+            values = []
+            ok = True
+            for item in batches:
+                if key not in item:
+                    ok = False
+                    break
+                arr = np.asarray(item[key])
+                if arr.shape[0:1] != (1,):
+                    ok = False
+                    break
+                values.append(arr)
+            if ok and values:
+                out[key] = np.concatenate(values, axis=0)
+        return out
+
+    def _sample_high_action_with_policy_debug(self, high_obs_batch: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict[str, Any] | None]:
+        actor = getattr(getattr(self.high_agent, "agent", None), "actor", None)
+        if actor is None or not hasattr(actor, "goal_safe_debug_enabled"):
+            a, a_buf = self.high_agent.sample_action(high_obs_batch)
+            return a, a_buf, None
+        prev_debug_enabled = bool(getattr(actor, "goal_safe_debug_enabled", False))
+        prev_last_debug = getattr(actor, "last_safe_policy_debug", None)
+        actor.goal_safe_debug_enabled = True
+        actor.last_safe_policy_debug = None
+        try:
+            obs_batch = np.asarray(high_obs_batch, dtype=np.float32)
+            n = int(obs_batch.shape[0])
+            if int(getattr(self.high_agent.agent, "n_envs", n)) == 1 and n > 1:
+                act_dim = int(self.high_agent.agent.action_space.shape[0])
+                a = np.empty((n, act_dim), dtype=np.float32)
+                a_buf = np.empty_like(a)
+                debug_rows: list[dict[str, Any] | None] = []
+                for row_i in range(n):
+                    actor.last_safe_policy_debug = None
+                    a_i, a_buf_i = self.high_agent.sample_action(obs_batch[row_i: row_i + 1])
+                    a[row_i] = np.asarray(a_i, dtype=np.float32).reshape(1, -1)[0]
+                    a_buf[row_i] = np.asarray(a_buf_i, dtype=np.float32).reshape(1, -1)[0]
+                    debug_rows.append(getattr(actor, "last_safe_policy_debug", None))
+                debug = self._concat_high_policy_debug(debug_rows)
+            else:
+                a, a_buf = self.high_agent.sample_action(obs_batch)
+                debug = getattr(actor, "last_safe_policy_debug", None)
+        finally:
+            actor.goal_safe_debug_enabled = prev_debug_enabled
+            if not prev_debug_enabled:
+                actor.last_safe_policy_debug = prev_last_debug
+        return a, a_buf, debug
 
     def _high_goal_infeasible_mode(self) -> str:
         mode = str(getattr(self.cfg, "high_goal_infeasible_action_mode", "reroute")).lower().strip()
@@ -866,9 +1155,120 @@ class HIROSAC:
 
         return executed.astype(np.float32), invalid_selected, shielded, selected
 
+    def _high_goal_endpoint_penalty(
+        self,
+        high_obs: np.ndarray,
+        actions: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Penalize high goals that sit too close to the selected reachable x upper bound."""
+        actions = np.asarray(actions, dtype=np.float32)
+        n = int(actions.shape[0]) if actions.ndim >= 1 else 0
+        penalty = np.zeros(n, dtype=np.float32)
+        frac = np.full(n, np.nan, dtype=np.float32)
+        if (
+            n == 0
+            or actions.ndim != 2
+            or actions.shape[1] < 2
+            or not bool(getattr(self.cfg, "high_goal_endpoint_penalty_enabled", False))
+            or float(getattr(self.cfg, "high_goal_endpoint_penalty_coef", 0.0)) <= 0.0
+            or not hasattr(self, "high_goal_safe_bounds")
+        ):
+            return penalty, frac
+
+        try:
+            stats = self.high_goal_safe_bounds.compute_np(np.asarray(high_obs, dtype=np.float32))
+            l2 = np.asarray(stats["l2"], dtype=np.float32)
+            u2 = np.asarray(stats["u2"], dtype=np.float32)
+            valid_k = u2 > l2
+            if l2.ndim != 2 or u2.ndim != 2 or l2.shape[0] != n or l2.shape[1] < 3:
+                return penalty, frac
+
+            lane_idx = np.asarray(stats.get("ego_lane_idx", np.zeros(n)), dtype=np.int64).reshape(-1)
+            n_lanes = int(np.asarray(stats.get("n_lanes", self.n_lanes)).reshape(-1)[0])
+            use_dynamic = bool(getattr(self.cfg, "high_goal_dynamic_feasible_lane_intervals", False))
+            selected = self._goal_action_component_indices(
+                actions,
+                lane_idx,
+                n_lanes,
+                dynamic_feasible_intervals=use_dynamic,
+            )
+            row = np.arange(n, dtype=np.int64)
+            selected = np.clip(selected, 0, l2.shape[1] - 1)
+            valid = valid_k[row, selected]
+            if not np.any(valid):
+                return penalty, frac
+
+            x_norm = self._high_action_dx_to_normalized(actions[:, 0])
+            lo_n = l2[row, selected]
+            hi_n = u2[row, selected]
+            span_n = np.maximum(hi_n - lo_n, 1e-9)
+            frac_valid = (x_norm - lo_n) / span_n
+            frac[:] = frac_valid.astype(np.float32)
+
+            low = np.asarray(self.high_agent.action_space.low, dtype=np.float32).reshape(-1)
+            high = np.asarray(self.high_agent.action_space.high, dtype=np.float32).reshape(-1)
+            span_dx = 0.5 * span_n * max(float(high[0] - low[0]), 1e-6)
+            min_span = float(max(0.0, getattr(self.cfg, "high_goal_endpoint_penalty_min_span", 0.0)))
+            active = valid & (span_dx >= min_span)
+            if not np.any(active):
+                return penalty, frac
+
+            limit = float(np.clip(getattr(self.cfg, "high_goal_endpoint_penalty_frac_limit", 0.85), 0.0, 1.0))
+            coef = float(max(0.0, getattr(self.cfg, "high_goal_endpoint_penalty_coef", 0.0)))
+            excess = np.maximum(frac_valid - limit, 0.0)
+            penalty[active] = (-coef * np.square(excess[active])).astype(np.float32)
+        except Exception:
+            return penalty, frac
+        return penalty, frac
+
     # ------------------------------------------------------------------
     # 内部工具函数：obs 处理
     # ------------------------------------------------------------------
+    def _high_goal_comfort_prior_penalty(
+        self,
+        ego_sub: np.ndarray,
+        goal_dist: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Predict a simple longitudinal comfort cost from constant-acceleration kinematics."""
+        ego_sub = np.asarray(ego_sub, dtype=np.float32)
+        goal_dist = np.asarray(goal_dist, dtype=np.float32)
+        n = int(goal_dist.shape[0]) if goal_dist.ndim >= 1 else 0
+        penalty = np.zeros(n, dtype=np.float32)
+        a_req = np.full(n, np.nan, dtype=np.float32)
+        cost = np.zeros(n, dtype=np.float32)
+        if (
+            n == 0
+            or goal_dist.ndim != 2
+            or goal_dist.shape[1] < 1
+            or ego_sub.ndim != 2
+            or ego_sub.shape[0] != n
+            or not bool(getattr(self.cfg, "high_goal_comfort_prior_enabled", False))
+            or float(getattr(self.cfg, "high_goal_comfort_prior_coef", 0.0)) <= 0.0
+        ):
+            return penalty, a_req, cost
+
+        try:
+            vx_feature_idx = int(self.feature_names.index("vx"))
+            vx_sub_idx = list(self.ego_feature_idx).index(vx_feature_idx)
+        except Exception:
+            vx_sub_idx = 2 if ego_sub.shape[1] > 2 else -1
+        if vx_sub_idx < 0 or ego_sub.shape[1] <= vx_sub_idx:
+            return penalty, a_req, cost
+
+        horizon_scale = float(max(1e-6, getattr(self.cfg, "high_goal_comfort_prior_horizon_scale", 1.0)))
+        horizon_t = float(max(1e-6, self.dt * float(self.cfg.high_interval) * horizon_scale))
+        dx = goal_dist[:, 0].astype(np.float32)
+        v0 = ego_sub[:, vx_sub_idx].astype(np.float32)
+        a_req = (2.0 * (dx - v0 * horizon_t) / max(horizon_t * horizon_t, 1e-6)).astype(np.float32)
+
+        deadband = float(max(0.0, getattr(self.cfg, "high_goal_comfort_prior_accel_deadband", 1.5)))
+        norm = float(max(1e-6, getattr(self.cfg, "high_goal_comfort_prior_accel_norm", 3.0)))
+        coef = float(max(0.0, getattr(self.cfg, "high_goal_comfort_prior_coef", 0.0)))
+        excess = np.maximum(np.abs(a_req) - deadband, 0.0)
+        cost = np.square(excess / norm).astype(np.float32)
+        penalty = (-coef * cost).astype(np.float32)
+        return penalty, a_req.astype(np.float32), cost
+
     def _get_signal_features(self) -> np.ndarray:
         """Get per-env traffic-signal features [is_green, remaining_seconds]."""
         n = int(self.n_envs)
@@ -1135,12 +1535,20 @@ class HIROSAC:
             "punctual_reward",
             "wrong_lane_terminal_penalty",
             "invalid_goal_penalty",
+            "goal_endpoint_penalty",
+            "goal_comfort_prior_penalty",
         ]
         high_comp_sums = {k: np.zeros(n_envs, dtype=np.float32) for k in high_comp_keys}
         high_goal_invalid_selected = np.zeros(n_envs, dtype=bool)
         high_goal_shielded = np.zeros(n_envs, dtype=bool)
         high_goal_selected_component = np.full(n_envs, -1, dtype=np.int64)
         high_goal_shield_penalty = np.zeros(n_envs, dtype=np.float32)
+        high_goal_endpoint_penalty = np.zeros(n_envs, dtype=np.float32)
+        high_goal_endpoint_frac = np.full(n_envs, np.nan, dtype=np.float32)
+        high_goal_comfort_prior_penalty = np.zeros(n_envs, dtype=np.float32)
+        high_goal_comfort_prior_accel = np.full(n_envs, np.nan, dtype=np.float32)
+        high_goal_comfort_prior_cost = np.zeros(n_envs, dtype=np.float32)
+        high_policy_debug = self._empty_high_policy_debug(n_envs)
         high_acc_min = np.full(n_envs, np.inf, dtype=np.float32)
         high_acc_max = np.full(n_envs, -np.inf, dtype=np.float32)
         high_acc_sum = np.zeros(n_envs, dtype=np.float32)
@@ -1225,6 +1633,7 @@ class HIROSAC:
             need_high_now = need_high & active_obs_mask
             if need_high_now.any():
                 idx = np.flatnonzero(need_high_now)
+                self._reset_high_policy_debug_rows(high_policy_debug, idx)
 
                 if high_policy is not None:
                     # Use custom high-level policy (e.g. random sampler)
@@ -1232,7 +1641,8 @@ class HIROSAC:
                     # For buffer action, if not training high, exact value doesn't matter much unless logged
                     a_buf = a.copy()
                 else:
-                    a, a_buf = self.high_agent.sample_action(high_obs[idx])
+                    a, a_buf, actor_debug = self._sample_high_action_with_policy_debug(high_obs[idx])
+                    self._assign_high_policy_debug(high_policy_debug, idx, actor_debug)
 
                 a = np.asarray(a, dtype=np.float32)
                 a_buf = np.asarray(a_buf, dtype=np.float32)
@@ -1256,6 +1666,12 @@ class HIROSAC:
                 high_goal_invalid_selected[idx] = invalid_selected
                 high_goal_shielded[idx] = shielded
                 high_goal_selected_component[idx] = selected_component
+                endpoint_penalty, endpoint_frac = self._high_goal_endpoint_penalty(
+                    high_obs[idx],
+                    a,
+                )
+                high_goal_endpoint_penalty[idx] = endpoint_penalty
+                high_goal_endpoint_frac[idx] = endpoint_frac
 
                 ego_sub = utils.extract_ego_substate(kin[idx], self.ego_feature_idx)
                 ego_start[idx] = ego_sub
@@ -1268,6 +1684,13 @@ class HIROSAC:
                     ),
                 )
                 goal_dist_start[idx] = goal_phys[idx] - ego_start[idx]
+                comfort_prior_penalty, comfort_prior_accel, comfort_prior_cost = self._high_goal_comfort_prior_penalty(
+                    ego_sub,
+                    goal_dist_start[idx],
+                )
+                high_goal_comfort_prior_penalty[idx] = comfort_prior_penalty
+                high_goal_comfort_prior_accel[idx] = comfort_prior_accel
+                high_goal_comfort_prior_cost[idx] = comfort_prior_cost
 
                 high_ret[idx] = 0.0
                 low_ret[idx] = 0.0
@@ -1275,6 +1698,11 @@ class HIROSAC:
                 high_len[idx] = 0
                 low_safety_clip_count[idx] = 0
                 high_goal_shield_penalty[idx] = 0.0
+                high_goal_endpoint_penalty[idx] = endpoint_penalty
+                high_goal_endpoint_frac[idx] = endpoint_frac
+                high_goal_comfort_prior_penalty[idx] = comfort_prior_penalty
+                high_goal_comfort_prior_accel[idx] = comfort_prior_accel
+                high_goal_comfort_prior_cost[idx] = comfort_prior_cost
                 for v in low_comp_sums.values():
                     v[idx] = 0.0
                 for v in high_comp_sums.values():
@@ -1285,6 +1713,12 @@ class HIROSAC:
                     high_goal_shield_penalty[shield_idx] = -penalty
                     high_ret[shield_idx] -= penalty
                     high_comp_sums["invalid_goal_penalty"][shield_idx] -= penalty
+                if np.any(endpoint_penalty < 0.0):
+                    high_ret[idx] += endpoint_penalty
+                    high_comp_sums["goal_endpoint_penalty"][idx] += endpoint_penalty
+                if np.any(comfort_prior_penalty < 0.0):
+                    high_ret[idx] += comfort_prior_penalty
+                    high_comp_sums["goal_comfort_prior_penalty"][idx] += comfort_prior_penalty
                 high_acc_min[idx] = np.inf
                 high_acc_max[idx] = -np.inf
                 high_acc_sum[idx] = 0.0
@@ -1624,8 +2058,13 @@ class HIROSAC:
                 high_goal_invalid_selected_end = high_goal_invalid_selected[idx_end].copy()
                 high_goal_shielded_end = high_goal_shielded[idx_end].copy()
                 high_goal_shield_penalty_end = high_goal_shield_penalty[idx_end].copy()
+                high_goal_endpoint_penalty_end = high_goal_endpoint_penalty[idx_end].copy()
+                high_goal_endpoint_frac_end = high_goal_endpoint_frac[idx_end].copy()
+                high_goal_comfort_prior_penalty_end = high_goal_comfort_prior_penalty[idx_end].copy()
+                high_goal_comfort_prior_accel_end = high_goal_comfort_prior_accel[idx_end].copy()
+                high_goal_comfort_prior_cost_end = high_goal_comfort_prior_cost[idx_end].copy()
 
-                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_safety_clip_ratio": low_safety_clip_ratio_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end, "goal_dist_start": goal_dist_start_end, "high_goal_invalid_selected": high_goal_invalid_selected_end, "high_goal_shielded": high_goal_shielded_end, "high_goal_shield_penalty": high_goal_shield_penalty_end})
+                callback.update_locals({**locals(), "low_ret": low_ret_end, "low_len": low_len_end, "low_safety_clip_ratio": low_safety_clip_ratio_end, "low_comp_sums": low_comp_end, "goal_err": goal_err_end, "intrinsic_unweighted": intrinsic_unweighted_end, "goal_dist_start": goal_dist_start_end, "high_goal_invalid_selected": high_goal_invalid_selected_end, "high_goal_shielded": high_goal_shielded_end, "high_goal_shield_penalty": high_goal_shield_penalty_end, "high_goal_endpoint_penalty": high_goal_endpoint_penalty_end, "high_goal_endpoint_frac": high_goal_endpoint_frac_end, "high_goal_comfort_prior_penalty": high_goal_comfort_prior_penalty_end, "high_goal_comfort_prior_accel": high_goal_comfort_prior_accel_end, "high_goal_comfort_prior_cost": high_goal_comfort_prior_cost_end})
                 callback.on_rollout_end()
 
                 if train_high:
@@ -1654,6 +2093,11 @@ class HIROSAC:
                         info_h["high_goal_shielded"] = bool(high_goal_shielded[j])
                         info_h["high_goal_selected_component"] = int(high_goal_selected_component[j])
                         info_h["high_goal_shield_penalty"] = float(high_goal_shield_penalty[j])
+                        info_h["high_goal_endpoint_penalty"] = float(high_goal_endpoint_penalty[j])
+                        info_h["high_goal_endpoint_frac"] = float(high_goal_endpoint_frac[j])
+                        info_h["high_goal_comfort_prior_penalty"] = float(high_goal_comfort_prior_penalty[j])
+                        info_h["high_goal_comfort_prior_accel"] = float(high_goal_comfort_prior_accel[j])
+                        info_h["high_goal_comfort_prior_cost"] = float(high_goal_comfort_prior_cost[j])
                         info_h["high_components"] = {
                             k: float(v[j])
                             for k, v in high_comp_sums.items()
@@ -1694,6 +2138,11 @@ class HIROSAC:
                 high_goal_shielded[idx_end] = False
                 high_goal_selected_component[idx_end] = -1
                 high_goal_shield_penalty[idx_end] = 0.0
+                high_goal_endpoint_penalty[idx_end] = 0.0
+                high_goal_endpoint_frac[idx_end] = np.nan
+                high_goal_comfort_prior_penalty[idx_end] = 0.0
+                high_goal_comfort_prior_accel[idx_end] = np.nan
+                high_goal_comfort_prior_cost[idx_end] = 0.0
                 for v in low_comp_sums.values():
                     v[idx_end] = 0.0
                 for v in high_comp_sums.values():
@@ -1726,6 +2175,11 @@ class HIROSAC:
                 high_goal_shielded[idx_dummy_done] = False
                 high_goal_selected_component[idx_dummy_done] = -1
                 high_goal_shield_penalty[idx_dummy_done] = 0.0
+                high_goal_endpoint_penalty[idx_dummy_done] = 0.0
+                high_goal_endpoint_frac[idx_dummy_done] = np.nan
+                high_goal_comfort_prior_penalty[idx_dummy_done] = 0.0
+                high_goal_comfort_prior_accel[idx_dummy_done] = np.nan
+                high_goal_comfort_prior_cost[idx_dummy_done] = 0.0
                 for v in low_comp_sums.values():
                     v[idx_dummy_done] = 0.0
                 for v in high_comp_sums.values():

@@ -110,6 +110,9 @@ class HiROHighReplayBuffer(ReplayBuffer):
             "goal_lane_dense_reward",
             "punctual_reward",
             "wrong_lane_terminal_penalty",
+            "invalid_goal_penalty",
+            "goal_endpoint_penalty",
+            "goal_comfort_prior_penalty",
         ]
         self._debug_components = {
             name: np.zeros((self.buffer_size,), dtype=np.float32)

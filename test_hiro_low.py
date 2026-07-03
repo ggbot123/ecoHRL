@@ -59,6 +59,16 @@ class _DummyHigh:
         return np.zeros((1, 3), dtype=np.float32), None
 
 
+def _disable_high_goal_safety_for_dummy_high(hiro_cfg: Any) -> None:
+    high_goal_safety = getattr(hiro_cfg, "high_goal_safety", None)
+    if high_goal_safety is not None and bool(getattr(high_goal_safety, "enabled", False)):
+        print(
+            "[LOW TEST] disabling high_goal_safety for low-only rollout "
+            "because _DummyHigh has no safe-goal actor"
+        )
+        high_goal_safety.enabled = False
+
+
 _abs_dx_metric_fn = abs_dx_metric_fn
 _abs_dy_metric_fn = abs_dy_metric_fn
 
@@ -894,6 +904,7 @@ def main(
             "because a SAC low_model_path is being tested"
         )
         hiro_cfg.low_level_type = "sac"
+    _disable_high_goal_safety_for_dummy_high(hiro_cfg)
 
     effective_scenario_name = scenario_name or saved_scenario_name or "multi_lane"
     scenario_spec = get_scenario_spec(effective_scenario_name)
@@ -1764,7 +1775,8 @@ if __name__ == "__main__":
         # low_model_path="./models/hiro_260622_lowonly_uniform_randomStart_snapshot02_queueNew_lc05_fixedHER/hiro_low_final.zip",
         # low_model_path="./models/hiro_260625_recover0318_oldbranch_lane1/hiro_low_final.zip",
         # low_model_path="./models/hiro_260626_recover0318_oldbranch_bitwise/hiro_low_final.zip",
-        low_model_path="./models/hiro_260625_lowonly_recover0318/hiro_low_final.zip",
+        low_model_path="./models/hiro_260630_lowonly_reUni_oldEnv_fixedHER_snapshot/hiro_low_final.zip",
+        # low_model_path="./models/hiro_260625_lowonly_recover0318/hiro_low_final.zip",
         # low_model_path="./models/hiro_260321_lowonly_reachableUniform_newSLv2_vio03_HER_reDim_amax3_dmin0/hiro_low_final.zip",
         # low_model_path="./models/hiro_260318_lowonly_uniform_RS_newSLv2_vio03_HER_reDim_v2/hiro_low_final.zip",
         # low_model_path="./models/hiro_260415_lowonly_reUni_fixedHERv2_amax3_dmin15_10/hiro_low_final.zip",
@@ -1784,7 +1796,7 @@ if __name__ == "__main__":
             [30.0, 0.0, 10.0, 0.0],
             [25.0, 8.0, 15.0, 0.0],
         ],
-        goal_phys=[25, 8, 0, 0],
+        goal_phys=[20, 4, 0, 0],
         # batch_cases_csv="low_test_cases.csv",
         # batch_cases_csv="low_test_cases_debug.csv",
         # batch_cases_json="debug/hiro_low_eval_cases_snapshot012.json",

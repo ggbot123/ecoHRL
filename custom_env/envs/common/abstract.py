@@ -73,6 +73,10 @@ class AbstractEnv(gym.Env):
 
         # self.reset()
 
+    def set_config(self, config: dict) -> None:
+        """Replace the raw env config through VecEnv.env_method."""
+        self.config = copy.deepcopy(config)
+
     @property
     def vehicle(self) -> Vehicle:
         """First (default) controlled vehicle."""

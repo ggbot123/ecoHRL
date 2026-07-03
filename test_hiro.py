@@ -18,6 +18,7 @@ from util.config_utils import deep_update
 from util.hiro_utils import (
     apply_hiro_config_overrides,
     env_config_from_run_config,
+    hiro_checkpoint_path,
     hiro_config_from_run_config,
     load_hiro_high_model,
     load_hiro_low_model,
@@ -86,6 +87,7 @@ def main(
     config_overrides: Optional[Mapping[str, Any]] = None,
     high_model_dir: Optional[str] = None,
     low_model_dir: Optional[str] = None,
+    low_model_path: Optional[str] = None,
     model_suffix: Optional[str] = "final",
     enable_rendering: bool = True,
     scenario_name: Optional[str] = None,
@@ -96,22 +98,6 @@ def main(
     independent_episodes: bool = True,
     eval_root_dir: str = "./results/eval_results",
 ) -> str:
-    def _strict_deep_update(
-        dst: Dict[str, Any],
-        src: Mapping[str, Any],
-        path: str,
-    ) -> None:
-        for key, value in src.items():
-            key_path = f"{path}.{key}"
-            if key not in dst:
-                raise ValueError(f"Unknown config override: {key_path}")
-            if isinstance(value, Mapping):
-                if not isinstance(dst[key], dict):
-                    raise TypeError(f"{key_path} cannot be overridden with an object")
-                _strict_deep_update(dst[key], value, key_path)
-            else:
-                dst[key] = deepcopy(value)
-
     overrides = deepcopy(dict(config_overrides or {}))
     allowed_override_sections = {"environment", "hiro", "evaluation"}
     unknown_sections = set(overrides) - allowed_override_sections
@@ -179,7 +165,7 @@ def main(
         )
     for mode_key, mode_val in hiro_eval_modes.items():
         setattr(hiro_cfg, mode_key, mode_val)
-    saved_metadata = env_run_config.get("run_metadata")
+    saved_metadata = run_config.get("run_metadata")
     if not isinstance(saved_metadata, Mapping):
         raise ValueError("run_config.json is missing the 'run_metadata' object")
     if not saved_metadata.get("scenario_name"):
@@ -256,30 +242,44 @@ def main(
     importlib.import_module(str(scenario_spec["module"]))
     env_id = str(scenario_spec["env_id"])
 
+    env_metadata = env_run_config.get("run_metadata")
+    env_saved_scenario_name = (
+        str(env_metadata["scenario_name"])
+        if isinstance(env_metadata, Mapping) and env_metadata.get("scenario_name")
+        else saved_scenario_name
+    )
     scenario_changed = bool(
-        scenario_name is not None
-        and saved_scenario_name is not None
-        and effective_scenario_name != saved_scenario_name
+        env_config_model_dir
+        and scenario_name is not None
+        and env_saved_scenario_name
+        and effective_scenario_name != env_saved_scenario_name
     )
-    saved_env_config = (
-        None
-        if scenario_changed
-        else env_config_from_run_config(env_run_config)
-    )
-    if saved_env_config is not None:
-        env_config = get_env_config_for_scenario(effective_scenario_name)
-        deep_update(env_config, saved_env_config)
-        env_config.pop("_env_seed", None)
-        env_config.pop("actual_episode_start_phase_offset", None)
+    if env_config_model_dir:
+        if scenario_changed:
+            env_config = get_env_config_for_scenario(effective_scenario_name, env_overrides)
+            env_config_source_desc = (
+                f"configs/conf.py scenario={effective_scenario_name} + "
+                "config_overrides.environment "
+                f"(ignored saved env config from {env_run_config_path}; "
+                f"saved scenario={env_saved_scenario_name})"
+            )
+        else:
+            saved_env_config = env_config_from_run_config(env_run_config)
+            env_config = get_env_config_for_scenario(effective_scenario_name)
+            deep_update(env_config, saved_env_config)
+            env_config.pop("_env_seed", None)
+            env_config.pop("actual_episode_start_phase_offset", None)
+            deep_update(env_config, env_overrides)
+            env_config_source_desc = (
+                f"{env_run_config_path} environment.env0_config "
+                "+ config_overrides.environment"
+            )
     else:
-        env_config = get_env_config_for_scenario(effective_scenario_name)
-    deep_update(env_config, runtime_overrides)
-    if env_overrides:
-        _strict_deep_update(
-            env_config,
-            env_overrides,
-            "config_overrides.environment",
+        env_config = get_env_config_for_scenario(effective_scenario_name, env_overrides)
+        env_config_source_desc = (
+            f"configs/conf.py scenario={effective_scenario_name} + config_overrides.environment"
         )
+    deep_update(env_config, runtime_overrides)
     if not enable_rendering:
         env_config["show_trajectories"] = False
         env_config["warmup_render"] = False
@@ -334,18 +334,39 @@ def main(
     if low_level_type not in {"sac", "rule_based"}:
         raise ValueError(f"Unknown low_level_type: {low_level_type}")
     suffix = model_suffix or "final"
+    high_load_dir = high_model_dir or model_dir
     high_model = load_hiro_high_model(
-        high_model_dir or model_dir,
+        high_load_dir,
         model_suffix=suffix,
     )
-    low_model = (
-        load_hiro_low_model(
-            low_model_dir or model_dir,
-            model_suffix=suffix,
+    low_model = None
+    low_load_path = None
+    if low_level_type == "sac":
+        if low_model_path and low_model_dir:
+            raise ValueError("Use either low_model_path or low_model_dir, not both")
+        if low_model_path:
+            low_load_path = str(low_model_path)
+            low_load_dir = os.path.dirname(low_load_path) or "."
+            low_load_suffix = os.path.basename(low_load_path)
+        else:
+            low_load_dir = low_model_dir or model_dir
+            low_load_suffix = suffix
+            low_load_path = hiro_checkpoint_path(low_load_dir, "hiro_low", low_load_suffix)
+        if not os.path.isfile(low_load_path):
+            low_pretrained_path = getattr(hiro_cfg, "low_pretrained_path", None)
+            hint = (
+                f" run_config low_pretrained_path={low_pretrained_path!r}; "
+                "pass it via low_model_path explicitly if this is the intended low model."
+                if low_pretrained_path
+                else ""
+            )
+            raise FileNotFoundError(
+                f"Low-level HIRO checkpoint not found: {low_load_path}.{hint}"
+            )
+        low_model = load_hiro_low_model(
+            low_load_dir,
+            model_suffix=low_load_suffix,
         )
-        if low_level_type == "sac"
-        else None
-    )
     runner = HIROPolicyRunner(
         high_model,
         low_model,
@@ -408,13 +429,13 @@ def main(
     log(f"Episodes           : {episodes}")
     log(f"Scenario           : {effective_scenario_name} ({env_id})")
     log(f"HIRO config source : {run_config_path}")
-    log(f"Env config source  : {env_run_config_path}")
+    log(f"Env config source  : {env_config_source_desc}")
     log(f"Config overrides   : {json.dumps(overrides, ensure_ascii=False, sort_keys=True)}")
     log(f"Independent eps    : {independent_episodes}")
     hd = high_model_dir or model_dir
     ld = low_model_dir or model_dir
-    hp = os.path.join(hd, f"hiro_high_{suffix}.zip")
-    lp = os.path.join(ld, f"hiro_low_{suffix}.zip")
+    hp = hiro_checkpoint_path(hd, "hiro_high", suffix)
+    lp = low_load_path or hiro_checkpoint_path(ld, "hiro_low", suffix)
     log(f"HIRO high          : {hp}")
     if low_level_type == "rule_based":
         log("HIRO low           : N/A (rule-based controller)")
@@ -430,6 +451,12 @@ def main(
     else:
         log(f"Low safety layer   : {runner.use_low_safety_layer}")
     log(f"Low policy source  : {low_level_type}")
+    log(
+        "High obs modes     : "
+        f"time={getattr(hiro_cfg, 'high_obs_time_mode', 'remaining')}, "
+        f"x={getattr(hiro_cfg, 'high_obs_x_mode', 'remaining')}, "
+        f"signal={getattr(runner, 'high_obs_include_signal_features', True)}"
+    )
     log(f"High interval      : {runner.hi}")
     log(f"Rendering enabled  : {enable_rendering}")
     log("=" * 80)
@@ -667,7 +694,7 @@ def main(
         json.dump(
             {
                 "hiro_config_source": run_config_path,
-                "env_config_source": env_run_config_path,
+                "env_config_source": env_config_source_desc,
                 "scenario_name": effective_scenario_name,
                 "env_id": env_id,
                 "episode_seeds": resolved_episode_seeds,
@@ -759,20 +786,23 @@ def main(
                     "Low-level observation dimension mismatch: "
                     f"test config builds {expected_low_dim}, model expects {trained_low_dim}. "
                     f"HIRO config source={run_config_path}, "
-                    f"env config source={env_run_config_path}. "
-                    "Use config_model_dir/env_config_model_dir with a complete saved config, "
-                    "or provide "
+                    f"env config source={env_config_source_desc}. "
+                    "Provide "
                     "matching config_overrides['environment']."
                 )
         should_record_trajectory = ep in trajectory_record_set
         trajectory_rows: list[Dict[str, Any]] = []
 
         def _build_low_obs_for_logging(obs_raw: np.ndarray) -> np.ndarray:
-            """Build low_obs as [t_norm, local_kin_flat, goal_rel] (no signal dims)."""
+            """Build the same low_obs layout that HIROPolicyRunner sends to the low model."""
             _, kin_local, kin_flat_local = runner._split(obs_raw)
             ego_sub_local = runner._ego_sub(kin_local)
             t_norm_local = np.array([runner.c / float(runner.hi)], dtype=np.float32)
             goal_rel_local = (runner.goal_phys - ego_sub_local).astype(np.float32)
+            obs_arr_local = np.asarray(obs_raw, dtype=np.float32).reshape(-1)
+            extra_local = obs_arr_local[
+                1 + runner.kin_flat_dim : 1 + runner.kin_flat_dim + runner.obs_extra_dim
+            ].astype(np.float32)
 
             local_kin_flat_local = np.asarray(
                 kin_flat_local[0, : runner.local_kin_flat_dim], dtype=np.float32
@@ -788,7 +818,9 @@ def main(
                     local_kin_flat_local[idx_x_local] = 0.0
                     local_kin_flat_local[idx_y_local] = 0.0
 
-            return np.concatenate([t_norm_local, local_kin_flat_local, goal_rel_local]).astype(np.float32)
+            return np.concatenate(
+                [t_norm_local, local_kin_flat_local, extra_local, goal_rel_local]
+            ).astype(np.float32)
 
         terminated, truncated, steps = False, False, 0
         high_ret, low_ext_ret, low_int_ret, low_total_ret = 0.0, 0.0, 0.0, 0.0
@@ -815,11 +847,15 @@ def main(
             hi_start_kin = None
             hi_start_ego_sub = np.asarray([], dtype=np.float32)
             if is_hi_start:
-                hi_start_high_obs = np.asarray(obs, dtype=np.float32).reshape(1, -1)
                 try:
+                    hi_start_high_obs = runner._build_high_obs(
+                        np.asarray(obs, dtype=np.float32),
+                        env,
+                    )
                     _, hi_start_kin, _ = runner._split(obs)
                     hi_start_ego_sub = runner._ego_sub(hi_start_kin).astype(np.float32)
                 except Exception:
+                    hi_start_high_obs = np.asarray(obs, dtype=np.float32).reshape(1, -1)
                     hi_start_kin = None
 
             # Capture prev goal before runner.act updates it (if need_high is True)
@@ -1217,8 +1253,12 @@ class HIROEvalModel:
     model_dir: str
     high_model_dir: Optional[str] = None
     low_model_dir: Optional[str] = None
+    low_model_path: Optional[str] = None
     model_suffix: str = "final"
     config_model_dir: Optional[str] = None
+    high_obs_time_mode: Optional[str] = None
+    high_obs_x_mode: Optional[str] = None
+    high_obs_use_signal_features: Optional[bool] = None
 
 
 def run_batch(
@@ -1238,7 +1278,7 @@ def run_batch(
     eval_kwargs.pop("independent_episodes", None)
     eval_kwargs.pop("episode_seeds", None)
     eval_kwargs.pop("seed_base", None)
-    eval_kwargs.pop("env_config_model_dir", None)
+    explicit_env_config_model_dir = eval_kwargs.pop("env_config_model_dir", None)
     seeds = (
         [int(seed) for seed in episode_seeds]
         if episode_seeds is not None
@@ -1254,13 +1294,15 @@ def run_batch(
     results: Dict[str, str] = {}
     manifest_models = []
     shared_env_source = None
-    if not use_each_model_env_config:
-        shared_env_source = (
-            shared_env_config_model_dir
-            or models[0].config_model_dir
-            or models[0].high_model_dir
-            or models[0].model_dir
-        )
+    if explicit_env_config_model_dir:
+        shared_env_source = explicit_env_config_model_dir
+    elif shared_env_config_model_dir:
+        shared_env_source = shared_env_config_model_dir
+    env_config_source_note = (
+        str(shared_env_source)
+        if shared_env_source is not None
+        else "configs/conf.py scenario defaults + config_overrides.environment"
+    )
 
     for spec in models:
         if spec.name in results:
@@ -1273,17 +1315,37 @@ def run_batch(
             )
         else:
             env_config_source = shared_env_source
+        model_eval_kwargs = dict(eval_kwargs)
+        if (
+            spec.high_obs_time_mode is not None
+            or spec.high_obs_x_mode is not None
+            or spec.high_obs_use_signal_features is not None
+        ):
+            merged_overrides = deepcopy(model_eval_kwargs.get("config_overrides", {}))
+            hiro_section = merged_overrides.setdefault("hiro", {})
+            if not isinstance(hiro_section, dict):
+                raise TypeError("config_overrides['hiro'] must be a mapping")
+            if spec.high_obs_time_mode is not None:
+                hiro_section["high_obs_time_mode"] = str(spec.high_obs_time_mode)
+            if spec.high_obs_x_mode is not None:
+                hiro_section["high_obs_x_mode"] = str(spec.high_obs_x_mode)
+            if spec.high_obs_use_signal_features is not None:
+                hiro_section["high_obs_use_signal_features"] = bool(
+                    spec.high_obs_use_signal_features
+                )
+            model_eval_kwargs["config_overrides"] = merged_overrides
         eval_dir = main(
             model_dir=spec.model_dir,
             high_model_dir=spec.high_model_dir,
             low_model_dir=spec.low_model_dir,
+            low_model_path=spec.low_model_path,
             model_suffix=spec.model_suffix,
             config_model_dir=spec.config_model_dir,
             env_config_model_dir=env_config_source,
             episodes=int(episodes),
             episode_seeds=seeds,
             independent_episodes=True,
-            **eval_kwargs,
+            **model_eval_kwargs,
         )
         results[spec.name] = eval_dir
         manifest_models.append(
@@ -1292,8 +1354,12 @@ def run_batch(
                 "model_dir": spec.model_dir,
                 "high_model_dir": spec.high_model_dir,
                 "low_model_dir": spec.low_model_dir,
+                "low_model_path": spec.low_model_path,
                 "model_suffix": spec.model_suffix,
                 "config_model_dir": spec.config_model_dir,
+                "high_obs_time_mode": spec.high_obs_time_mode,
+                "high_obs_x_mode": spec.high_obs_x_mode,
+                "high_obs_use_signal_features": spec.high_obs_use_signal_features,
                 "env_config_model_dir": env_config_source,
                 "eval_dir": eval_dir,
             }
@@ -1305,6 +1371,7 @@ def run_batch(
                 "episodes": int(episodes),
                 "episode_seeds": seeds,
                 "shared_env_config_model_dir": shared_env_source,
+                "env_config_source": env_config_source_note,
                 "use_each_model_env_config": use_each_model_env_config,
                 "config_overrides": deepcopy(eval_kwargs.get("config_overrides", {})),
                 "models": manifest_models,
@@ -1324,8 +1391,22 @@ if __name__ == "__main__":
             #     model_dir="./models/hiro_260331_highonly_rule_accwithSL_randomLane",
             # ),
             # HIROEvalModel(
-            #     name="lateGreen_lane2to2_newReset",
-            #     model_dir="./models/hiro_260618_highonly_lateGreen_2to2_newReset",
+            #     name="uni_fixedHER_oldEnv",
+            #     model_dir="./models/hiro_260628_highonly_pretrained_uni_oldEnv_fixedHER_SLmpc_noaugObs",
+            #     low_model_path="./models/hiro_260627_lowonly_uni_oldEnv_fixedHER_SLmpc_noaugObs/hiro_low_final.zip",
+            # ),
+            HIROEvalModel(
+                name="uni_fixedHER_oldEnv_old",
+                model_dir="./models/hiro_260331_highonly_reachableUniformLane1_Rainbow_amax3_dmin15_10_randomlane",
+                low_model_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
+                high_obs_time_mode="elapsed",
+                high_obs_x_mode="elapsed",
+                high_obs_use_signal_features=False,
+            ),
+            # HIROEvalModel(
+            #     name="reUni_fixedHER_oldEnv",
+            #     model_dir="./models/hiro_260702_highonly_reUni_lowSnapshot_oldEnv_fixedHER_newPolicy_withPrior",
+            #     low_model_path="./models/hiro_260630_lowonly_reUni_oldEnv_fixedHER_snapshot/hiro_low_final.zip",
             # ),
             # HIROEvalModel(
             #     name="hiro_260619_highonly_lateGreen_2to0_newReset",
@@ -1346,30 +1427,132 @@ if __name__ == "__main__":
         record_episodes=[i for i in range(1, 31)],
         record_trajectory_episodes=[i for i in range(1, 31)],
         # enable_rendering=False,
-        # scenario_name="multi_lane",
-        scenario_name="multi_lane_stop_to_int",
+        scenario_name="multi_lane",
+        # scenario_name="multi_lane_stop_to_int",
         shared_env_config_model_dir=None,
-        use_each_model_env_config=False,
+        use_each_model_env_config=True,
         config_overrides={
             "environment": {
-                "initial_lane_id": "2",
-                "goal_lane_id": "2",
+                "rule_based_compute_action_mode": "goal_x_accel",
                 # "rule_follow_reset_on_high_interval": False,
-                # "rule_based_compute_action_mode": "goal_x_accel",
-                # "rule_based_compute_action_mode": "idm_mobil",
+                # "rule_based_compute_action_mode": "goal_x_accel_follow",
+                "observation": {
+                    "append_front_vehicle_features": False,
+                    # "append_front_vehicle_features": True,
+                    "goal_lane_feature_encoding": "one_hot",
+                },
+                "initial_lane_probs": None,
+                "initial_lane_id": "random",
+                # "initial_lane_id": 2,
+                # "initial_lane_id": 1,
+                # "goal_lane_id": 0,
+                # "goal_lane_id": 1,
+                "goal_lane_id": 2,
+                # "goal_lane_id": "random",
+                "goal_lane_probs": None,
+                # "behavior_lane_probs": [
+                #     [0.4, 0.3, 0.3],
+                #     [0.6, 0.3, 0.1],
+                #     [0.6, 0.3, 0.1],
+                # ],
+                "behavior_lane_probs": [
+                    [0.6, 0.3, 0.1],
+                    [0.6, 0.3, 0.1],
+                    [0.4, 0.3, 0.3],
+                ],
+                # "behavior_lane_probs": [
+                #     [0.6, 0.3, 0.1],
+                #     [0.4, 0.3, 0.3],
+                #     [0.6, 0.3, 0.1],
+                # ],
+                "signal_plan": [
+                    {"straight": 63.0},
+                    {"left": 57.0},
+                ],
+                "enable_signal_cycle_spawn_probability": True,
+                "signal_cycle_spawn_probability": [
+                    {"start": 0.0, "end": 27.0, "spawn_probability": 0.07},
+                    {"start": 27.0, "end": 84.0, "spawn_probability": 0.03},
+                    {"start": 84.0, "end": 120.0, "spawn_probability": 0.07},
+                ],
+                # "align_ego_spawn_to_signal_offset": False,
+                "align_ego_spawn_to_signal_offset": True,
+                # "background_snapshot_reset": True,
+                "background_snapshot_reset": False,
+                "background_snapshot_paths": None,
+                # "background_snapshot_paths": [
+                #     "debug/background_snapshot_pool_slowlane0",
+                #     "debug/background_snapshot_pool_slowlane2",
+                # ],
+                "background_snapshot_chunk_reuse_enabled": False,
+                # "background_snapshot_chunk_reuse_enabled": True,
+                "background_snapshot_chunk_reuse_count": 16,
+                "background_snapshot_phase_offset": 20.0,
+                "episode_start_phase_offset": 20.0,   # late green pass
+                "enable_queue_takeover": True,
+                # Ignored by the multi_lane scenario spec; kept here as a reminder
+                # that the saved training metadata included this key.
+                # "terminate_on_queue_takeover": True,
+                # "enable_queue_takeover": False,
+                "lane_change_min_front_gap": 15.0,
+                "lane_change_min_front_ttc": 3.0,
+                "lane_change_min_rear_gap": 10.0,
+                "lane_change_min_rear_ttc": 2.0,
+
+                # "goal_lane_dense_reward": 0,
+                "goal_lane_dense_reward": 1.0,
+                "lane_change_reward": -1.0,
+                # "lane_change_reward": -0.5,
+
+                "action": {
+                    "acceleration_range": [-5.0, 5.0],
+                    # "acceleration_range": [-3.0, 2.0],
+                },
+                "enable_signal_green_launch_behavior": False,
+
+                # "ego_speed_range": [5.0, 15.0], # only lower model training
             },
             "hiro": {
-                "use_low_safety_layer": True,
-                "goal_sampler": {
-                    "type": "reachable_uniform",
+                "low_level_type": "sac",
+                "low_safety_filter": {
+                    # "type": "legacy_mpc_max",
+                    "type": "mpc_constraints",
                 },
                 "high_goal_safety": {
+                    "enabled": True,
+                    # "enabled": False,
                     # "dynamic_feasible_lane_intervals": False,
+                    "infeasible_action_mode": "reroute",
+                    # "infeasible_action_mode": "shield_penalty",
+                    # "infeasible_action_penalty": 3.0,
+                    "max_accel": 3.0,
+                    "max_decel": 3.0,
+                    # "front_dmin": 10.0,
+                    # "lane_change_rear_dmin": 8.0,
+                    # "endpoint_penalty_enabled": True,
+                    "endpoint_penalty_enabled": False,
+                    "endpoint_penalty_frac_limit": 0.85,
+                    "endpoint_penalty_coef": 0.2,
+                    "endpoint_penalty_min_span": 5.0,
+                    "policy_distribution": "tanh_gaussian",
+                    # "policy_distribution": "categorical_beta",
+                    "comfort_prior_enabled": False,
+                    # "comfort_prior_enabled": True,
+                    "comfort_prior_coef": 0.5,
+                    "comfort_prior_accel_deadband": 1.0,
+                    "comfort_prior_accel_norm": 3.0,
+                    "comfort_prior_horizon_scale": 1.0,
                 },
-            },
-            "evaluation": {
-                "high_policy_source": "high_model",
-                # "high_policy_source": "goal_sampler",
+                "low_use_her": False,
+                # "low_use_her": True,
+                "low_her_ratio": 0.8,
+                "low_her_future_mode": "episode_timeaware",
+                # "low_her_future_mode": "segment_timeaware",
+                "low_snapshot_training_enabled": False,
+                # "low_snapshot_training_enabled": True,
+                "low_snapshot_training_duration_hi": 1,
+                "low_snapshot_ego_x_range": [0, 400],
+                "low_snapshot_ego_speed_range": [7, 15],
             },
         },
     )

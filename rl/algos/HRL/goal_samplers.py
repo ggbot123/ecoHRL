@@ -46,6 +46,44 @@ class UniformGoalSampler(GoalSampler):
         return np.random.uniform(low, high, size=(n, low.shape[0])).astype(np.float32)
 
 
+def _fill_wait_fallback_actions(
+    actions: np.ndarray,
+    rows: np.ndarray,
+    low: np.ndarray,
+    high: np.ndarray,
+    stats: dict[str, np.ndarray],
+    dynamic_feasible_intervals: bool,
+) -> None:
+    """Fill no-reachable rows with a conservative keep-lane/wait goal."""
+    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    if rows.size == 0:
+        return
+
+    act_dim = int(actions.shape[1]) if actions.ndim == 2 else 0
+    if act_dim >= 1:
+        actions[rows, 0] = np.float32(low[0])
+
+    if act_dim >= 2:
+        lane_idx = np.asarray(stats.get("ego_lane_idx", np.zeros(actions.shape[0])), dtype=np.int64).reshape(-1)
+        n_lanes = int(np.asarray(stats.get("n_lanes", 3)).reshape(-1)[0])
+        use_dynamic = bool(dynamic_feasible_intervals) and {
+            "ego_lane_idx",
+            "n_lanes",
+        }.issubset(stats)
+        y_intervals = np.asarray(
+            [
+                semantic_y_interval(1, int(lane_idx[row]), n_lanes, use_dynamic)
+                for row in rows
+            ],
+            dtype=np.float32,
+        )
+        y_mid = 0.5 * (y_intervals[:, 0] + y_intervals[:, 1])
+        actions[rows, 1] = np.clip(y_mid, low[1], high[1]).astype(np.float32)
+
+    if act_dim >= 3:
+        actions[rows, 2] = np.float32(np.clip(0.0, low[2], high[2]))
+
+
 class ReachableUniformGoalSampler(GoalSampler):
     """Sample goals from reachable set with uniform segment selection.
 
@@ -97,6 +135,7 @@ class ReachableUniformGoalSampler(GoalSampler):
 
         valid = u2 > l2
         valid_any = np.any(valid, axis=1)
+        _fill_wait_fallback_actions(actions, np.flatnonzero(~valid_any), low, high, stats, self._dynamic_feasible_intervals)
 
         if np.any(valid_any):
             idx = np.flatnonzero(valid_any)
@@ -207,6 +246,8 @@ class ReachableGaussianGoalSampler(GoalSampler):
             u_vx = None
 
         valid = u2 > l2
+        valid_any = np.any(valid, axis=1)
+        _fill_wait_fallback_actions(actions, np.flatnonzero(~valid_any), low, high, stats, self._dynamic_feasible_intervals)
         denom = max(float(high[0] - low[0]), 1e-6)
         lane_idx = np.asarray(stats.get("ego_lane_idx", np.zeros(n)), dtype=np.int64).reshape(-1)
         n_lanes = int(np.asarray(stats.get("n_lanes", 3)).reshape(-1)[0])
@@ -359,7 +400,9 @@ class ReachableCruiseMixGoalSampler(GoalSampler):
         valid = u2 > l2
         valid_any = np.any(valid, axis=1)
         if not np.any(valid_any):
+            _fill_wait_fallback_actions(actions, np.arange(n), low, high, stats, self._dynamic_feasible_intervals)
             return actions.astype(np.float32)
+        _fill_wait_fallback_actions(actions, np.flatnonzero(~valid_any), low, high, stats, self._dynamic_feasible_intervals)
 
         speed = np.asarray(self._speed_fn(obs), dtype=np.float32).reshape(-1)
         if speed.shape[0] != n:

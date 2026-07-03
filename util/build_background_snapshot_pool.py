@@ -79,13 +79,13 @@ SNAPSHOT_POOL_CONFIG: dict[str, Any] = {
     # sharded pool containing only snapshots with at least one eligible ego
     # candidate.
     "filter_existing_pool_enabled": True,
-    "filter_source_path": Path("debug") / "background_snapshot_pool_slowlane2",
-    "filter_out_path": Path("debug") / "background_snapshot_pool_slowlane2_x0_200_v7_15",
+    "filter_source_path": Path("debug") / "background_snapshot_pool_slowlane0",
+    "filter_out_path": Path("debug") / "background_snapshot_pool_slowlane0_x0_400_v7_15",
     # Optional shard filter for offline filtering. filter_offsets uses seconds
     # and is converted to the internal key scale, e.g. 20.0 -> "20000".
     "filter_offsets": [20.0],
     "filter_offset_keys": None,
-    "filter_ego_x_range": [0.0, 200.0],
+    "filter_ego_x_range": [0.0, 400.0],
     "filter_ego_speed_range": [7.0, 15.0],
     "filter_chunk_size": 500,
     "filter_overwrite": True,

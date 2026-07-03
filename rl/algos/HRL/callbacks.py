@@ -100,6 +100,8 @@ class HIROLoggingCallback(BaseCallback):
             "punctual_reward",
             "wrong_lane_terminal_penalty",
             "invalid_goal_penalty",
+            "goal_endpoint_penalty",
+            "goal_comfort_prior_penalty",
         ]
 
         self._traj_csv_enabled = (self.csv_log_freq > 0 or self.high_transition_csv_all > 0) and bool(self.csv_save_dir)
@@ -176,6 +178,29 @@ class HIROLoggingCallback(BaseCallback):
                     "high_comp_goal_lane_dense_reward",
                     "high_comp_punctual_reward",
                     "high_comp_wrong_lane_terminal_penalty",
+                    "high_comp_invalid_goal_penalty",
+                    "high_comp_goal_endpoint_penalty",
+                    "high_comp_goal_comfort_prior_penalty",
+                    "high_goal_selected_component",
+                    "high_goal_endpoint_frac",
+                    "high_goal_endpoint_penalty",
+                    "high_goal_comfort_prior_penalty",
+                    "high_goal_comfort_prior_accel",
+                    "high_goal_comfort_prior_cost",
+                    "policy_distribution",
+                    "policy_selected_component",
+                    "policy_valid_mask",
+                    "policy_lateral_probs",
+                    "policy_beta_u",
+                    "policy_beta_alpha_selected",
+                    "policy_beta_beta_selected",
+                    "policy_x_norm",
+                    "policy_y_code",
+                    "policy_raw_x_norm",
+                    "policy_raw_y_code",
+                    "policy_log_prob",
+                    "policy_log_prob_k",
+                    "policy_log_prob_x",
                     "low_seq_collision_reward",
                     "low_seq_progress_reward",
                     "low_seq_speed_ref_aux_reward",
@@ -184,6 +209,9 @@ class HIROLoggingCallback(BaseCallback):
                     "low_seq_goal_lane_dense_reward",
                     "low_seq_punctual_reward",
                     "low_seq_wrong_lane_terminal_penalty",
+                    "low_seq_invalid_goal_penalty",
+                    "low_seq_goal_endpoint_penalty",
+                    "low_seq_goal_comfort_prior_penalty",
                     "low_seq_ego_acceleration",
                     "next_high_obs",
                     "done_env",
@@ -208,7 +236,44 @@ class HIROLoggingCallback(BaseCallback):
                 "high_obs",
                 "kin",
                 "goal_action",
+                "goal_action_raw",
+                "goal_buffer_action",
                 "goal_phys",
+                "high_goal_selected_component",
+                "high_goal_invalid_selected",
+                "high_goal_shielded",
+                "high_goal_endpoint_frac",
+                "high_goal_endpoint_penalty",
+                "high_goal_comfort_prior_penalty",
+                "high_goal_comfort_prior_accel",
+                "high_goal_comfort_prior_cost",
+                "policy_distribution",
+                "policy_selected_component",
+                "policy_selected_component_base",
+                "policy_selected_component_fallback",
+                "policy_feasible_any",
+                "policy_fallback_to_base",
+                "policy_valid_selected",
+                "policy_valid_selected_base",
+                "policy_use_fallback",
+                "policy_valid_mask",
+                "policy_lateral_logits",
+                "policy_lateral_probs",
+                "policy_beta_alpha",
+                "policy_beta_beta",
+                "policy_beta_alpha_selected",
+                "policy_beta_beta_selected",
+                "policy_beta_u",
+                "policy_x_norm",
+                "policy_y_code",
+                "policy_raw_x_norm",
+                "policy_raw_y_code",
+                "policy_log_prob",
+                "policy_log_prob_k",
+                "policy_log_prob_x",
+                "policy_log_prob_lateral",
+                "policy_log_prob_vx",
+                "policy_log_prob_other",
                 "safe_l1",
                 "safe_u1",
                 "safe_l2",
@@ -708,6 +773,8 @@ class HIROLoggingCallback(BaseCallback):
         }
         comp["comfort_reward_for_high"] = float(rc.get("comfort_reward", 0.0))
         comp["invalid_goal_penalty"] = float(rc.get("invalid_goal_penalty", 0.0))
+        comp["goal_endpoint_penalty"] = float(rc.get("goal_endpoint_penalty", 0.0))
+        comp["goal_comfort_prior_penalty"] = float(rc.get("goal_comfort_prior_penalty", 0.0))
         return comp
 
     def _to_physical_acc(self, a1: float) -> float:
@@ -1330,11 +1397,34 @@ class HIROLoggingCallback(BaseCallback):
             and self._traj_csv_enabled
             and infos
         ):
+            c_arr_for_endpoint = np.asarray(loc.get("c", []), dtype=np.int32).reshape(-1)
+            endpoint_penalty_arr = np.asarray(
+                loc.get("high_goal_endpoint_penalty", []),
+                dtype=np.float32,
+            ).reshape(-1)
+            comfort_prior_penalty_arr = np.asarray(
+                loc.get("high_goal_comfort_prior_penalty", []),
+                dtype=np.float32,
+            ).reshape(-1)
+            shield_penalty_arr = np.asarray(
+                loc.get("high_goal_shield_penalty", []),
+                dtype=np.float32,
+            ).reshape(-1)
             for env_i in self._csv_env_indices(len(infos)):
                 if env_i >= replay_mask.size or not bool(replay_mask[env_i]) or not self._capture_active(env_i):
                     continue
                 rc_i = infos[env_i].get("reward_components", {}) if isinstance(infos[env_i], dict) else {}
                 eff_i = self._effective_high_components(rc_i)
+                if (
+                    env_i < c_arr_for_endpoint.size
+                    and int(c_arr_for_endpoint[env_i]) == 0
+                ):
+                    if env_i < shield_penalty_arr.size:
+                        eff_i["invalid_goal_penalty"] += float(shield_penalty_arr[env_i])
+                    if env_i < endpoint_penalty_arr.size:
+                        eff_i["goal_endpoint_penalty"] += float(endpoint_penalty_arr[env_i])
+                    if env_i < comfort_prior_penalty_arr.size:
+                        eff_i["goal_comfort_prior_penalty"] += float(comfort_prior_penalty_arr[env_i])
                 comp_seq = self._hi_comp_seq_by_env.setdefault(env_i, {k: [] for k in self.high_comp_keys})
                 for k in self.high_comp_keys:
                     comp_seq.setdefault(k, []).append(float(eff_i.get(k, 0.0)))
@@ -1363,8 +1453,45 @@ class HIROLoggingCallback(BaseCallback):
                 high_obs = np.asarray(loc.get("high_obs", []), dtype=np.float32)
                 kin = np.asarray(loc.get("kin", []), dtype=np.float32)
                 goal_action = np.asarray(loc.get("goal_action", []), dtype=np.float32)
+                goal_action_raw = np.asarray(loc.get("goal_action_raw", []), dtype=np.float32)
+                goal_buffer_action = np.asarray(loc.get("goal_buffer_action", []), dtype=np.float32)
                 goal_phys = np.asarray(loc.get("goal_phys", []), dtype=np.float32)
                 seg_id = np.asarray(loc.get("seg_id", []), dtype=np.int64).reshape(-1)
+                high_goal_selected_component = np.asarray(
+                    loc.get("high_goal_selected_component", []),
+                    dtype=np.int64,
+                ).reshape(-1)
+                high_goal_invalid_selected = np.asarray(
+                    loc.get("high_goal_invalid_selected", []),
+                    dtype=np.int32,
+                ).reshape(-1)
+                high_goal_shielded = np.asarray(
+                    loc.get("high_goal_shielded", []),
+                    dtype=np.int32,
+                ).reshape(-1)
+                high_goal_endpoint_frac = np.asarray(
+                    loc.get("high_goal_endpoint_frac", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_goal_endpoint_penalty = np.asarray(
+                    loc.get("high_goal_endpoint_penalty", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_goal_comfort_prior_penalty = np.asarray(
+                    loc.get("high_goal_comfort_prior_penalty", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_goal_comfort_prior_accel = np.asarray(
+                    loc.get("high_goal_comfort_prior_accel", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_goal_comfort_prior_cost = np.asarray(
+                    loc.get("high_goal_comfort_prior_cost", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_policy_debug = loc.get("high_policy_debug", {})
+                if not isinstance(high_policy_debug, dict):
+                    high_policy_debug = {}
 
                 safe_bounds = None
                 safe_dx_l2 = None
@@ -1517,6 +1644,50 @@ class HIROLoggingCallback(BaseCallback):
                     if safe_dx_u2 is not None:
                         safe_dx_u2_row = np.asarray(safe_dx_u2, dtype=np.float32)[p:p + 1]
 
+                    def dbg_scalar(key: str, default: float = np.nan) -> float:
+                        arr = high_policy_debug.get(key)
+                        if arr is None:
+                            return float(default)
+                        try:
+                            arr_np = np.asarray(arr)
+                            if arr_np.ndim >= 1 and arr_np.shape[0] > int(env_i):
+                                return float(arr_np[int(env_i)])
+                        except Exception:
+                            return float(default)
+                        return float(default)
+
+                    def dbg_int(key: str, default: int = -1) -> int:
+                        arr = high_policy_debug.get(key)
+                        if arr is None:
+                            return int(default)
+                        try:
+                            arr_np = np.asarray(arr)
+                            if arr_np.ndim >= 1 and arr_np.shape[0] > int(env_i):
+                                return int(arr_np[int(env_i)])
+                        except Exception:
+                            return int(default)
+                        return int(default)
+
+                    def dbg_arr(key: str) -> str:
+                        arr = high_policy_debug.get(key)
+                        if arr is None:
+                            return "[]"
+                        try:
+                            arr_np = np.asarray(arr)
+                            if arr_np.ndim >= 1 and arr_np.shape[0] > int(env_i):
+                                return self._json_arr(arr_np[int(env_i)])
+                        except Exception:
+                            return "[]"
+                        return "[]"
+
+                    policy_distribution = ""
+                    try:
+                        policy_dist_arr = np.asarray(high_policy_debug.get("policy_distribution", []), dtype=object)
+                        if policy_dist_arr.ndim >= 1 and policy_dist_arr.shape[0] > int(env_i):
+                            policy_distribution = str(policy_dist_arr[int(env_i)])
+                    except Exception:
+                        policy_distribution = ""
+
                     debug_row = [
                         self._hi_start_seen,
                         self._hi_start_saved,
@@ -1529,7 +1700,44 @@ class HIROLoggingCallback(BaseCallback):
                         self._json_arr(high_obs[int(env_i)]) if high_obs.ndim == 2 and high_obs.shape[0] > int(env_i) else "[]",
                         self._json_arr(kin[int(env_i)]) if kin.ndim == 3 and kin.shape[0] > int(env_i) else "[]",
                         self._json_arr(goal_action[int(env_i)]) if goal_action.ndim == 2 and goal_action.shape[0] > int(env_i) else "[]",
+                        self._json_arr(goal_action_raw[int(env_i)]) if goal_action_raw.ndim == 2 and goal_action_raw.shape[0] > int(env_i) else "[]",
+                        self._json_arr(goal_buffer_action[int(env_i)]) if goal_buffer_action.ndim == 2 and goal_buffer_action.shape[0] > int(env_i) else "[]",
                         self._json_arr(goal_phys[int(env_i)]) if goal_phys.ndim == 2 and goal_phys.shape[0] > int(env_i) else "[]",
+                        int(high_goal_selected_component[int(env_i)]) if high_goal_selected_component.size > int(env_i) else -1,
+                        int(high_goal_invalid_selected[int(env_i)]) if high_goal_invalid_selected.size > int(env_i) else -1,
+                        int(high_goal_shielded[int(env_i)]) if high_goal_shielded.size > int(env_i) else -1,
+                        float(high_goal_endpoint_frac[int(env_i)]) if high_goal_endpoint_frac.size > int(env_i) else np.nan,
+                        float(high_goal_endpoint_penalty[int(env_i)]) if high_goal_endpoint_penalty.size > int(env_i) else np.nan,
+                        float(high_goal_comfort_prior_penalty[int(env_i)]) if high_goal_comfort_prior_penalty.size > int(env_i) else np.nan,
+                        float(high_goal_comfort_prior_accel[int(env_i)]) if high_goal_comfort_prior_accel.size > int(env_i) else np.nan,
+                        float(high_goal_comfort_prior_cost[int(env_i)]) if high_goal_comfort_prior_cost.size > int(env_i) else np.nan,
+                        policy_distribution,
+                        dbg_int("selected_component"),
+                        dbg_int("selected_component_base"),
+                        dbg_int("selected_component_fallback"),
+                        dbg_int("feasible_any"),
+                        dbg_int("fallback_to_base"),
+                        dbg_int("valid_selected"),
+                        dbg_int("valid_selected_base"),
+                        dbg_int("use_fallback"),
+                        dbg_arr("valid_mask"),
+                        dbg_arr("lateral_logits"),
+                        dbg_arr("lateral_probs"),
+                        dbg_arr("beta_alpha"),
+                        dbg_arr("beta_beta"),
+                        dbg_scalar("beta_alpha_selected"),
+                        dbg_scalar("beta_beta_selected"),
+                        dbg_scalar("beta_u"),
+                        dbg_scalar("x_norm"),
+                        dbg_scalar("y_code"),
+                        dbg_scalar("raw_x_norm"),
+                        dbg_scalar("raw_y_code"),
+                        dbg_scalar("log_prob"),
+                        dbg_scalar("log_prob_k"),
+                        dbg_scalar("log_prob_x"),
+                        dbg_scalar("log_prob_lateral"),
+                        dbg_scalar("log_prob_vx"),
+                        dbg_scalar("log_prob_other"),
                         self._json_arr(safe_l1),
                         self._json_arr(safe_u1),
                         self._json_arr(safe_l2),
@@ -1578,6 +1786,33 @@ class HIROLoggingCallback(BaseCallback):
                 next_high_obs = np.asarray(loc.get("next_high_obs", []), dtype=np.float32)
                 done_env = np.asarray(loc.get("done", False), dtype=bool).reshape(-1)
                 seg_id = np.asarray(loc.get("seg_id", np.full_like(done_low, -1)), dtype=np.int64).reshape(-1)
+                high_goal_selected_component = np.asarray(
+                    loc.get("high_goal_selected_component", []),
+                    dtype=np.int64,
+                ).reshape(-1)
+                high_goal_endpoint_frac = np.asarray(
+                    loc.get("high_goal_endpoint_frac", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_goal_endpoint_penalty = np.asarray(
+                    loc.get("high_goal_endpoint_penalty", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_goal_comfort_prior_penalty = np.asarray(
+                    loc.get("high_goal_comfort_prior_penalty", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_goal_comfort_prior_accel = np.asarray(
+                    loc.get("high_goal_comfort_prior_accel", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_goal_comfort_prior_cost = np.asarray(
+                    loc.get("high_goal_comfort_prior_cost", []),
+                    dtype=np.float32,
+                ).reshape(-1)
+                high_policy_debug = loc.get("high_policy_debug", {})
+                if not isinstance(high_policy_debug, dict):
+                    high_policy_debug = {}
 
                 if (
                     high_obs_start.ndim == 2
@@ -1598,6 +1833,50 @@ class HIROLoggingCallback(BaseCallback):
                         comp_sums = {k: float(np.sum(np.asarray(comp_seq.get(k, []), dtype=np.float32))) for k in self.high_comp_keys}
                         comp_sum_total = float(sum(comp_sums.values()))
 
+                        def dbg_transition_scalar(key: str, default: float = np.nan) -> float:
+                            arr = high_policy_debug.get(key)
+                            if arr is None:
+                                return float(default)
+                            try:
+                                arr_np = np.asarray(arr)
+                                if arr_np.ndim >= 1 and arr_np.shape[0] > int(env_i):
+                                    return float(arr_np[int(env_i)])
+                            except Exception:
+                                return float(default)
+                            return float(default)
+
+                        def dbg_transition_int(key: str, default: int = -1) -> int:
+                            arr = high_policy_debug.get(key)
+                            if arr is None:
+                                return int(default)
+                            try:
+                                arr_np = np.asarray(arr)
+                                if arr_np.ndim >= 1 and arr_np.shape[0] > int(env_i):
+                                    return int(arr_np[int(env_i)])
+                            except Exception:
+                                return int(default)
+                            return int(default)
+
+                        def dbg_transition_arr(key: str) -> str:
+                            arr = high_policy_debug.get(key)
+                            if arr is None:
+                                return "[]"
+                            try:
+                                arr_np = np.asarray(arr)
+                                if arr_np.ndim >= 1 and arr_np.shape[0] > int(env_i):
+                                    return self._json_arr(arr_np[int(env_i)])
+                            except Exception:
+                                return "[]"
+                            return "[]"
+
+                        policy_distribution = ""
+                        try:
+                            policy_dist_arr = np.asarray(high_policy_debug.get("policy_distribution", []), dtype=object)
+                            if policy_dist_arr.ndim >= 1 and policy_dist_arr.shape[0] > int(env_i):
+                                policy_distribution = str(policy_dist_arr[int(env_i)])
+                        except Exception:
+                            policy_distribution = ""
+
                         row_h = [
                             int(getattr(self.model, "num_timesteps", 0)),
                             int(env_i),
@@ -1614,6 +1893,29 @@ class HIROLoggingCallback(BaseCallback):
                             comp_sums["goal_lane_dense_reward"],
                             comp_sums["punctual_reward"],
                             comp_sums["wrong_lane_terminal_penalty"],
+                            comp_sums["invalid_goal_penalty"],
+                            comp_sums["goal_endpoint_penalty"],
+                            comp_sums["goal_comfort_prior_penalty"],
+                            int(high_goal_selected_component[env_i]) if high_goal_selected_component.size > env_i else -1,
+                            float(high_goal_endpoint_frac[env_i]) if high_goal_endpoint_frac.size > env_i else np.nan,
+                            float(high_goal_endpoint_penalty[env_i]) if high_goal_endpoint_penalty.size > env_i else np.nan,
+                            float(high_goal_comfort_prior_penalty[env_i]) if high_goal_comfort_prior_penalty.size > env_i else np.nan,
+                            float(high_goal_comfort_prior_accel[env_i]) if high_goal_comfort_prior_accel.size > env_i else np.nan,
+                            float(high_goal_comfort_prior_cost[env_i]) if high_goal_comfort_prior_cost.size > env_i else np.nan,
+                            policy_distribution,
+                            dbg_transition_int("selected_component"),
+                            dbg_transition_arr("valid_mask"),
+                            dbg_transition_arr("lateral_probs"),
+                            dbg_transition_scalar("beta_u"),
+                            dbg_transition_scalar("beta_alpha_selected"),
+                            dbg_transition_scalar("beta_beta_selected"),
+                            dbg_transition_scalar("x_norm"),
+                            dbg_transition_scalar("y_code"),
+                            dbg_transition_scalar("raw_x_norm"),
+                            dbg_transition_scalar("raw_y_code"),
+                            dbg_transition_scalar("log_prob"),
+                            dbg_transition_scalar("log_prob_k"),
+                            dbg_transition_scalar("log_prob_x"),
                             self._json_arr(comp_seq.get("collision_reward", [])),
                             self._json_arr(comp_seq.get("progress_reward", [])),
                             self._json_arr(comp_seq.get("speed_ref_aux_reward", [])),
@@ -1622,6 +1924,9 @@ class HIROLoggingCallback(BaseCallback):
                             self._json_arr(comp_seq.get("goal_lane_dense_reward", [])),
                             self._json_arr(comp_seq.get("punctual_reward", [])),
                             self._json_arr(comp_seq.get("wrong_lane_terminal_penalty", [])),
+                            self._json_arr(comp_seq.get("invalid_goal_penalty", [])),
+                            self._json_arr(comp_seq.get("goal_endpoint_penalty", [])),
+                            self._json_arr(comp_seq.get("goal_comfort_prior_penalty", [])),
                             self._json_arr(self._hi_acc_seq_by_env.get(env_i, [])),
                             self._json_arr(next_high_obs[env_i]),
                             int(done_env[env_i]) if done_env.size > env_i else 0,

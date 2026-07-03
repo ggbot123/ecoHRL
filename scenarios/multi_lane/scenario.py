@@ -402,11 +402,12 @@ class MultiLaneEnv(AbstractEnv):
             or self._goal_longitudinal_reached()
             # or self._goal_reached()
             or not self.vehicle.on_road
+            or self.time >= self.config["duration"]
         )
 
     def _is_truncated(self) -> bool:
-        """The episode is truncated if the episode time limit is reached."""
-        return self.time >= self.config["duration"]
+        """Duration is treated as a regular terminal condition in this task."""
+        return False
 
     def _wrong_lane_terminal_triggered(self) -> bool:
         longitudinal_reached = self._goal_longitudinal_reached()
@@ -805,7 +806,9 @@ class MultiLaneEnv(AbstractEnv):
             cache.popitem(last=False)
         return snapshots
 
-    def _background_snapshot_selected_offset_key(self) -> str | None:
+    def _background_snapshot_selected_offset_key(self, meta: dict[str, Any] | None = None) -> str | None:
+        if isinstance(meta, dict) and str(meta.get("scenario_name", "")).strip() == "multi_lane":
+            return None
         selected_offset_raw = self.config.get("background_snapshot_phase_offset", None)
         if selected_offset_raw is None:
             selected_offset_raw = self.config.get("background_snapshot_offset", None)
@@ -820,7 +823,7 @@ class MultiLaneEnv(AbstractEnv):
         path: Path,
         meta: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], np.ndarray]:
-        selected_offset_key = self._background_snapshot_selected_offset_key()
+        selected_offset_key = self._background_snapshot_selected_offset_key(meta)
         cached_path = getattr(self, "_background_snapshot_chunk_index_path", None)
         cached_offset_key = getattr(self, "_background_snapshot_chunk_index_offset_key", None)
         cached_chunks = getattr(self, "_background_snapshot_chunk_index_chunks", None)
@@ -885,7 +888,7 @@ class MultiLaneEnv(AbstractEnv):
             self._background_snapshot_meta_cache_path = str(path)
             self._background_snapshot_meta = meta
 
-        selected_offset_key = self._background_snapshot_selected_offset_key()
+        selected_offset_key = self._background_snapshot_selected_offset_key(meta)
         if bool(self.config.get("background_snapshot_chunk_reuse_enabled", False)):
             active_path = getattr(self, "_background_snapshot_active_chunk_path", None)
             active_offset_key = getattr(self, "_background_snapshot_active_chunk_offset_key", None)

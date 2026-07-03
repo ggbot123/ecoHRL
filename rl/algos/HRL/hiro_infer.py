@@ -240,6 +240,22 @@ class HIROPolicyRunner:
                     if self._high_goal_infeasible_mode() == "shield_penalty"
                     else "reroute"
                 )
+            if hasattr(high_actor, "categorical_beta_gumbel_temperature"):
+                high_actor.categorical_beta_gumbel_temperature = float(
+                    getattr(self.cfg, "high_goal_categorical_beta_gumbel_temperature", 1.0)
+                )
+            if hasattr(high_actor, "categorical_beta_min_concentration"):
+                high_actor.categorical_beta_min_concentration = float(
+                    getattr(self.cfg, "high_goal_categorical_beta_min_concentration", 1.1)
+                )
+            if hasattr(high_actor, "categorical_beta_u_eps"):
+                high_actor.categorical_beta_u_eps = float(
+                    getattr(self.cfg, "high_goal_categorical_beta_u_eps", 1e-4)
+                )
+            if hasattr(high_actor, "categorical_beta_include_x_jacobian"):
+                high_actor.categorical_beta_include_x_jacobian = bool(
+                    getattr(self.cfg, "high_goal_categorical_beta_include_x_jacobian", False)
+                )
 
         intrinsic_norm = getattr(self.cfg, "intrinsic_norm_ranges", None)
         self.norm_ranges = np.asarray(intrinsic_norm, dtype=np.float32)

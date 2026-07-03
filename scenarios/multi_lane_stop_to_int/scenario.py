@@ -1113,10 +1113,105 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             setattr(vehicle, str(attr), self._snapshot_scalar(value))
         return vehicle
 
+    def _snapshot_ego_candidate_indices(self, vehicles: list[dict[str, Any]]) -> list[int]:
+        x_range = self.config.get("low_snapshot_ego_x_range", None)
+        if x_range is None:
+            x_range = [0.0, float(self.config["road_length"]) - 50.0]
+        speed_range = self.config.get("low_snapshot_ego_speed_range", None)
+        if speed_range is None:
+            speed_range = [0.0, float(self.config["speed_limit"])]
+        x_min, x_max = x_range
+        speed_min, speed_max = speed_range
+        candidates: list[int] = []
+        for i, data in enumerate(vehicles):
+            if bool(data.get("crashed", False)):
+                continue
+            lane_index = self._snapshot_lane_index(data.get("lane_index", None))
+            if lane_index is None or lane_index[2] is None:
+                continue
+            if not (0 <= int(lane_index[2]) < int(self.config["lanes_count"])):
+                continue
+            pos = np.asarray(data.get("position", [np.nan, np.nan]), dtype=float)
+            speed = float(data.get("speed", 0.0))
+            if pos.size < 2 or not np.all(np.isfinite(pos[:2])):
+                continue
+            if (
+                float(x_min) <= float(pos[0]) <= float(x_max)
+                and float(speed_min) <= speed <= float(speed_max)
+            ):
+                candidates.append(i)
+        return candidates
+
+    def _make_ego_from_snapshot_vehicle(self, data: dict[str, Any]):
+        position = np.asarray(data.get("position", [0.0, 0.0]), dtype=float).copy()
+        heading = float(data.get("heading", 0.0))
+        speed = float(data.get("speed", 0.0))
+        lane_index = self._snapshot_lane_index(data.get("lane_index", None))
+        if lane_index is None:
+            lane_index = self.road.network.get_closest_lane_index(position, heading)
+        target_lane_index = self._snapshot_lane_index(data.get("target_lane_index", lane_index))
+        route = self._snapshot_route(data.get("route", None))
+        target_speed = float(data.get("target_speed", speed))
+
+        try:
+            ego = self.action_type.vehicle_class(
+                self.road,
+                position,
+                heading,
+                speed,
+                target_lane_index=target_lane_index,
+                target_speed=target_speed,
+                route=route,
+            )
+        except TypeError:
+            ego = self.action_type.vehicle_class(self.road, position, heading, speed)
+
+        ego.lane_index = lane_index
+        ego.lane = self.road.network.get_lane(lane_index)
+        ego.target_lane_index = target_lane_index or lane_index
+        if route is not None:
+            ego.route = list(route)
+        ego.target_speed = target_speed
+        ego.action = dict(data.get("action", {}) or {"steering": 0.0, "acceleration": 0.0})
+        if data.get("movement_direction", None) is not None:
+            ego.movement_direction = str(data["movement_direction"])
+        if int(data.get("vid", -1)) >= 0:
+            ego.vid = int(data["vid"])
+        for attr, value in dict(data.get("attrs", {}) or {}).items():
+            setattr(ego, str(attr), self._snapshot_scalar(value))
+        return ego
+
     def _reset_from_background_snapshot(self) -> bool:
-        snapshot = self._sample_background_snapshot()
-        if not isinstance(snapshot, dict):
-            raise ValueError("Background snapshot entries must be dictionaries")
+        use_ego_from_background = bool(self.config.get("low_snapshot_ego_from_background", False))
+        max_attempts = max(
+            1,
+            int(self.config.get("background_snapshot_max_resample_attempts", 64)),
+        )
+        last_error = "no snapshot sampled"
+        snapshot: dict[str, Any] | None = None
+        vehicles_data: list[dict[str, Any]] = []
+        ego_index = None
+        for _ in range(max_attempts):
+            sampled = self._sample_background_snapshot()
+            if not isinstance(sampled, dict):
+                last_error = "background snapshot entries must be dictionaries"
+                continue
+            sampled_vehicles = list(sampled.get("vehicles", []) or [])
+            if use_ego_from_background:
+                candidates = self._snapshot_ego_candidate_indices(sampled_vehicles)
+                if not candidates:
+                    last_error = "no valid ego candidate found in background snapshot"
+                    continue
+                ego_index = int(candidates[int(self.np_random.integers(len(candidates)))])
+            snapshot = sampled
+            vehicles_data = sampled_vehicles
+            break
+
+        if snapshot is None:
+            raise ValueError(
+                "Failed to sample a usable background snapshot after "
+                f"{max_attempts} attempts: {last_error}"
+            )
 
         snapshot_signature = snapshot.get("config_signature", None)
         if isinstance(snapshot_signature, dict) and "behavior_lane_probs" in snapshot_signature:
@@ -1136,19 +1231,43 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             self._signal_time_global = (phase - cycle_offset) % cycle if cycle > 1e-9 else phase
 
         max_vid = int(snapshot.get("vid", self.config.get("vid", 0)))
-        for vehicle_data in list(snapshot.get("vehicles", []) or []):
+        if ego_index is not None:
+            lane_index = self._snapshot_lane_index(vehicles_data[ego_index].get("lane_index", None))
+            if lane_index is not None and lane_index[2] is not None:
+                self._episode_initial_lane_id = int(lane_index[2])
+                self._episode_goal_lane_id = self._sample_goal_lane_id()
+
+        for i, vehicle_data in enumerate(vehicles_data):
+            if ego_index is not None and i == ego_index:
+                continue
             vehicle = self._vehicle_from_background_snapshot(vehicle_data)
             self.road.vehicles.append(vehicle)
             max_vid = max(max_vid, int(getattr(vehicle, "vid", -1)))
-        self.config["vid"] = max(int(self.config.get("vid", 0)), max_vid)
 
         self.time = 0.0
         self.steps = 0
         self._signal_episode_base = float(self._signal_time_global)
         self._sync_episode_punctual_time()
-        self._create_ego()
+        if ego_index is None:
+            self.config["vid"] = max(int(self.config.get("vid", 0)), max_vid)
+            self._create_ego()
+        else:
+            ego = self._make_ego_from_snapshot_vehicle(vehicles_data[ego_index])
+            self.vehicle = ego
+            self.controlled_vehicles = [ego]
+            self.road.vehicles.append(ego)
+            max_vid = max(max_vid, int(getattr(ego, "vid", -1)))
+            self.config["vid"] = max(int(self.config.get("vid", 0)), max_vid)
+            self._last_speed = float(getattr(ego, "speed", 0.0))
+            self._last_longitudinal = float(np.asarray(ego.position, dtype=float)[0])
+            self._last_lane_id = int(getattr(ego, "lane_index", ("0", "1", self._initial_lane_id()))[2])
+            self._has_arrived = False
+            self._arrival_time = None
+            self._queue_takeover_active = False
+            self._queue_takeover_enter_count = 0
         self._episodes_started += 1
         self._did_global_warmup = True
+        self._background_only_sim_time = float(snapshot.get("snapshot_time", 0.0))
         self._mark_signal_green_launch_reset_vehicles()
         self._update_signal_virtual_stops(query_time=0.0)
         return True
@@ -2018,11 +2137,12 @@ class MultiLaneStopToIntEnv(AbstractEnv):
             self.vehicle.crashed
             or self._goal_longitudinal_reached()
             or not self.vehicle.on_road
+            or self.time >= self.config["duration"]
         )
 
     def _is_truncated(self) -> bool:
-        """The episode is truncated if the episode time limit is reached."""
-        return self.time >= self.config["duration"]
+        """Duration is treated as a regular terminal condition in this task."""
+        return False
 
     def _wrong_lane_terminal_triggered(self) -> bool:
         longitudinal_reached = self._goal_longitudinal_reached()

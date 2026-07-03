@@ -135,7 +135,9 @@ def _configure_low_snapshot_training(env, cfg: Any, train_mode: str) -> bool:
         cfg_new["duration"] = float(duration_hi * high_interval) / max(policy_frequency, 1e-6)
         cfg_new["inter_episode_as_steps"] = False
         cfg_new["warmup_each_episode"] = False
-        env.set_attr("config", cfg_new, indices=i)
+        if not hasattr(env, "env_method"):
+            raise RuntimeError("low_snapshot_training requires a VecEnv with env_method support")
+        env.env_method("set_config", cfg_new, indices=i)
 
     print(
         "[HIRO Trainer] Enabled low snapshot training: "
@@ -258,7 +260,9 @@ def train_hiro(
         for i, cfg_i in enumerate(cfg_list):
             cfg_new = dict(cfg_i)
             cfg_new["ego_speed_range"] = [8.0, 12.0]
-            env.set_attr("config", cfg_new, indices=i)
+            if not hasattr(env, "env_method"):
+                raise RuntimeError("speed_near_cruise sampler requires a VecEnv with env_method support")
+            env.env_method("set_config", cfg_new, indices=i)
         print("[HIRO Trainer] Enabled ego_speed_range=[8,12] for speed_near_cruise sampler")
 
     checkpoint_save_freq = 50_000

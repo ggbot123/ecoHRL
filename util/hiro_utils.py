@@ -5,6 +5,8 @@ from copy import deepcopy
 from dataclasses import MISSING, asdict, fields
 from typing import Any, Dict, Mapping, Optional, Tuple, Type
 
+from stable_baselines3.common.buffers import ReplayBuffer
+
 from rl.algos.sac.sac import SAC
 from rl.algos.HRL.goal_samplers import GoalSamplerConfig
 from rl.algos.HRL.hiro import HIROConfig, HighGoalSafetyConfig, LowSafetyFilterConfig
@@ -232,16 +234,33 @@ def load_hiro_models(
     high_dir = high_model_dir or model_dir
     low_dir = low_model_dir or model_dir
     suffix = model_suffix or "final"
-    high_name = f"hiro_high_{suffix}"
-    low_name = f"hiro_low_{suffix}"
-    high_path = os.path.join(high_dir, f"{high_name}.zip")
-    low_path = os.path.join(low_dir, f"{low_name}.zip")
-    return SAC.load(high_path), SAC.load(low_path)
+    high_path = hiro_checkpoint_path(high_dir, "hiro_high", suffix)
+    low_path = hiro_checkpoint_path(low_dir, "hiro_low", suffix)
+    return SAC.load(high_path), load_hiro_low_model(low_dir, suffix)
+
+
+def hiro_checkpoint_path(model_dir: str, prefix: str, model_suffix: str = "final") -> str:
+    suffix = str(model_suffix or "final")
+    stem, ext = os.path.splitext(suffix)
+    if ext.lower() == ".zip":
+        suffix = stem
+    if not os.path.basename(suffix).startswith(f"{prefix}_"):
+        suffix = f"{prefix}_{suffix}"
+    return os.path.join(model_dir, f"{suffix}.zip")
 
 
 def load_hiro_high_model(model_dir: str, model_suffix: str = "final") -> SAC:
-    return SAC.load(os.path.join(model_dir, f"hiro_high_{model_suffix}.zip"))
+    return SAC.load(hiro_checkpoint_path(model_dir, "hiro_high", model_suffix))
 
 
 def load_hiro_low_model(model_dir: str, model_suffix: str = "final") -> SAC:
-    return SAC.load(os.path.join(model_dir, f"hiro_low_{model_suffix}.zip"))
+    return SAC.load(
+        hiro_checkpoint_path(model_dir, "hiro_low", model_suffix),
+        # Inference does not need the saved HER replay buffer. Replacing it keeps
+        # old checkpoints compatible after HiROLowHERReplayBuffer gained required
+        # constructor args such as obs_extra_dim and high_interval.
+        custom_objects={
+            "replay_buffer_class": ReplayBuffer,
+            "replay_buffer_kwargs": {},
+        },
+    )
