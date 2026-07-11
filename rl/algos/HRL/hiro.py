@@ -46,6 +46,19 @@ def _make_dummy_vec_env(obs_space: gym.spaces.Box, act_space: gym.spaces.Box, n_
     return DummyVecEnv([(lambda: DummyEnv(obs_space, act_space)) for _ in range(int(n_envs))])
 
 
+def _sac_replay_buffer_custom_objects(sac_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Use the current run's replay-buffer config when loading pretrained SAC.
+
+    Older HiRO low-level checkpoints may have saved a HiROLowHERReplayBuffer
+    constructor with a smaller keyword set. SB3 rebuilds the replay buffer before
+    loading weights, so overriding these fields keeps old checkpoints usable.
+    """
+    return {
+        "replay_buffer_class": sac_kwargs.get("replay_buffer_class", SkipReplayBuffer),
+        "replay_buffer_kwargs": dict(sac_kwargs.get("replay_buffer_kwargs", {}) or {}),
+    }
+
+
 class HIROProgressBarCallback(ProgressBarCallback):
     """SB3 Rich progress bar driven by HIRO effective replay/train timesteps."""
 
@@ -695,6 +708,7 @@ class HIROSAC:
                     low_pretrained_path,
                     env=_make_dummy_vec_env(low_obs_space, low_act_space, low_sac_n_envs),
                     device=self.device,
+                    custom_objects=_sac_replay_buffer_custom_objects(low_sac_kwargs),
                     **low_sac_kwargs,
                 )
             else:

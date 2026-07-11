@@ -235,9 +235,10 @@ class HIROPolicyRunner:
             elif need_bind_bounds:
                 high_actor.goal_safe_sampling_enabled = False
             if hasattr(high_actor, "infeasible_action_mode"):
+                infeasible_mode = self._high_goal_infeasible_mode()
                 high_actor.infeasible_action_mode = (
                     "preserve"
-                    if self._high_goal_infeasible_mode() == "shield_penalty"
+                    if infeasible_mode in {"shield_penalty", "preserve"}
                     else "reroute"
                 )
             if hasattr(high_actor, "categorical_beta_gumbel_temperature"):
@@ -306,6 +307,8 @@ class HIROPolicyRunner:
         mode = str(getattr(self.cfg, "high_goal_infeasible_action_mode", "reroute")).lower().strip()
         if mode in {"shield", "shield_penalty", "penalty", "fallback"}:
             return "shield_penalty"
+        if mode in {"preserve", "legacy", "no_reroute", "no-reroute", "none"}:
+            return "preserve"
         return "reroute"
 
     def _goal_component_index(self, action: np.ndarray, ego_lane_idx: int, n_lanes: int) -> int:

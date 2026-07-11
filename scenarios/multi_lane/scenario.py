@@ -105,9 +105,13 @@ class MultiLaneEnv(AbstractEnv):
         - 第一次 reset：建路 + 全局 warmup 交通流 + 插入 ego；
         - 后续 reset：保留现有路网和交通流，只移除旧 ego、清理一下车流，再插入新的 ego。
         """
-        # episode
-        self._episode_initial_lane_id = self._sample_initial_lane_id()
-        self._episode_goal_lane_id = self._sample_goal_lane_id()
+        # Reset per-episode cached task choices without sampling yet.  Legacy
+        # multi_lane sampled the ego lane inside _create_ego(), after warmup had
+        # consumed background-traffic randomness; keeping that order is needed
+        # for old checkpoints/eval seeds to reproduce the same scenes.
+        for attr in ("_episode_initial_lane_id", "_episode_goal_lane_id"):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
         if bool(self.config.get("background_snapshot_reset", False)):
             self._reset_from_background_snapshot()
