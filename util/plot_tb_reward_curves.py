@@ -1,5 +1,5 @@
 import os
-from typing import List, Sequence, Tuple, Union
+from typing import Dict, List, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -7,16 +7,26 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 
 ScalarSeries = List[Tuple[int, float]]
+CachedSeriesResult = Union[Tuple[str, ScalarSeries], str]
+SeriesCache = Dict[str, Dict[str, CachedSeriesResult]]
 
 
 # ===== User Config =====
 # Multiple TensorBoard event paths (each item can be an event file or a directory).
 EVENT_PATHS = [
-    r"D:\workspace\python\ecoHRL\logs\current\sac_260403_base_SLv2_randomlane\SAC_1",
+    r"D:\workspace\python\ecoHRL\logs\current\sac_260709_base_wronglanePen_oldEnv\SAC_1",
     r"D:\workspace\python\ecoHRL\logs\current\sac_260403_withPrior_SLv2_randomlane\SAC_1",
-    r"D:\workspace\python\ecoHRL\logs\current\hiro_260331_highonly_rule_accwithSL_randomLane\hiro_high\hiro_high_1",
+    r"D:\workspace\python\ecoHRL\logs\current\sac_260613_withPrior_oldEnv_randomto2_wronglanePen_1e7\SAC_1",
     r"D:\workspace\python\ecoHRL\logs\current\hiro_260331_highonly_reachableUniformLane1_Rainbow_amax3_dmin15_10_randomlane\hiro_high\hiro_high_1",
 ]
+
+# EVENT_PATHS = [
+#     r"D:\workspace\python\ecoHRL\logs\current\hiro_260628_highonly_pretrained_uni_oldEnv_fixedHER_SLmpc_noaugObs\hiro_high\hiro_high_1",
+#     r"D:\workspace\python\ecoHRL\logs\current\hiro_260628_highonly_pretrained_uni_oldEnv_noHER_SLmpc_noaugObs\hiro_high\hiro_high_1",
+#     r"D:\workspace\python\ecoHRL\logs\current\hiro_260706_highonly_ruleReUni_oldEnv\hiro_high\hiro_high_1",
+#     # r"D:\workspace\python\ecoHRL\logs\current\hiro_260331_highonly_reachableUniformLane1_Rainbow_amax3_dmin15_10_randomlane\hiro_high\hiro_high_1",
+#     r"D:\workspace\python\ecoHRL\logs\current\hiro_260709_highonly_reUni_oldEnv\hiro_high\hiro_high_1",
+# ]
 
 # Tag to plot on one figure for all EVENT_PATHS.
 # Supports exact match first, then suffix fallback, e.g. "ep_rew" can match "rollout/ep_rew".
@@ -28,14 +38,22 @@ TAG_TO_PLOT: Union[str, List[str]] = [
 
 # Optional labels for each path. Keep same length as EVENT_PATHS; use "" to auto-name.
 RUN_LABELS = [
-    "SAC","SAC+SG","Hybrid","HRL",
+    "SAC","SAC+SG","SAC+SG+LP","HRL",
+    # "w/o. reGoal","w/o. FH_HER","w/o. lowerRL","HRL",
 ]
 
-# Output directory for generated figures. If None, defaults to current working directory.
-OUTPUT_DIR = None
+# Output directory for generated figures. Resolve from the project root so the
+# result does not depend on the working directory used to launch this script.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "results", "tb_reward_curves")
 
-# Whether to adjust ep_rew as: ep_rew - speed_ref_aux_reward.
+# Whether to remove the reward components listed below from ep_rew.
 ADJUST_EP_REW = True
+EP_REW_COMPONENTS_TO_EXCLUDE = [
+    "speed_ref_aux_reward",
+    "goal_lane_dense_reward",
+    "wrong_lane_terminal_penalty",
+]
 
 # Alignment mode for ep_rew adjustment:
 # "exact": only subtract when steps are exactly the same.
@@ -119,17 +137,17 @@ def normalize_tags(tag_cfg: Union[str, List[str]]) -> List[str]:
     return tags
 
 
-def adjusted_ep_rew_exact(ep_rew: ScalarSeries, speed_aux: ScalarSeries) -> ScalarSeries:
-    aux_by_step = {step: value for step, value in speed_aux}
+def subtract_component_exact(ep_rew: ScalarSeries, component: ScalarSeries) -> ScalarSeries:
+    component_by_step = {step: value for step, value in component}
     result: ScalarSeries = []
     for step, rew in ep_rew:
-        if step in aux_by_step:
-            result.append((step, rew - aux_by_step[step]))
+        if step in component_by_step:
+            result.append((step, rew - component_by_step[step]))
     return result
 
 
-def adjusted_ep_rew_previous(ep_rew: ScalarSeries, speed_aux: ScalarSeries) -> ScalarSeries:
-    if not speed_aux:
+def subtract_component_previous(ep_rew: ScalarSeries, component: ScalarSeries) -> ScalarSeries:
+    if not component:
         return []
 
     result: ScalarSeries = []
@@ -137,8 +155,8 @@ def adjusted_ep_rew_previous(ep_rew: ScalarSeries, speed_aux: ScalarSeries) -> S
     last_aux = None
 
     for step, rew in ep_rew:
-        while j < len(speed_aux) and speed_aux[j][0] <= step:
-            last_aux = speed_aux[j][1]
+        while j < len(component) and component[j][0] <= step:
+            last_aux = component[j][1]
             j += 1
         if last_aux is not None:
             result.append((step, rew - last_aux))
@@ -147,6 +165,90 @@ def adjusted_ep_rew_previous(ep_rew: ScalarSeries, speed_aux: ScalarSeries) -> S
 
 def is_ep_rew_tag(tag_name: str) -> bool:
     return tag_name == "ep_rew" or tag_name.endswith("/ep_rew")
+
+
+def prepare_series_for_tag(
+    event_acc: EventAccumulator,
+    scalar_tags: Sequence[str],
+    tag_cfg: str,
+    event_path: str,
+) -> Tuple[str, ScalarSeries]:
+    resolved_tag = find_tag(scalar_tags, tag_cfg)
+    series = load_series(event_acc, resolved_tag)
+    if not series:
+        raise ValueError(f"No scalar points for tag '{resolved_tag}' in: {event_path}")
+
+    if ADJUST_EP_REW and is_ep_rew_tag(resolved_tag):
+        for component_name in EP_REW_COMPONENTS_TO_EXCLUDE:
+            component_tag = None
+            for candidate in (f"rollout/{component_name}", component_name):
+                try:
+                    component_tag = find_tag(scalar_tags, candidate)
+                    break
+                except ValueError:
+                    continue
+
+            if component_tag is None:
+                print(
+                    f"[warn] {event_path}: {component_name} not found; "
+                    "continuing without excluding it."
+                )
+                continue
+
+            component_series = load_series(event_acc, component_tag)
+            if ALIGN_MODE == "exact":
+                adjusted_series = subtract_component_exact(series, component_series)
+            else:
+                adjusted_series = subtract_component_previous(series, component_series)
+
+            if adjusted_series:
+                series = adjusted_series
+            else:
+                print(
+                    f"[warn] Excluding {component_name} produced no aligned "
+                    f"ep_rew points in {event_path}; keeping the current "
+                    "ep_rew series. You may try ALIGN_MODE='previous'."
+                )
+
+    return resolved_tag, series
+
+
+def build_series_cache(
+    event_paths: Sequence[str],
+    tags_to_plot: Sequence[str],
+) -> SeriesCache:
+    cache: SeriesCache = {}
+    for event_path_raw in event_paths:
+        event_path = os.path.abspath(event_path_raw)
+        if event_path in cache:
+            continue
+
+        print(f"[load] TensorBoard events: {event_path}")
+        event_acc = EventAccumulator(event_path, size_guidance={"scalars": 0})
+        event_acc.Reload()
+        scalar_tags = event_acc.Tags().get("scalars", [])
+
+        tag_cache: Dict[str, CachedSeriesResult] = {}
+        if not scalar_tags:
+            error = f"No scalar tags found in: {event_path}"
+            for tag_cfg in tags_to_plot:
+                tag_cache[tag_cfg] = error
+        else:
+            for tag_cfg in tags_to_plot:
+                try:
+                    tag_cache[tag_cfg] = prepare_series_for_tag(
+                        event_acc,
+                        scalar_tags,
+                        tag_cfg,
+                        event_path,
+                    )
+                except ValueError as exc:
+                    tag_cache[tag_cfg] = str(exc)
+
+        cache[event_path] = tag_cache
+        print(f"[loaded] TensorBoard events: {event_path}")
+
+    return cache
 
 
 def sanitize_tag_for_filename(tag: str) -> str:
@@ -202,16 +304,21 @@ def smooth_with_window_bounds(series: ScalarSeries, window: int) -> Tuple[np.nda
     if w == 1:
         return x, y, y, y
 
-    smooth = np.empty_like(y)
-    lower = np.empty_like(y)
-    upper = np.empty_like(y)
+    indices = np.arange(y.size, dtype=np.int64)
+    starts = np.maximum(indices - w + 1, 0)
+    cumulative = np.empty(y.size + 1, dtype=np.float64)
+    cumulative[0] = 0.0
+    np.cumsum(y, out=cumulative[1:])
+    counts = indices - starts + 1
+    smooth = (cumulative[indices + 1] - cumulative[starts]) / counts
 
-    for i in range(y.size):
-        start = max(0, i - w + 1)
-        seg = y[start : i + 1]
-        smooth[i] = float(np.mean(seg))
-        lower[i] = float(np.min(seg))
-        upper[i] = float(np.max(seg))
+    # The first w-1 points use expanding windows, matching the original code.
+    lower = np.minimum.accumulate(y)
+    upper = np.maximum.accumulate(y)
+    if y.size >= w:
+        windows = np.lib.stride_tricks.sliding_window_view(y, w)
+        lower[w - 1 :] = np.min(windows, axis=1)
+        upper[w - 1 :] = np.max(windows, axis=1)
 
     return x, smooth, lower, upper
 
@@ -245,6 +352,7 @@ def main() -> None:
     if str(SMOOTH_WINDOW_MODE).strip().lower() == "ratio" and SMOOTH_WINDOW_RATIO <= 0:
         raise ValueError("SMOOTH_WINDOW_RATIO must be > 0 when SMOOTH_WINDOW_MODE='ratio'.")
     tags_to_plot = normalize_tags(TAG_TO_PLOT)
+    series_cache = build_series_cache(EVENT_PATHS, tags_to_plot)
 
     output_dir = OUTPUT_DIR
     if not output_dir:
@@ -260,13 +368,6 @@ def main() -> None:
 
         for idx, event_path_raw in enumerate(EVENT_PATHS):
             event_path = os.path.abspath(event_path_raw)
-            event_acc = EventAccumulator(event_path, size_guidance={"scalars": 0})
-            event_acc.Reload()
-
-            scalar_tags = event_acc.Tags().get("scalars", [])
-            if not scalar_tags:
-                print(f"[skip] No scalar tags found in: {event_path}")
-                continue
 
             label = ""
             if RUN_LABELS:
@@ -274,43 +375,11 @@ def main() -> None:
             if not label:
                 label = auto_label(event_path)
 
-            try:
-                resolved_tag = find_tag(scalar_tags, tag_cfg)
-            except ValueError as exc:
-                print(f"[skip] {event_path}: {exc}")
+            cached_result = series_cache[event_path][tag_cfg]
+            if isinstance(cached_result, str):
+                print(f"[skip] {event_path}: {cached_result}")
                 continue
-
-            series = load_series(event_acc, resolved_tag)
-            if not series:
-                print(f"[skip] No scalar points for tag '{resolved_tag}' in: {event_path}")
-                continue
-
-            if ADJUST_EP_REW and is_ep_rew_tag(resolved_tag):
-                speed_aux_tag = None
-                try:
-                    speed_aux_tag = find_tag(scalar_tags, "rollout/speed_ref_aux_reward")
-                except ValueError:
-                    try:
-                        speed_aux_tag = find_tag(scalar_tags, "speed_ref_aux_reward")
-                    except ValueError:
-                        speed_aux_tag = None
-
-                if speed_aux_tag is None:
-                    print(f"[warn] {event_path}: speed_ref_aux_reward not found, using raw ep_rew.")
-                else:
-                    speed_aux_series = load_series(event_acc, speed_aux_tag)
-                    if ALIGN_MODE == "exact":
-                        adjusted_series = adjusted_ep_rew_exact(series, speed_aux_series)
-                    else:
-                        adjusted_series = adjusted_ep_rew_previous(series, speed_aux_series)
-
-                    if adjusted_series:
-                        series = adjusted_series
-                    else:
-                        print(
-                            f"[warn] Adjusted ep_rew empty in {event_path}; "
-                            f"using raw ep_rew. You may try ALIGN_MODE='previous'."
-                        )
+            resolved_tag, series = cached_result
 
             smooth_window = resolve_smooth_window(len(series))
             x, y_smooth, y_low, y_high = smooth_with_window_bounds(series, smooth_window)
@@ -345,7 +414,8 @@ def main() -> None:
 
         title = f"TensorBoard Tag Compare: {tag_cfg}"
         if ADJUST_EP_REW and is_ep_rew_tag(tag_cfg):
-            title += " (adjusted: ep_rew - speed_ref_aux_reward)"
+            excluded = ", ".join(EP_REW_COMPONENTS_TO_EXCLUDE)
+            title += f" (excluded: {excluded})"
         ax.set_title(title)
         ax.set_xlabel("step")
         ax.set_ylabel("value")
@@ -358,12 +428,16 @@ def main() -> None:
         ax.legend()
         fig.tight_layout()
 
-        output_path = os.path.join(
+        output_stem = os.path.join(
             output_dir,
-            f"tb_tag_compare_{sanitize_tag_for_filename(tag_cfg)}.png",
+            f"tb_tag_compare_{sanitize_tag_for_filename(tag_cfg)}",
         )
-        fig.savefig(output_path, dpi=160)
-        print(f"Saved figure to: {output_path}")
+        png_path = output_stem + ".png"
+        svg_path = output_stem + ".svg"
+        fig.savefig(png_path, dpi=160)
+        fig.savefig(svg_path, format="svg")
+        print(f"Saved PNG figure to: {png_path}")
+        print(f"Saved SVG figure to: {svg_path}")
         total_saved += 1
 
         if SHOW_PLOT:

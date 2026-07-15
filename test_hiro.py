@@ -64,6 +64,16 @@ LANE_TRAFFIC_CONFIG_KEYS = (
     "signal_cycle_spawn_probability",
 )
 
+SAC_GOAL_LANE_ENV_CONFIG_KEYS = (
+    "rule_based_compute_action_mode",
+    "rule_follow_mode_enabled",
+)
+
+SAC_LEGACY_CONFIG_FALLBACK_BY_RUN_NAME = {
+    "sac_260403_withPrior_SLv2_randomlane": "sac_260709_base_wronglanePen_oldEnv",
+    "sac_260403_base_SLv2_randomlane": "sac_260709_base_wronglanePen_oldEnv",
+}
+
 
 class OneBasedEvalRecordVideo(RecordVideo):
     """Name evaluation videos with the same 1-based episode id as trajectory CSVs."""
@@ -122,6 +132,49 @@ def _load_hiro_run_config_or_legacy(model_dir: str) -> Tuple[Dict[str, Any], str
 
 
 def _legacy_sac_run_config(model_dir: str, scenario_name: str) -> Tuple[Dict[str, Any], str]:
+    model_dir_abs = os.path.abspath(model_dir)
+    run_name = os.path.basename(os.path.normpath(model_dir_abs))
+    fallback_run_name = SAC_LEGACY_CONFIG_FALLBACK_BY_RUN_NAME.get(run_name)
+    if fallback_run_name:
+        repo_root = os.path.abspath(os.path.dirname(__file__))
+        fallback_dir = os.path.join(repo_root, "models", fallback_run_name)
+        fallback_payload, fallback_path = load_hiro_run_config(fallback_dir)
+        fallback_metadata = fallback_payload.get("run_metadata")
+        fallback_scenario = (
+            str(fallback_metadata["scenario_name"])
+            if isinstance(fallback_metadata, Mapping)
+            and fallback_metadata.get("scenario_name")
+            else scenario_name
+        )
+        if fallback_scenario != scenario_name:
+            raise ValueError(
+                "Legacy SAC config fallback scenario mismatch: "
+                f"model={model_dir_abs}, requested={scenario_name!r}, "
+                f"fallback={fallback_run_name!r}, "
+                f"fallback_scenario={fallback_scenario!r}, "
+                f"fallback_config={fallback_path}"
+            )
+        payload = deepcopy(fallback_payload)
+        metadata = dict(payload.get("run_metadata", {}) or {})
+        metadata.update(
+            {
+                "algo": "sac",
+                "scenario_name": fallback_scenario,
+                "borrowed_config_fallback": True,
+                "borrowed_config_from_run_name": fallback_run_name,
+                "borrowed_config_from_path": fallback_path,
+                "legacy_model_dir": model_dir_abs,
+                "sac_obs_time_mode": "elapsed",
+                "sac_obs_x_mode": "elapsed",
+            }
+        )
+        metadata.pop("legacy_config_fallback", None)
+        payload["run_metadata"] = metadata
+        return (
+            payload,
+            f"<borrowed SAC config from {fallback_path} for {model_dir_abs}>",
+        )
+
     env_cfg = get_env_config_for_scenario(scenario_name)
     payload = {
         "run_metadata": {
@@ -232,6 +285,9 @@ def _extract_sac_goal_lane_env_config(
     saved_env_config: Mapping[str, Any],
 ) -> Dict[str, Any]:
     cfg = _extract_lane_traffic_config(saved_env_config)
+    for key in SAC_GOAL_LANE_ENV_CONFIG_KEYS:
+        if key in saved_env_config:
+            cfg[key] = deepcopy(saved_env_config[key])
     action_cfg = saved_env_config.get("action", {})
     if isinstance(action_cfg, Mapping) and "acceleration_range" in action_cfg:
         cfg.setdefault("action", {})["acceleration_range"] = deepcopy(
@@ -241,7 +297,11 @@ def _extract_sac_goal_lane_env_config(
 
 
 def _sac_goal_lane_env_config_keys() -> list[str]:
-    return [*LANE_TRAFFIC_CONFIG_KEYS, "action.acceleration_range"]
+    return [
+        *LANE_TRAFFIC_CONFIG_KEYS,
+        *SAC_GOAL_LANE_ENV_CONFIG_KEYS,
+        "action.acceleration_range",
+    ]
 
 
 def _train_eval_config_overrides(*, algo: str) -> Dict[str, Any]:
@@ -1693,6 +1753,7 @@ def main_sac(
     episodes: int,
     model_name: str = "best_model.zip",
     sac_model_by_goal_lane: Optional[Mapping[Any, str]] = None,
+    enable_sac_low_safety_filter: Optional[bool] = None,
     record_episodes: Optional[Sequence[int]] = None,
     record_trajectory_episodes: Optional[Sequence[int]] = None,
     config_overrides: Optional[Mapping[str, Any]] = None,
@@ -1811,6 +1872,11 @@ def main_sac(
         env_config["warmup_render"] = False
         env_config["offscreen_rendering"] = False
 
+    if enable_sac_low_safety_filter is not None:
+        safety_filter_enabled = bool(enable_sac_low_safety_filter)
+        env_config["enable_sac_low_safety_filter"] = safety_filter_enabled
+        env_config["enable_low_safety_filter"] = safety_filter_enabled
+
     if bool(env_config.get("enable_sac_low_safety_filter", False)):
         hiro_cfg_for_sac = get_hiro_config()
         if getattr(hiro_cfg_for_sac, "low_safety_filter", None) is not None:
@@ -1885,6 +1951,10 @@ def main_sac(
                 )
             deep_update(cfg, deepcopy(lane_traffic_overrides_by_goal_lane[lane]))
             deep_update(cfg, test_env_overrides)
+        if enable_sac_low_safety_filter is not None:
+            safety_filter_enabled = bool(enable_sac_low_safety_filter)
+            cfg["enable_sac_low_safety_filter"] = safety_filter_enabled
+            cfg["enable_low_safety_filter"] = safety_filter_enabled
         cfg["goal_lane_id"] = lane
         cfg["goal_lane_probs"] = None
         return cfg
@@ -1942,10 +2012,25 @@ def main_sac(
 
     env = make_eval_env(1 if independent_episodes else None)
     model_path = os.path.join(model_dir, model_name)
-    sac_models_by_goal_lane = {
-        lane: _load_sac_model_source(source, model_name, env)
-        for lane, source in sac_model_sources_by_goal_lane.items()
-    }
+    sac_models_by_goal_lane = {}
+    for lane, source in sorted(sac_model_sources_by_goal_lane.items()):
+        try:
+            sac_models_by_goal_lane[lane] = _load_sac_model_source(
+                source,
+                model_name,
+                env,
+            )
+        except ValueError as exc:
+            env.close()
+            log_file.close()
+            raise ValueError(
+                "Failed to load goal-lane SAC model: "
+                f"goal_lane_id={lane}, "
+                f"model={_sac_model_source_path(source, model_name)}, "
+                f"evaluation_observation_space={env.observation_space}. "
+                "Use a checkpoint trained with the same observation config as "
+                "the evaluation environment."
+            ) from exc
     if sac_models_by_goal_lane:
         active_sac_goal_lane: Optional[int] = sorted(sac_models_by_goal_lane)[0]
         model = sac_models_by_goal_lane[active_sac_goal_lane]
@@ -2207,7 +2292,14 @@ def main_sac(
                 else None
             )
             acc_suffix = f" | acc_range={acc_range}" if acc_range is not None else ""
-            log(f"  goal_lane={lane:<2d}       : {source}{acc_suffix}")
+            rule_mode = lane_cfg.get("rule_based_compute_action_mode")
+            rule_follow = lane_cfg.get("rule_follow_mode_enabled")
+            rule_suffix = (
+                f" | rule_mode={rule_mode}, follow={rule_follow}"
+                if rule_mode is not None or rule_follow is not None
+                else ""
+            )
+            log(f"  goal_lane={lane:<2d}       : {source}{acc_suffix}{rule_suffix}")
     else:
         log(f"Model file         : {model_path}")
     log(f"Episodes           : {episodes}")
@@ -2256,6 +2348,9 @@ def main_sac(
                 "independent_episodes": bool(independent_episodes),
                 "deterministic": bool(deterministic),
                 "enable_rendering": bool(enable_rendering),
+                "enable_sac_low_safety_filter_override": (
+                    enable_sac_low_safety_filter
+                ),
                 "environment": env_config,
             },
             f,
@@ -2447,6 +2542,11 @@ def main_sac(
                     "  action acc range        : "
                     f"{action_cfg.get('acceleration_range')}"
                 )
+            log(
+                "  rule mode               : "
+                f"{base_env.config.get('rule_based_compute_action_mode')} "
+                f"(follow={base_env.config.get('rule_follow_mode_enabled')})"
+            )
         log(f"  terminal lane           : {final_lane_id if final_lane_id is not None else 'N/A'}")
         log(f"  length (steps)          : {steps}")
         log(f"  total reward            : {ep_ret:.6f}")
@@ -2544,6 +2644,8 @@ class SACEvalModel:
     model_name: str = "best_model.zip"
     sac_model_by_goal_lane: Optional[Mapping[Any, str]] = None
     config_model_dir: Optional[str] = None
+    # None inherits the saved environment setting; bool values force evaluation behavior.
+    enable_sac_low_safety_filter: Optional[bool] = None
 
 
 def run_sac_batch(
@@ -2598,6 +2700,7 @@ def run_sac_batch(
             model_dir=spec.model_dir,
             model_name=spec.model_name,
             sac_model_by_goal_lane=spec.sac_model_by_goal_lane,
+            enable_sac_low_safety_filter=spec.enable_sac_low_safety_filter,
             config_model_dir=spec.config_model_dir,
             env_config_model_dir=env_config_source,
             episodes=int(episodes),
@@ -2625,6 +2728,7 @@ def run_sac_batch(
                 ),
                 "config_model_dir": spec.config_model_dir,
                 "env_config_model_dir": env_config_source,
+                "enable_sac_low_safety_filter": spec.enable_sac_low_safety_filter,
                 "eval_dir": eval_dir,
             }
         )
@@ -2827,11 +2931,11 @@ if __name__ == "__main__":
             #     model_dir="./models/hiro_260628_highonly_pretrained_uni_oldEnv_noHER_SLmpc_noaugObs",
             #     low_model_path="./models/hiro_260627_lowonly_uni_oldEnv_noHER_SLmpc_noaugObs/hiro_low_final.zip",
             # ),
-            # HIROEvalModel(
-            #     name="reUni_fixedHER_oldEnv",
-            #     model_dir="./models/hiro_260702_highonly_reUni_lowSnapshot_oldEnv_fixedHER_newPolicy_withPrior",
-            #     low_model_path="./models/hiro_260630_lowonly_reUni_oldEnv_fixedHER_snapshot/hiro_low_final.zip",
-            # ),
+            HIROEvalModel(
+                name="reUni_fixedHER_oldEnv",
+                model_dir="./models/hiro_260709_highonly_reUni_oldEnv",
+                low_model_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
+            ),
             # HIROEvalModel(
             #     name="uni_fixedHER_newEnv",
             #     model_dir="./models/hiro_260703_highonly_uniOld_fixedHER_newEnv_2to0",  # 用作 config/run_config 来源，任选一个同环境模型
@@ -2862,40 +2966,40 @@ if __name__ == "__main__":
             #     },
             #     low_level_type="rule_based",
             # ),
-            HIROEvalModel(
-                name="reUni_fixedHER_newEnv",
-                model_dir="./models/hiro_260708_highonly_reUni_oldLow_newEnv_2to0",  # 用作 config/run_config 来源，任选一个同环境模型
-                high_model_by_goal_lane={
-                    0: "./models/hiro_260708_highonly_reUni_oldLow_newEnv_2to0",
-                    1: "./models/hiro_260708_highonly_reUni_oldLow_newEnv_2to1",
-                    2: "./models/hiro_260708_highonly_reUni_oldLow_newEnv_2to2",
-                },
-                low_model_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
-            ),
+            # HIROEvalModel(
+            #     name="reUni_fixedHER_newEnv",
+            #     model_dir="./models/hiro_260708_highonly_reUni_oldLow_newEnv_2to0",  # 用作 config/run_config 来源，任选一个同环境模型
+            #     high_model_by_goal_lane={
+            #         0: "./models/hiro_260708_highonly_reUni_oldLow_newEnv_2to0",
+            #         1: "./models/hiro_260708_highonly_reUni_oldLow_newEnv_2to1",
+            #         2: "./models/hiro_260708_highonly_reUni_oldLow_newEnv_2to2",
+            #     },
+            #     low_model_path="./models/hiro_260328_lowonly_reachablePretrainedV2_Rainbow_amax3_dmin15_10/hiro_low_final.zip",
+            # ),
         ],
         # seed_base=343,
         episodes=300,
         record_episodes=[i for i in range(1, 301)],
         record_trajectory_episodes=[i for i in range(1, 301)],
         # enable_rendering=False,
-        # scenario_name="multi_lane",
-        scenario_name="multi_lane_stop_to_int",
+        scenario_name="multi_lane",
+        # scenario_name="multi_lane_stop_to_int",
         shared_env_config_model_dir=None,
         use_each_model_env_config=True,
         config_overrides={
             "environment": {
-                # "initial_lane_probs": None,
-                # "initial_lane_id": "random",
-                # "goal_lane_id": 2,
-                # "behavior_lane_probs": [
-                #     [0.6, 0.3, 0.1],
-                #     [0.6, 0.3, 0.1],
-                #     [0.4, 0.3, 0.3],
-                # ],
+                "initial_lane_probs": None,
+                "initial_lane_id": "random",
+                "goal_lane_id": 2,
+                "behavior_lane_probs": [
+                    [0.6, 0.3, 0.1],
+                    [0.6, 0.3, 0.1],
+                    [0.4, 0.3, 0.3],
+                ],
 
-                "initial_lane_id": 2,
-                "goal_lane_id": "random",
-                "goal_lane_probs": None,
+                # "initial_lane_id": 2,
+                # "goal_lane_id": "random",
+                # "goal_lane_probs": None,
                 # # "goal_lane_probs": [0.5, 0.0, 0.5],
 
                 "action": {
@@ -2923,18 +3027,81 @@ if __name__ == "__main__":
 
     # run_sac_batch(
     #     models=[
+    #         # SACEvalModel(
+    #         #     name="sac_oldcontroller",
+    #         #     model_dir="./models/sac_1e7_lane1_oldcontroller",  # 用作基础 config 来源，任选同环境模型
+    #         #     model_name="best_model.zip",
+    #         #     enable_sac_low_safety_filter=False,
+    #         # ),
     #         SACEvalModel(
-    #             name="sac_newEnv_by_lane",
-    #             model_dir="./models/sac_260624_withPrior_2to0",  # 用作基础 config 来源，任选同环境模型
+    #             name="sac_withPrior_oldEnv_withWrongLanePen",
+    #             model_dir="./models/sac_260613_withPrior_oldEnv_randomto2_wronglanePen_1e7",  # 用作基础 config 来源，任选同环境模型
     #             model_name="best_model.zip",
-    #             sac_model_by_goal_lane={
-    #                 0: "./models/sac_260624_withPrior_2to0",
-    #                 1: "./models/sac_260704_withPrior_2to1",
-    #                 2: "./models/sac_260622_withPrior_2to2_noGoalReshape",
-    #             },
     #         ),
+    #         # SACEvalModel(
+    #         #     name="sac_withPrior_oldEnv",
+    #         #     model_dir="./models/sac_260403_withPrior_SLv2_randomlane",  # 用作基础 config 来源，任选同环境模型
+    #         #     model_name="best_model.zip",
+    #         # ),
+    #         # SACEvalModel(
+    #         #     name="sac_base_oldEnv_withWrongLanePen",
+    #         #     model_dir="./models/sac_260709_base_wronglanePen_oldEnv",  # 用作基础 config 来源，任选同环境模型
+    #         #     model_name="best_model.zip",
+    #         # ),
     #     ],
     #     episodes=300,
+    #     record_episodes=[i for i in range(1, 301)],
+    #     record_trajectory_episodes=[i for i in range(1, 301)],
+    #     scenario_name="multi_lane",
+    #     use_each_model_env_config=True,
+    #     config_overrides={
+    #         "environment": {
+    #             # "initial_lane_id": "1",
+    #             "initial_lane_id": "random",
+    #             "goal_lane_id": "2",
+    #         },
+    #         "evaluation": {
+    #             "deterministic": True,
+    #         },
+    #     },
+    # )
+    # run_sac_batch(
+    #     models=[
+    #         SACEvalModel(
+    #             name="sac_withPrior_newEnv_by_lane_withWrongLanePen",
+    #             model_dir="./models/sac_260709_withPrior_wronglanePen_newEnv_2to0",  # 用作基础 config 来源，任选同环境模型
+    #             model_name="best_model.zip",
+    #             sac_model_by_goal_lane={
+    #                 0: "./models/sac_260709_withPrior_wronglanePen_newEnv_2to0",
+    #                 1: "./models/sac_260709_withPrior_wronglanePen_newEnv_2to1",
+    #                 2: "./models/sac_260709_withPrior_wronglanePen_newEnv_2to2",
+    #             },
+    #             # model_suffix=6000000,
+    #         ),
+    #         # SACEvalModel(
+    #         #     name="sac_withPrior_newEnv_by_lane",
+    #         #     model_dir="./models/sac_260624_withPrior_2to0",  # 用作基础 config 来源，任选同环境模型
+    #         #     model_name="best_model.zip",
+    #         #     sac_model_by_goal_lane={
+    #         #         0: "./models/sac_260624_withPrior_2to0",
+    #         #         1: "./models/sac_260704_withPrior_2to1",
+    #         #         2: "./models/sac_260622_withPrior_2to2_noGoalReshape",
+    #         #     },
+    #         # ),
+    #         # SACEvalModel(
+    #         #     name="sac_base_newEnv_by_lane_withWrongLanePen",
+    #         #     model_dir="./models/sac_260709_base_wronglanePen_newEnv_2to0",  # 用作基础 config 来源，任选同环境模型
+    #         #     model_name="best_model.zip",
+    #         #     sac_model_by_goal_lane={
+    #         #         0: "./models/sac_260709_base_wronglanePen_newEnv_2to0",
+    #         #         1: "./models/sac_260709_base_wronglanePen_newEnv_2to1",
+    #         #         2: "./models/sac_260709_base_wronglanePen_newEnv_2to2",
+    #         #     },
+    #         # ),
+    #     ],
+    #     episodes=300,
+    #     record_episodes=[i for i in range(1, 301)],
+    #     record_trajectory_episodes=[i for i in range(1, 301)],
     #     scenario_name="multi_lane_stop_to_int",
     #     use_each_model_env_config=True,
     #     config_overrides={

@@ -296,6 +296,20 @@ class RLControlledVehicle(ControlledVehicle):
         else:
             return
         self.target_lane_index = (_from, _to, desired_id)
+
+        # if lane_change_cmd == 0:
+        #     return
+
+        # _from, _to, _id = self.target_lane_index
+        # lanes_on_edge = self.road.network.graph[_from][_to]
+        # max_lane_id = len(lanes_on_edge) - 1
+
+        # if lane_change_cmd == 1:  # LANE_LEFT
+        #     self.target_lane_index = (_from, _to, int(np.clip(_id - 1, 0, max_lane_id)))
+        # elif lane_change_cmd == 2:  # LANE_RIGHT
+        #     self.target_lane_index = (_from, _to, int(np.clip(_id + 1, 0, max_lane_id)))
+        # else:
+        #     return
     
     def act(self, action: Union[dict, str, None] = None) -> None:
         """

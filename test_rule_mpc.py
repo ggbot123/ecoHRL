@@ -1,7 +1,11 @@
 import os
 import warnings
+import random
+import json
+import csv
+from copy import deepcopy
 from datetime import datetime
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import cvxpy as cp
 import gymnasium as gym
@@ -16,20 +20,66 @@ except Exception:
         return iterable
 
 from configs.builders import get_env_config_for_scenario, get_scenario_spec
+from configs.conf import TRAIN_CONFIG
 from custom_env.vehicle.behavior import IDMVehicle
 from rl.algos.HRL.rule_based import RuleBasedController
-from util.hiro_utils import unique_path
+from scenarios.goal_lane_logic import sample_goal_lane_id
+from util.hiro_utils import env_config_from_run_config, load_hiro_run_config, unique_path
+from util.config_utils import deep_update
 from util.plot_result import save_speed_acc_curves
+
+
+# Kept in sync with test_hiro.py: these are the only per-goal-lane fields that
+# may differ between the three SAC training environments.
+LANE_TRAFFIC_CONFIG_KEYS = (
+    "behavior_probs", "behavior_lane_probs", "behavior_vehicle_types",
+    "flow_speed_range", "speed_distribution", "spawn_probability",
+    "spawn_min_gap", "spawn_min_t_headway", "spawn_check_adjacent_cutins",
+    "spawn_adjacent_cutin_front_gap", "spawn_adjacent_cutin_back_gap",
+    "movement_lanes", "movement_behavior_probs",
+    "background_vehicle_respect_movement_lanes", "background_snapshot_reset",
+    "background_snapshot_path", "background_snapshot_paths",
+    "background_snapshot_max_resample_attempts",
+    "background_snapshot_chunk_reuse_enabled",
+    "background_snapshot_chunk_reuse_count",
+    "background_snapshot_chunk_cache_size", "background_snapshot_phase_offset",
+    "signal_plan", "enable_signal_green_launch_behavior",
+    "signal_green_launch_approach_distance", "signal_green_launch_end_margin",
+    "signal_green_launch_target_speed", "enable_signal_cycle_spawn_probability",
+    "signal_cycle_spawn_probability",
+)
+
+
+def _extract_goal_lane_environment_config(saved_env_config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Match test_hiro.py's per-goal-lane SAC environment extraction."""
+    extracted = {
+        key: deepcopy(saved_env_config[key])
+        for key in LANE_TRAFFIC_CONFIG_KEYS
+        if key in saved_env_config
+    }
+    for key in ("rule_based_compute_action_mode", "rule_follow_mode_enabled"):
+        if key in saved_env_config:
+            extracted[key] = deepcopy(saved_env_config[key])
+    action_cfg = saved_env_config.get("action", {})
+    if isinstance(action_cfg, Mapping) and "acceleration_range" in action_cfg:
+        extracted.setdefault("action", {})["acceleration_range"] = deepcopy(
+            action_cfg["acceleration_range"]
+        )
+    return extracted
 
 
 class RuleMPCController:
     """Rule + MPC baseline.
 
-    1) Lateral lane target is always RIGHT unless ego is already on the rightmost lane.
+    1) Lateral lane target moves one lane at a time toward the episode goal lane.
     2) Longitudinal motion is obtained by solving a convex QP over acceleration sequence.
        Objective: sum(a^2) + sum((v-v_ref)^2)
        Constraints: min distance & TTC to nearby vehicles (front/rear), speed and accel bounds.
          If lane-change-target MPC is infeasible, fallback target lane is current lane.
+    3) When the ego vehicle is within ``forced_goal_lane_change_distance`` of the
+       goal x but is still in the wrong lane, it attempts one adjacent merge toward
+       the goal lane. Its QP predicts that a rear vehicle in the target lane
+       brakes at ``forced_goal_lane_rear_braking``.
     """
 
     def __init__(
@@ -49,7 +99,7 @@ class RuleMPCController:
         self.w_speed = float(max(w_speed, 1e-8))
         self.lane_change_settle_steps = int(max(1, lane_change_settle_steps))
         lane_strategy_norm = str(lane_strategy).strip().lower()
-        if lane_strategy_norm not in {"right_bias", "mobil"}:
+        if lane_strategy_norm not in {"right_bias", "mobil", "benefit_urgency"}:
             raise ValueError(f"Unsupported lane_strategy: {lane_strategy}")
         self.lane_strategy = lane_strategy_norm
 
@@ -61,6 +111,18 @@ class RuleMPCController:
         self.speed_limit = float(cfg.get("speed_limit", 15.0))
         self.goal_longitudinal = float(cfg.get("goal_longitudinal", 400.0))
         self.punctual_target = float(cfg.get("punctual_time_target", cfg.get("duration", 35.0)))
+        self.forced_goal_lane_change_distance = float(
+            max(cfg.get("forced_goal_lane_change_distance", 30.0), 0.0)
+        )
+        self.enable_forced_goal_lane_change = bool(
+            cfg.get("enable_forced_goal_lane_change", True)
+        )
+        self.forced_goal_lane_rear_braking = float(
+            max(cfg.get("forced_goal_lane_rear_braking", 3.0), 0.0)
+        )
+        self.mobil_goal_lane_bias_distance = float(
+            max(cfg.get("mobil_goal_lane_bias_distance", 100.0), 0.0)
+        )
 
         self.front_gap_min = float(cfg.get("lane_change_min_front_gap", 10.0))
         self.rear_gap_min = float(cfg.get("lane_change_min_rear_gap", 8.0))
@@ -69,6 +131,37 @@ class RuleMPCController:
 
         self.lanes_count = int(cfg.get("lanes_count", 3))
         self.lane_width = float(cfg.get("lane_width", 4.0))
+        # MOBIL-like benefit + goal-lane urgency strategy parameters.
+        self.lane_score_politeness = float(cfg.get("lane_score_politeness", 0.2))
+        self.lane_score_traffic_weight = float(cfg.get("lane_score_traffic_weight", 1.0))
+        self.lane_score_goal_weight = float(cfg.get("lane_score_goal_weight", 0.25))
+        self.lane_score_goal_urgency_weight = float(
+            cfg.get("lane_score_goal_urgency_weight", 2.5)
+        )
+        self.lane_score_goal_approach_distance = float(
+            max(cfg.get("lane_score_goal_approach_distance", 150.0), 1e-3)
+        )
+        self.lane_score_change_cost = float(cfg.get("lane_score_change_cost", 0.1))
+        self.last_lane_scores: Dict[int, float] = {}
+        self.last_forced_goal_lane_change = False
+        self.mobil_failure_count = 0
+        self.mobil_last_error: Optional[str] = None
+        self.mobil_failed_this_episode = False
+
+    def begin_episode(self) -> None:
+        self.mobil_failed_this_episode = False
+
+    def _goal_target_lane(self, current_lane: int) -> int:
+        try:
+            goal_lane = int(self.env.get_goal_lane_id())
+        except (AttributeError, TypeError, ValueError):
+            goal_lane = int(self.env.config.get("goal_lane_id", current_lane))
+        goal_lane = int(np.clip(goal_lane, 0, self.lanes_count - 1))
+        if goal_lane < int(current_lane):
+            return int(current_lane) - 1
+        if goal_lane > int(current_lane):
+            return int(current_lane) + 1
+        return int(current_lane)
 
     def _lane_scalar_from_target(self, current_lane: int, target_lane: int) -> float:
         delta = int(target_lane) - int(current_lane)
@@ -94,11 +187,6 @@ class RuleMPCController:
         y = float(vehicle.position[1])
         return int(np.clip(int(round(y / max(self.lane_width, 1e-6))), 0, self.lanes_count - 1))
 
-    def _right_bias_target_lane(self, current_lane: int) -> int:
-        if int(current_lane) >= self.lanes_count - 1:
-            return int(current_lane)
-        return int(current_lane) + 1
-
     def _mobil_target_lane(self, ego, current_lane: int) -> int:
         try:
             shadow = IDMVehicle.create_from(ego)
@@ -120,9 +208,140 @@ class RuleMPCController:
             lane_index = getattr(shadow, "target_lane_index", None)
             if lane_index is not None and len(lane_index) >= 3:
                 return int(np.clip(lane_index[2], 0, self.lanes_count - 1))
-        except Exception:
-            pass
+        except Exception as exc:
+            self.mobil_failure_count += 1
+            self.mobil_failed_this_episode = True
+            self.mobil_last_error = f"{type(exc).__name__}: {exc}"
         return int(current_lane)
+
+    @staticmethod
+    def _vehicle_speed(vehicle: Any) -> float:
+        return float(getattr(vehicle, "speed", np.linalg.norm(vehicle.velocity)))
+
+    def _idm_acceleration_estimate(self, vehicle: Any, front_vehicle: Optional[Any]) -> float:
+        """Deterministic IDM estimate used only for relative lane scoring."""
+        if vehicle is None:
+            return 0.0
+        speed = max(self._vehicle_speed(vehicle), 0.0)
+        desired_speed = float(
+            np.clip(getattr(vehicle, "target_speed", self.speed_limit), 0.1, self.speed_limit)
+        )
+        comfort_acc = 2.0
+        comfort_brake = 5.0
+        acc = comfort_acc * (1.0 - (speed / desired_speed) ** 4)
+        if front_vehicle is None:
+            return float(acc)
+
+        try:
+            distance = max(float(vehicle.lane_distance_to(front_vehicle)), 0.1)
+        except Exception:
+            distance = max(float(front_vehicle.position[0] - vehicle.position[0]), 0.1)
+        front_speed = max(self._vehicle_speed(front_vehicle), 0.0)
+        desired_gap = 5.0 + speed * 1.5 + speed * (speed - front_speed) / (
+            2.0 * np.sqrt(comfort_acc * comfort_brake)
+        )
+        return float(acc - comfort_acc * (max(desired_gap, 0.1) / distance) ** 2)
+
+    def _benefit_urgency_target_lane(self, ego: Any, current_lane: int, x0: float) -> int:
+        """Score adjacent lanes by MOBIL-like benefit plus goal urgency."""
+        goal_lane = self._goal_target_lane(current_lane)
+        # _goal_target_lane returns an adjacent step; recover the actual endpoint
+        # to score all candidate lanes by their distance from the route goal.
+        try:
+            final_goal_lane = int(self.env.get_goal_lane_id())
+        except (AttributeError, TypeError, ValueError):
+            final_goal_lane = int(goal_lane)
+        final_goal_lane = int(np.clip(final_goal_lane, 0, self.lanes_count - 1))
+        remaining_distance = max(self.goal_longitudinal - x0, 0.0)
+        urgency = float(np.clip(
+            1.0 - remaining_distance / self.lane_score_goal_approach_distance,
+            0.0,
+            1.0,
+        ))
+
+        old_front, old_rear = self.env.road.neighbour_vehicles(ego)
+        ego_acc_now = self._idm_acceleration_estimate(ego, old_front)
+        old_rear_acc_now = self._idm_acceleration_estimate(old_rear, ego)
+        old_rear_acc_after = self._idm_acceleration_estimate(old_rear, old_front)
+        scores: Dict[int, float] = {}
+
+        for lane in range(max(0, current_lane - 1), min(self.lanes_count - 1, current_lane + 1) + 1):
+            if lane == current_lane:
+                traffic_benefit = 0.0
+            else:
+                lane_index = (ego.lane_index[0], ego.lane_index[1], int(lane))
+                try:
+                    target_lane_obj = self.env.road.network.get_lane(lane_index)
+                    if not target_lane_obj.is_reachable_from(ego.position):
+                        scores[lane] = -np.inf
+                        continue
+                    new_front, new_rear = self.env.road.neighbour_vehicles(ego, lane_index)
+                except Exception:
+                    scores[lane] = -np.inf
+                    continue
+
+                ego_acc_after = self._idm_acceleration_estimate(ego, new_front)
+                new_rear_acc_now = self._idm_acceleration_estimate(new_rear, new_front)
+                new_rear_acc_after = self._idm_acceleration_estimate(new_rear, ego)
+                traffic_benefit = (
+                    ego_acc_after - ego_acc_now
+                    + self.lane_score_politeness
+                    * ((new_rear_acc_after - new_rear_acc_now) + (old_rear_acc_after - old_rear_acc_now))
+                )
+
+            goal_progress = abs(current_lane - final_goal_lane) - abs(lane - final_goal_lane)
+            goal_score = (
+                self.lane_score_goal_weight + self.lane_score_goal_urgency_weight * urgency
+            ) * float(goal_progress)
+            change_cost = self.lane_score_change_cost if lane != current_lane else 0.0
+            scores[lane] = self.lane_score_traffic_weight * traffic_benefit + goal_score - change_cost
+
+        self.last_lane_scores = scores
+        best_score = max(scores.values())
+        best_lanes = [lane for lane, score in scores.items() if np.isclose(score, best_score)]
+        # Prefer keeping the current lane on ties to prevent lane oscillation.
+        return int(current_lane if current_lane in best_lanes else min(best_lanes))
+
+    def _safe_fallback_acceleration(
+        self,
+        x0: float,
+        v0: float,
+        current_lane: int,
+        v_ref: float,
+        neighbors_state: np.ndarray,
+    ) -> float:
+        """One-step safety-constrained fallback, with front-safety priority if infeasible."""
+        dt = self.dt
+        lower = self.acc_min
+        upper = min(self.acc_max, (self.speed_limit - v0) / dt)
+        desired = float(np.clip((v_ref - v0) / dt, self.acc_min, self.acc_max))
+
+        for xj0, lane_j_raw, vj in neighbors_state:
+            if int(lane_j_raw) != int(current_lane):
+                continue
+            if float(xj0) >= x0:
+                gap_free = float(xj0) - x0 + (float(vj) - v0) * dt
+                upper = min(upper, 2.0 * (gap_free - self.front_gap_min) / (dt ** 2))
+                upper = min(
+                    upper,
+                    (gap_free - self.front_ttc_min * (v0 - float(vj)))
+                    / (0.5 * dt ** 2 + self.front_ttc_min * dt),
+                )
+            else:
+                gap_free = x0 - float(xj0) + (v0 - float(vj)) * dt
+                lower = max(lower, 2.0 * (self.rear_gap_min - gap_free) / (dt ** 2))
+                lower = max(
+                    lower,
+                    (self.rear_ttc_min * (float(vj) - v0) - gap_free)
+                    / (0.5 * dt ** 2 + self.rear_ttc_min * dt),
+                )
+
+        upper = max(self.acc_min, min(self.acc_max, upper))
+        lower = max(self.acc_min, min(self.acc_max, lower))
+        if lower <= upper:
+            return float(np.clip(desired, lower, upper))
+        # Conflicting front/rear constraints: protect against the frontal collision.
+        return float(upper)
 
     def _neighbors_state(self) -> np.ndarray:
         ego = self.env.vehicle
@@ -149,7 +368,15 @@ class RuleMPCController:
         target_lane: int,
         v_ref: float,
         neighbors_state: np.ndarray,
+        target_lane_rear_braking: float = 0.0,
     ) -> Tuple[float, int]:
+        """Solve the longitudinal MPC.
+
+        ``target_lane_rear_braking`` is a positive braking magnitude.  It is
+        only applied to a vehicle that starts behind ego in the requested
+        target lane; all other surrounding vehicles retain constant-speed
+        prediction.
+        """
         def _solve_for_lane(planned_target_lane: int) -> Optional[float]:
             H = self.horizon
             a = cp.Variable(H)
@@ -158,7 +385,14 @@ class RuleMPCController:
 
             constraints = [x[0] == x0, v[0] == v0]
             constraints += [a >= self.acc_min, a <= self.acc_max]
-            constraints += [v >= 0.0, v <= self.speed_limit]
+            # v0 is measured state and cannot be made feasible retroactively.
+            # For an externally overridden overspeed state, permit only the
+            # fastest physically possible monotone recovery toward the limit.
+            recovery_upper = np.maximum(
+                self.speed_limit,
+                v0 + self.acc_min * self.dt * np.arange(1, H + 1),
+            )
+            constraints += [v[1:] >= 0.0, v[1:] <= recovery_upper]
 
             for t in range(H):
                 constraints += [x[t + 1] == x[t] + v[t] * self.dt + 0.5 * a[t] * (self.dt ** 2)]
@@ -184,17 +418,34 @@ class RuleMPCController:
                     if lane_j not in active_lanes:
                         continue
 
-                    xj_t = xj0 + vj * tt
                     ahead_now = xj0 >= x0
+                    target_rear_brakes = bool(
+                        target_lane_rear_braking > 0.0
+                        and lane_j == int(target_lane)
+                        and not ahead_now
+                    )
+                    if target_rear_brakes:
+                        # Constant -b prediction until the rear vehicle stops;
+                        # do not extrapolate it backwards after that instant.
+                        brake = float(target_lane_rear_braking)
+                        stop_time = max(vj, 0.0) / brake
+                        moving_time = min(tt, stop_time)
+                        xj_t = xj0 + max(vj, 0.0) * moving_time - 0.5 * brake * moving_time ** 2
+                        if tt > stop_time:
+                            xj_t = xj0 + max(vj, 0.0) ** 2 / (2.0 * brake)
+                        vj_t = max(vj - brake * tt, 0.0)
+                    else:
+                        xj_t = xj0 + vj * tt
+                        vj_t = vj
 
                     if ahead_now:
                         d_front = xj_t - x[t]
                         constraints += [d_front >= self.front_gap_min]
-                        constraints += [d_front >= self.front_ttc_min * (v[t] - vj)]
+                        constraints += [d_front >= self.front_ttc_min * (v[t] - vj_t)]
                     else:
                         d_rear = x[t] - xj_t
                         constraints += [d_rear >= self.rear_gap_min]
-                        constraints += [d_rear >= self.rear_ttc_min * (vj - v[t])]
+                        constraints += [d_rear >= self.rear_ttc_min * (vj_t - v[t])]
 
             objective = cp.Minimize(
                 self.w_acc * cp.sum_squares(a)
@@ -229,26 +480,56 @@ class RuleMPCController:
             if fallback is not None:
                 return fallback, int(current_lane)
 
-        heuristic = float(np.clip((float(v_ref) - float(v0)) / self.dt, self.acc_min, self.acc_max))
-        return heuristic, int(current_lane)
+        safe_fallback = self._safe_fallback_acceleration(
+            x0, v0, current_lane, v_ref, neighbors_state
+        )
+        return safe_fallback, int(current_lane)
 
     def act(self) -> np.ndarray:
         ego = self.env.vehicle
         x0 = self._longitudinal(ego)
         v0 = float(ego.velocity[0])
         current_lane = self._infer_lane_id(ego)
+        remaining_distance = max(self.goal_longitudinal - x0, 0.0)
+        try:
+            final_goal_lane = int(self.env.get_goal_lane_id())
+        except (AttributeError, TypeError, ValueError):
+            final_goal_lane = current_lane
+        final_goal_lane = int(np.clip(final_goal_lane, 0, self.lanes_count - 1))
+        forced_goal_lane_change = bool(
+            self.enable_forced_goal_lane_change
+            and 0.0 < remaining_distance <= self.forced_goal_lane_change_distance
+            and current_lane != final_goal_lane
+        )
+        self.last_forced_goal_lane_change = forced_goal_lane_change
 
-        if self.lane_strategy == "mobil":
-            target_lane = self._mobil_target_lane(ego, current_lane)
+        if forced_goal_lane_change:
+            # Near goal x, force one adjacent step toward the required lane.
+            # The low speed created by max braking makes the forced merge easier.
+            target_lane = self._goal_target_lane(current_lane)
+        elif self.lane_strategy == "mobil":
+            # Near the route endpoint, MOBIL's traffic-efficiency objective is
+            # subordinated to route completion. right_bias is goal-directed in
+            # this script, so it advances one adjacent lane toward goal_lane.
+            if 0.0 < remaining_distance <= self.mobil_goal_lane_bias_distance:
+                target_lane = self._goal_target_lane(current_lane)
+            else:
+                target_lane = self._mobil_target_lane(ego, current_lane)
+        elif self.lane_strategy == "benefit_urgency":
+            target_lane = self._benefit_urgency_target_lane(ego, current_lane, x0)
         else:
-            target_lane = self._right_bias_target_lane(current_lane)
+            target_lane = self._goal_target_lane(current_lane)
 
         # Reference speed = remaining distance / remaining planned arrival time.
-        remain_dist = max(self.goal_longitudinal - x0, 0.0)
+        remain_dist = remaining_distance
         remain_time = max(self.punctual_target - float(getattr(self.env, "time", 0.0)), self.dt)
         v_ref = float(np.clip(remain_dist / remain_time, 0.0, self.speed_limit))
 
         neighbors_state = self._neighbors_state()
+        # The forced merge keeps its lateral command even if the QP falls back,
+        # but uses a more realistic target-lane rear-vehicle prediction: the
+        # rear vehicle is assumed to brake at 3 m/s^2 (configurable) for the
+        # horizon. Normal driving keeps the previous constant-speed model.
         acc_phys, used_target_lane = self._solve_longitudinal_qp(
             x0=x0,
             v0=v0,
@@ -256,9 +537,19 @@ class RuleMPCController:
             target_lane=target_lane,
             v_ref=v_ref,
             neighbors_state=neighbors_state,
+            target_lane_rear_braking=(
+                self.forced_goal_lane_rear_braking if forced_goal_lane_change else 0.0
+            ),
         )
 
-        lane_scalar = self._lane_scalar_from_target(current_lane, used_target_lane)
+        # benefit_urgency deliberately issues its selected lateral action
+        # directly. Its longitudinal QP fallback must not cancel that action.
+        lateral_target_lane = (
+            target_lane
+            if forced_goal_lane_change or self.lane_strategy == "benefit_urgency"
+            else used_target_lane
+        )
+        lane_scalar = self._lane_scalar_from_target(current_lane, lateral_target_lane)
         acc_norm = self._acc_phys_to_norm(acc_phys)
         return np.array([lane_scalar, acc_norm], dtype=np.float32)
 
@@ -267,13 +558,43 @@ def main(
     model_dir: str,
     episodes: int = 10,
     record_episodes: Optional[Sequence[int]] = None,
+    record_trajectory_episodes: Optional[Sequence[int]] = None,
     env_overrides: Optional[Dict[str, Any]] = None,
     horizon: int = 15,
     lane_strategy: str = "right_bias",
     use_low_safety_layer: bool = False,
     enable_rendering: bool = True,
     scenario_name: str = "multi_lane",
+    initial_lane_id: Optional[Any] = None,
+    goal_lane_id: Optional[Any] = None,
+    duration: Optional[float] = None,
+    goal_longitudinal: Optional[float] = None,
+    forced_goal_lane_change_distance: Optional[float] = None,
+    enable_forced_goal_lane_change: Optional[bool] = None,
+    forced_goal_lane_rear_braking: Optional[float] = None,
+    mobil_goal_lane_bias_distance: Optional[float] = None,
+    punctual_time_target: Optional[float] = None,
+    punctual_time_window: Optional[Sequence[float]] = None,
+    spawn_probability: Optional[float] = None,
+    start_longitudinal: Optional[float] = None,
+    episode_start_phase_offset: Optional[float] = None,
+    enable_queue_takeover: Optional[bool] = None,
+    reference_env_model_dir: Optional[str] = None,
+    goal_lane_reference_env_model_dirs: Optional[Mapping[int, str]] = None,
+    snapshot_pool_by_goal_lane: Optional[Mapping[int, str]] = None,
 ):
+    if record_episodes and any(int(ep_idx) < 1 for ep_idx in record_episodes):
+        raise ValueError(
+            "record_episodes uses 1-based episode numbers; values must be >= 1"
+        )
+    if record_trajectory_episodes and any(
+        int(ep_idx) < 1 for ep_idx in record_trajectory_episodes
+    ):
+        raise ValueError(
+            "record_trajectory_episodes uses 1-based episode numbers; "
+            "values must be >= 1"
+        )
+
     eval_root_dir = os.path.join(model_dir, "eval_results")
     os.makedirs(eval_root_dir, exist_ok=True)
     run_folder_name = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -287,34 +608,83 @@ def main(
         print(msg)
         log_file.write(msg + "\n")
 
-    test_overrides: Dict[str, Any] = {
-        "initial_lane_id": "random",
-        "duration": 70.0,
-        "warmup_each_episode": False,
+    runtime_overrides: Dict[str, Any] = {
         "screen_width": 1800,
         "screen_height": 300,
         "scaling": 3,
         "centering_position": [0.5, 0.5],
         "show_trajectories": enable_rendering,
-        "warmup_render": enable_rendering,
+        "warmup_render": False,
         "offscreen_rendering": enable_rendering,
-        "action": {
-            "type": "ParamLaneAccelAction",
-            "acceleration_range": [-5.0, 5.0],
-            "lane_actions": ["KEEP", "LANE_LEFT", "LANE_RIGHT"],
-        },
     }
+    test_env_overrides: Dict[str, Any] = {}
+    explicit_overrides = {
+        "initial_lane_id": initial_lane_id,
+        "goal_lane_id": goal_lane_id,
+        "duration": duration,
+        "goal_longitudinal": goal_longitudinal,
+        "forced_goal_lane_change_distance": forced_goal_lane_change_distance,
+        "enable_forced_goal_lane_change": enable_forced_goal_lane_change,
+        "forced_goal_lane_rear_braking": forced_goal_lane_rear_braking,
+        "mobil_goal_lane_bias_distance": mobil_goal_lane_bias_distance,
+        "punctual_time_target": punctual_time_target,
+        "spawn_probability": spawn_probability,
+        "start_longitudinal": start_longitudinal,
+        "episode_start_phase_offset": episode_start_phase_offset,
+        "enable_queue_takeover": enable_queue_takeover,
+    }
+    test_env_overrides.update({k: v for k, v in explicit_overrides.items() if v is not None})
+    if punctual_time_window is not None:
+        if len(punctual_time_window) != 2:
+            raise ValueError("punctual_time_window must contain exactly two values")
+        test_env_overrides["punctual_time_window"] = [
+            float(punctual_time_window[0]),
+            float(punctual_time_window[1]),
+        ]
     if env_overrides:
-        test_overrides.update(env_overrides)
+        deep_update(test_env_overrides, env_overrides)
     scenario_spec = get_scenario_spec(scenario_name)
     importlib.import_module(str(scenario_spec["module"]))
     env_id = str(scenario_spec["env_id"])
     if not enable_rendering:
-        test_overrides["show_trajectories"] = False
-        test_overrides["warmup_render"] = False
-        test_overrides["offscreen_rendering"] = False
-    env_config = get_env_config_for_scenario(scenario_name, test_overrides)
+        runtime_overrides["show_trajectories"] = False
+        runtime_overrides["warmup_render"] = False
+        runtime_overrides["offscreen_rendering"] = False
+    conf_config_overrides = TRAIN_CONFIG.get("config_overrides", {}) or {}
+    conf_env_overrides = deepcopy(
+        dict(conf_config_overrides.get("environment", {}) or {})
+    )
+    # Normal evaluation precedence: base -> scenario -> conf -> this script.
+    # A SAC-reference profile then replaces the conf-derived environment with
+    # its saved training environment, just as test_hiro.py does.
+    env_config = get_env_config_for_scenario(scenario_name, conf_env_overrides)
+    reference_env_config_path: Optional[str] = None
+    if reference_env_model_dir:
+        reference_run_config, reference_env_config_path = load_hiro_run_config(
+            reference_env_model_dir
+        )
+        deep_update(env_config, env_config_from_run_config(reference_run_config))
+        env_config.pop("_env_seed", None)
+        env_config.pop("actual_episode_start_phase_offset", None)
+    deep_update(env_config, test_env_overrides)
+    deep_update(env_config, runtime_overrides)
 
+    lane_env_overrides: Dict[int, Dict[str, Any]] = {}
+    lane_env_config_sources: Dict[int, str] = {}
+    for raw_lane, source_dir in (goal_lane_reference_env_model_dirs or {}).items():
+        lane = int(raw_lane)
+        lane_run_config, lane_source_path = load_hiro_run_config(str(source_dir))
+        lane_env_overrides[lane] = _extract_goal_lane_environment_config(
+            env_config_from_run_config(lane_run_config)
+        )
+        lane_env_config_sources[lane] = lane_source_path
+
+    normalized_snapshot_pools = {
+        int(lane): str(path)
+        for lane, path in (snapshot_pool_by_goal_lane or {}).items()
+    }
+
+    record_set: set[int] = set()
     if not record_episodes:
         def trigger(ep_id: int) -> bool:
             return False
@@ -324,33 +694,80 @@ def main(
         def trigger(ep_id: int) -> bool:
             return ep_id in record_set
 
-    render_mode = "rgb_array" if enable_rendering else None
-    base_env = gym.make(env_id, render_mode=render_mode, config=env_config)
-    env = RecordVideo(base_env, video_folder=eval_dir, episode_trigger=trigger, name_prefix="rule_mpc") if enable_rendering else base_env
-
-    controller = RuleMPCController(
-        env=base_env.unwrapped,
-        horizon=int(horizon),
-        dt=1.0 / float(env_config["policy_frequency"]),
-        w_acc=1.0,
-        w_speed=2.0,
-        lane_change_settle_steps=4,
-        lane_strategy=lane_strategy,
+    trajectory_record_set = (
+        {int(ep_idx) for ep_idx in record_trajectory_episodes}
+        if record_trajectory_episodes
+        else set()
     )
-    safety_controller = RuleBasedController(env_config) if use_low_safety_layer else None
+
+    render_mode = "rgb_array" if enable_rendering else None
+    per_goal_lane_environment = bool(lane_env_overrides or normalized_snapshot_pools)
+
+    def config_for_goal_lane(goal_lane: int) -> Dict[str, Any]:
+        cfg = deepcopy(env_config)
+        lane = int(goal_lane)
+        if lane_env_overrides:
+            if lane not in lane_env_overrides:
+                raise ValueError(
+                    f"No reference environment config for goal_lane_id={lane}. "
+                    f"Available lanes: {sorted(lane_env_overrides)}"
+                )
+            deep_update(cfg, deepcopy(lane_env_overrides[lane]))
+            # Match test_hiro.py: user test settings override lane model traffic.
+            deep_update(cfg, test_env_overrides)
+            deep_update(cfg, runtime_overrides)
+        if normalized_snapshot_pools:
+            if lane not in normalized_snapshot_pools:
+                raise ValueError(
+                    f"No snapshot pool configured for goal_lane_id={lane}. "
+                    f"Available lanes: {sorted(normalized_snapshot_pools)}"
+                )
+            cfg["background_snapshot_reset"] = True
+            cfg["background_snapshot_path"] = None
+            cfg["background_snapshot_paths"] = [normalized_snapshot_pools[lane]]
+        cfg["goal_lane_id"] = lane
+        cfg["goal_lane_probs"] = None
+        return cfg
+
+    def make_runtime_environment(config: Mapping[str, Any], episode_number: Optional[int] = None):
+        base = gym.make(env_id, render_mode=render_mode, config=dict(config))
+        wrapped = base
+        if enable_rendering:
+            if episode_number is None:
+                wrapped = RecordVideo(base, video_folder=eval_dir, episode_trigger=trigger, name_prefix="rule_mpc")
+            else:
+                should_record = int(episode_number) in record_set
+                wrapped = RecordVideo(
+                    base,
+                    video_folder=eval_dir,
+                    episode_trigger=lambda _ep_id: should_record,
+                    name_prefix=f"rule_mpc_ep_{int(episode_number):04d}",
+                )
+        active_controller = RuleMPCController(
+            env=base.unwrapped,
+            horizon=int(horizon),
+            dt=1.0 / float(config["policy_frequency"]),
+            w_acc=1.0,
+            w_speed=2.0,
+            lane_change_settle_steps=4,
+            lane_strategy=lane_strategy,
+        )
+        active_safety_controller = RuleBasedController(config) if use_low_safety_layer else None
+        return wrapped, active_controller, active_safety_controller
+
+    env, controller, safety_controller = make_runtime_environment(env_config)
 
     reward_keys = [
         "collision_reward",
         "progress_reward",
+        "speed_ref_aux_reward",
         "comfort_reward",
         "lane_change_reward",
+        "goal_lane_dense_reward",
         "punctual_reward",
+        "wrong_lane_terminal_penalty",
         "on_road_reward",
     ]
-    punctual_time_window = env_config.get("punctual_time_window", [20.0, 30.0])
-    t_min = float(punctual_time_window[0])
-    t_max = float(punctual_time_window[1])
-
     def get_terminal_lane_id(base_env: Any) -> Optional[int]:
         ego_vehicle = getattr(base_env, "vehicle", None)
         if ego_vehicle is not None:
@@ -378,6 +795,8 @@ def main(
         arrival_time: Optional[float],
         final_lane_id: Optional[int],
         goal_lane_id: Optional[int],
+        t_min: float,
+        t_max: float,
     ) -> Tuple[bool, bool, bool, bool, bool]:
         if crashed:
             return True, True, False, False, False
@@ -439,10 +858,52 @@ def main(
     log(f"Eval run folder     : {run_folder_name}")
     log(f"Eval results dir    : {eval_dir}")
     log(f"Episodes            : {episodes}")
+    log(f"Scenario            : {scenario_name} ({env_id})")
+    log(f"Initial lane config : {env_config.get('initial_lane_id')}")
+    log(f"Goal lane config    : {env_config.get('goal_lane_id')}")
+    log(f"Goal longitudinal   : {env_config.get('goal_longitudinal')}")
+    log(f"Duration            : {env_config.get('duration')} s")
+    log(f"Punctual target     : {env_config.get('punctual_time_target')} s")
+    log(f"Punctual window     : {env_config.get('punctual_time_window')}")
+    if reference_env_config_path:
+        log(f"Reference env config: {reference_env_config_path}")
+    if lane_env_config_sources:
+        log("Per-goal env config sources:")
+        for lane, source in sorted(lane_env_config_sources.items()):
+            log(f"  goal_lane={lane}: {source}")
+    if normalized_snapshot_pools:
+        log("Snapshot pool by goal lane:")
+        for lane, pool in sorted(normalized_snapshot_pools.items()):
+            log(f"  goal_lane={lane}: {pool}")
     log(f"Lane strategy       : {lane_strategy}")
     log(f"Low safety layer    : {use_low_safety_layer}")
     log(f"Rendering enabled   : {enable_rendering}")
     log("=" * 80)
+
+    seed_base = 42
+    with open(os.path.join(eval_dir, "effective_eval_config.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "controller": "rule_mpc",
+                "scenario_name": scenario_name,
+                "env_id": env_id,
+                "reference_env_config_source": reference_env_config_path,
+                "goal_lane_env_config_sources": {
+                    str(lane): source for lane, source in sorted(lane_env_config_sources.items())
+                },
+                "snapshot_pool_by_goal_lane": {
+                    str(lane): pool for lane, pool in sorted(normalized_snapshot_pools.items())
+                },
+                "test_env_overrides": test_env_overrides,
+                "runtime_overrides": runtime_overrides,
+                "base_environment": env_config,
+                "goal_lane_environment_overrides": lane_env_overrides,
+                "episode_seeds": [seed_base + ep for ep in range(1, int(episodes) + 1)],
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     ep_lens: list[int] = []
     ep_rets: list[float] = []
@@ -477,10 +938,11 @@ def main(
     failed_wrong_lane_count = 0
     failed_late_count = 0
     failed_early_count = 0
+    mobil_failed_episode_count = 0
+    mobil_failure_call_count = 0
+    mobil_last_failure_error: Optional[str] = None
 
     viewer_initialized = False
-    seed_base = 42
-
     episode_iter = tqdm(
         range(1, int(episodes) + 1),
         total=int(episodes),
@@ -488,8 +950,28 @@ def main(
         dynamic_ncols=True,
     )
     for ep in episode_iter:
-        obs, _ = env.reset(seed=seed_base + ep)
-        del obs
+        episode_seed = seed_base + ep
+        planned_goal_lane: Optional[int] = None
+        if per_goal_lane_environment:
+            planned_goal_lane = int(
+                sample_goal_lane_id(
+                    np.random.default_rng(int(episode_seed)),
+                    goal_lane_id=env_config.get("goal_lane_id", 0),
+                    lanes_count=int(env_config.get("lanes_count", 1)),
+                    goal_lane_probs=env_config.get("goal_lane_probs", None),
+                )
+            )
+            env.close()
+            env, controller, safety_controller = make_runtime_environment(
+                config_for_goal_lane(planned_goal_lane), ep
+            )
+            viewer_initialized = False
+
+        # Mirrors test_hiro.py's episode seeding for comparable traffic streams.
+        random.seed(episode_seed)
+        np.random.seed(episode_seed)
+        obs, _ = env.reset(seed=episode_seed)
+        controller.begin_episode()
 
         reset_base_env = env.unwrapped
         init_lane = None
@@ -508,8 +990,11 @@ def main(
         terminated = False
         truncated = False
         step_count = 0
+        forced_goal_lane_change_steps = 0
         ep_total_reward = 0.0
         ep_components = {k: 0.0 for k in reward_keys}
+        should_record_trajectory = ep in trajectory_record_set
+        trajectory_rows: list[Dict[str, Any]] = []
 
         if enable_rendering and not viewer_initialized:
             class Dummy:
@@ -523,6 +1008,8 @@ def main(
 
         while not (terminated or truncated):
             action = controller.act()
+            if controller.last_forced_goal_lane_change:
+                forced_goal_lane_change_steps += 1
             if use_low_safety_layer and safety_controller is not None:
                 ego = env.unwrapped.vehicle
                 ego_abs = np.array(
@@ -576,14 +1063,43 @@ def main(
                     dt=controller.dt,
                     remaining_time=remain_time,
                 )
-            _, reward, terminated, truncated, info = env.step(action)
+            obs_next, reward, terminated, truncated, info = env.step(action)
+            done = bool(terminated or truncated)
 
-            rc = info.get("reward_components", {}) if isinstance(info, dict) else {}
+            rc = info.get("reward_components", None) if isinstance(info, dict) else None
+            if rc is None:
+                rc = getattr(env.unwrapped, "_last_weighted_rewards", None)
+            rc = rc or {}
             for k in reward_keys:
                 ep_components[k] += float(rc.get(k, 0.0))
 
+            if should_record_trajectory:
+                row: Dict[str, Any] = {
+                    "episode": int(ep),
+                    "step": int(step_count),
+                    "done": int(done),
+                    "terminated": int(terminated),
+                    "truncated": int(truncated),
+                    "queue_takeover_active": int(
+                        bool(info.get("queue_takeover_active", False))
+                        if isinstance(info, dict)
+                        else False
+                    ),
+                    "reward": float(reward),
+                }
+                flat_obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+                flat_action = np.asarray(action, dtype=np.float32).reshape(-1)
+                for i, value in enumerate(flat_obs):
+                    row[f"obs_{i}"] = float(value)
+                for i, value in enumerate(flat_action):
+                    row[f"action_{i}"] = float(value)
+                for key in reward_keys:
+                    row[key] = float(rc.get(key, 0.0))
+                trajectory_rows.append(row)
+
             ep_total_reward += float(reward)
             step_count += 1
+            obs = obs_next
 
         base_env_unwrapped = env.unwrapped
         arrived = bool(getattr(base_env_unwrapped, "_has_arrived", False))
@@ -604,12 +1120,24 @@ def main(
 
         final_lane_id = get_terminal_lane_id(base_env_unwrapped)
         goal_lane_id = int(base_env_unwrapped.get_goal_lane_id())
+        if planned_goal_lane is not None and goal_lane_id != planned_goal_lane:
+            raise RuntimeError(
+                "Planned goal lane and environment goal lane diverged: "
+                f"planned={planned_goal_lane}, actual={goal_lane_id}"
+            )
+        episode_time_window = base_env_unwrapped.config.get(
+            "punctual_time_window", env_config.get("punctual_time_window", [20.0, 30.0])
+        )
+        t_min = float(episode_time_window[0])
+        t_max = float(episode_time_window[1])
         failed, failed_collision, failed_wrong_lane, failed_late, failed_early = classify_failure(
             crashed,
             arrived,
             arrival_time,
             final_lane_id,
             goal_lane_id,
+            t_min,
+            t_max,
         )
         if arrived:
             arrived_count += 1
@@ -626,12 +1154,28 @@ def main(
         if failed_early:
             failed_early_count += 1
 
+        if controller.mobil_failed_this_episode:
+            mobil_failed_episode_count += 1
+        mobil_failure_call_count += controller.mobil_failure_count
+        if controller.mobil_last_error is not None:
+            mobil_last_failure_error = controller.mobil_last_error
+
         reason = "terminated" if terminated else ("truncated(time limit)" if truncated else "unknown")
         log("=" * 60)
         log(f"Episode {ep}:")
         log(f"  initial lane            : {init_lane}")
         log(f"  terminal lane           : {final_lane_id if final_lane_id is not None else 'N/A'}")
+        log(f"  goal lane               : {goal_lane_id}")
+        if planned_goal_lane is not None:
+            log(f"  snapshot pool           : {base_env_unwrapped.config.get('background_snapshot_paths')}")
         log(f"  length (steps)          : {step_count}")
+        if forced_goal_lane_change_steps:
+            log(
+                "  forced goal-lane merge  : "
+                f"{forced_goal_lane_change_steps} control steps "
+                f"(target rear assumes {controller.forced_goal_lane_rear_braking:.1f} m/s^2 braking "
+                f"within {controller.forced_goal_lane_change_distance:.1f} m)"
+            )
         log(f"  terminated info         : {reason}")
         log(f"  mpc total reward        : {ep_total_reward:.6f}")
         log("  reward components (sum over episode):")
@@ -645,9 +1189,30 @@ def main(
                 "  failed flags            : "
                 f"collision={int(failed_collision)}, wrong_lane={int(failed_wrong_lane)}, late={int(failed_late)}, early={int(failed_early)}"
             )
+        if controller.mobil_failed_this_episode:
+            log(
+                "  WARNING: MOBIL lane decision failed in this episode; "
+                f"kept current lane. Last error: {controller.mobil_last_error}"
+            )
 
         if enable_rendering and base_env_unwrapped.config.get("show_trajectories", False):
             save_speed_acc_curves(env, ep_idx=ep, model_path=eval_dir)
+        if should_record_trajectory:
+            csv_path = os.path.join(eval_dir, f"rule_mpc_ep_{ep:04d}_trajectory.csv")
+            if trajectory_rows:
+                with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
+                    writer = csv.DictWriter(
+                        csv_file,
+                        fieldnames=list(trajectory_rows[0].keys()),
+                    )
+                    writer.writeheader()
+                    writer.writerows(trajectory_rows)
+                log(f"  saved trajectory csv    : {csv_path}")
+            else:
+                log(
+                    "  saved trajectory csv    : skipped "
+                    f"(episode {ep} has no trajectory rows)"
+                )
 
         group = ensure_lane_group(int(init_lane))
         group["episodes"] += 1
@@ -741,6 +1306,15 @@ def main(
         failed_late_count,
         failed_early_count,
     )
+    if lane_strategy == "mobil":
+        if mobil_failed_episode_count:
+            log(
+                "  WARNING: MOBIL silently-fallback episodes: "
+                f"{mobil_failed_episode_count}/{n}; calls failed: "
+                f"{mobil_failure_call_count}; last error: {mobil_last_failure_error}"
+            )
+        else:
+            log("  MOBIL fallback failures : 0")
     log("=" * 80)
 
     log_file.close()
@@ -748,20 +1322,68 @@ def main(
 
 
 if __name__ == "__main__":
+    # Select a test_hiro.py SAC reference condition. Environment settings are
+    # loaded from its saved run_config.json; only Rule+MPC controls ego.
+    EVAL_PROFILE = "sac_withPrior_newEnv_by_lane"
+    # EVAL_PROFILE = "sac_withPrior_oldEnv_withWrongLanePen"
+
+    EVAL_PROFILES: Dict[str, Dict[str, Any]] = {
+        "sac_withPrior_oldEnv_withWrongLanePen": {
+            "scenario_name": "multi_lane",
+            "model_dir": "./results/rule_mpc_sacPrior_oldEnv_wrongLanePen",
+            "reference_env_model_dir": "./models/sac_260613_withPrior_oldEnv_randomto2_wronglanePen_1e7",
+            "initial_lane_id": "random",
+            # Keep the string form used by test_hiro.py's explicit override.
+            "goal_lane_id": "2",
+            "env_overrides": {
+                "goal_lane_probs": None,
+            },
+        },
+        "sac_withPrior_newEnv_by_lane": {
+            "scenario_name": "multi_lane_stop_to_int",
+            "model_dir": "./results/rule_mpc_sacPrior_newEnv_by_lane",
+            "reference_env_model_dir": "./models/sac_260624_withPrior_2to0",
+            "goal_lane_reference_env_model_dirs": {
+                0: "./models/sac_260624_withPrior_2to0",
+                1: "./models/sac_260704_withPrior_2to1",
+                2: "./models/sac_260622_withPrior_2to2_noGoalReshape",
+            },
+            # Required new-environment snapshot mapping.
+            "snapshot_pool_by_goal_lane": {
+                0: "debug/background_snapshot_pool_slowlane0",
+                1: "debug/background_snapshot_pool_slowlane2",
+                2: "debug/background_snapshot_pool_slowlane2",
+            },
+            "initial_lane_id": 2,
+            "goal_lane_id": "random",
+            "env_overrides": {
+                "goal_lane_probs": None,
+            },
+        },
+    }
+
+    common_config: Dict[str, Any] = {
+        "episodes": 300,
+        # "record_episodes": [],
+        # "enable_rendering": False,
+        "record_episodes": [i for i in range(1, 301)],
+        "record_trajectory_episodes": [i for i in range(1, 301)],
+        "horizon": 15,
+        "enable_forced_goal_lane_change": False,
+        # "enable_forced_goal_lane_change": True,
+        "forced_goal_lane_change_distance": 30.0,
+        "forced_goal_lane_rear_braking": 3.0,
+
+        "mobil_goal_lane_bias_distance": 50.0,
+        # "mobil_goal_lane_bias_distance": 100.0,
+
+        # "lane_strategy": "right_bias",
+        "lane_strategy": "mobil",
+        # "lane_strategy": "benefit_urgency",
+
+        "use_low_safety_layer": True,
+    }
     main(
-        # model_dir="./models/baseline_260407_mlc_mpc",
-        # model_dir="./models/baseline_260407_mobil_mpc",
-        model_dir="./models/baseline_260407_mlc_mpc_withSL",
-
-        episodes=301,
-        record_episodes=[i for i in range(1, 301)],
-        horizon=15,
-
-        # lane_strategy="mobil",
-        lane_strategy="right_bias",
-
-        # use_low_safety_layer=False,
-        use_low_safety_layer=True,
-
-        enable_rendering=False,
+        **common_config,
+        **EVAL_PROFILES[EVAL_PROFILE],
     )

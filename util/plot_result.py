@@ -1146,6 +1146,20 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
 
     # 对比模式：RL / RL+safety / RL safety upper / MPC / MPC safety upper
     if isinstance(comparison_data, dict) and comparison_data:
+        show_reward_summary = bool(comparison_data.get("show_reward_summary", True))
+
+        def _parse_ylim(key: str, default: Any = None) -> tuple[float, float] | None:
+            raw = comparison_data.get(key, default)
+            if raw is None:
+                return None
+            values = np.asarray(raw, dtype=float).reshape(-1)
+            if values.size != 2 or not np.all(np.isfinite(values)) or values[0] >= values[1]:
+                raise ValueError(f"comparison_data['{key}'] must be (ymin, ymax) with ymin < ymax, or None")
+            return float(values[0]), float(values[1])
+
+        speed_ylim = _parse_ylim("speed_ylim", default=(0.0, 16.0))
+        acc_ylim = _parse_ylim("acc_ylim")
+        lane_ylim = _parse_ylim("lane_ylim")
         speed_rl = np.asarray(comparison_data.get("speed_rl", []), dtype=float).reshape(-1)
         speed_rl_safety_output = np.asarray(comparison_data.get("speed_rl_safety_output", []), dtype=float).reshape(-1)
         speed_safety_upper_rl = np.asarray(comparison_data.get("speed_safety_upper_rl", []), dtype=float).reshape(-1)
@@ -1229,7 +1243,8 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
             plt.plot(t_su_mpc, speed_safety_upper_mpc, color="tab:red", linewidth=1.4, linestyle="--", label="MPC safety upper")
         plt.xlabel("Time [s]")
         plt.ylabel("Speed [m/s]")
-        plt.ylim(0.0, 16.0)
+        if speed_ylim is not None:
+            plt.ylim(*speed_ylim)
         plt.title(f"Ego Speed Comparison (ep {ep_idx})")
         plt.grid(True)
         plt.legend(loc="best")
@@ -1281,6 +1296,8 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
 
         ax.set_xlabel("Time [s]")
         ax.set_ylabel("Acceleration [m/s²]")
+        if acc_ylim is not None:
+            ax.set_ylim(*acc_ylim)
         ax.set_title(f"Ego Acceleration Comparison (ep {ep_idx})")
         ax.grid(True)
 
@@ -1288,19 +1305,20 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         if lines_l:
             ax.legend(lines_l, labels_l, loc="best")
 
-        fig.subplots_adjust(right=0.77)
-        ax.text(
-            1.02,
-            0.98,
-            reward_text,
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=9,
-            bbox=dict(facecolor="white", alpha=0.85, edgecolor="0.7"),
-        )
-
-        fig.tight_layout(rect=[0.0, 0.0, 0.77, 1.0])
+        if show_reward_summary:
+            ax.text(
+                1.02,
+                0.98,
+                reward_text,
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                bbox=dict(facecolor="white", alpha=0.85, edgecolor="0.7"),
+            )
+            fig.tight_layout(rect=[0.0, 0.0, 0.77, 1.0])
+        else:
+            fig.tight_layout()
         fig.savefig(acc_path)
         plt.close(fig)
 
@@ -1338,6 +1356,8 @@ def save_speed_acc_curves(env, ep_idx: int, model_path: str, comparison_data: di
         plt.title(f"Ego Lane-Change Comparison (ep {ep_idx})")
         plt.grid(True)
         plt.yticks([-1, 0, 1])
+        if lane_ylim is not None:
+            plt.ylim(*lane_ylim)
         plt.legend(loc="best")
         plt.tight_layout()
         plt.savefig(lane_path)

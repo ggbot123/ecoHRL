@@ -5,8 +5,6 @@
 /debug
 /videos
 *.csv
-/copy
-/gpt
 env.yml
 .vscode/settings.json
 *.pkl
